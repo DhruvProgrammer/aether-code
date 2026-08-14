@@ -16,6 +16,17 @@ pub struct SessionMeta {
     pub result: Option<String>,
 }
 
+/// A row from the `messages` table, used to seed the Executor's conversation transcript
+/// on `--resume` (BUG-P1-05 regression).
+#[derive(Debug, Clone)]
+pub struct MessageRow {
+    pub id: i64,
+    pub role: String,
+    pub content: String,
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    pub tool_call_id: Option<String>,
+}
+
 pub struct SessionStore {
     conn: Connection,
 }
@@ -74,6 +85,12 @@ impl SessionStore {
                 payload TEXT
             );",
         )?;
+        // BUG-P1-05: migrate older sessions DBs to add tool-call persistence columns
+        // so `--resume` can restore the full conversation transcript. SQLite ignores
+        // duplicate-column errors silently if we use a SELECT-count guard, but the
+        // simplest robust path is to attempt ADD COLUMN and tolerate failures.
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_calls TEXT", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
         Ok(Arc::new(Self { conn }))
     }
 
@@ -98,6 +115,35 @@ impl SessionStore {
         self.conn.execute(
             "INSERT INTO messages(session_id, role, content, ts) VALUES (?1, ?2, ?3, ?4)",
             (session_id, role, content, now.as_str()),
+        )?;
+        Ok(())
+    }
+
+    /// Persist a message with optional tool-call payload. Used by the Executor to record
+    /// assistant tool-call messages and tool-result messages so `--resume` can restore the
+    /// full conversation transcript (BUG-P1-05 regression).
+    pub fn add_message_full(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tool_calls: Option<&[serde_json::Value]>,
+        tool_call_id: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let tc_json = tool_calls
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+        self.conn.execute(
+            "INSERT INTO messages(session_id, role, content, ts, tool_calls, tool_call_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                session_id,
+                role,
+                content,
+                now.as_str(),
+                tc_json,
+                tool_call_id,
+            ),
         )?;
         Ok(())
     }
@@ -207,6 +253,36 @@ impl SessionStore {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    /// Return the most recent N messages for a session, oldest-first, used by `--resume`
+    /// to seed the Executor's `messages` array (BUG-P1-05 regression: previously resume
+    /// reloaded engineering state but the conversation transcript was lost).
+    pub fn get_messages(&self, session_id: &str, limit: usize) -> Result<Vec<MessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, role, content, tool_calls, tool_call_id FROM messages \
+             WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map((session_id, limit as i64), |r| {
+            let tool_calls_json: Option<String> = r.get(3)?;
+            let tool_calls = tool_calls_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok());
+            Ok(MessageRow {
+                id: r.get(0)?,
+                role: r.get(1)?,
+                content: r.get(2)?,
+                tool_calls,
+                tool_call_id: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        // We selected DESC for `LIMIT N recent`; flip to chronological order.
+        out.reverse();
+        Ok(out)
     }
 
     /// Record a trace event (spec §34 / Phase 6): a point-in-time record of what an agent or

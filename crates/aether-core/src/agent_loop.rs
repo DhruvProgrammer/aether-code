@@ -284,7 +284,7 @@ impl Agent {
                 self.max_iterations,
                 self.context_max_tokens,
                 self.session.clone(),
-                self.session_id.clone(),
+                sid.to_string(),
                 format!("{CODER_SYSTEM}\n{}", crate::mode::KARPATHY_POLICY),
                 None,
             );

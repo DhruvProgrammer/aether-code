@@ -62,8 +62,8 @@ pub async fn run_agent(
 
     let text = exec.run(task).await?;
 
-    let mut out = match serde_json::from_str::<RawOut>(&extract_json_text(&text)) {
-        Ok(r) => SubagentResult {
+    let out = match extract_json_text(&text).and_then(|j| serde_json::from_str::<RawOut>(&j).ok()) {
+        Some(r) => SubagentResult {
             role: def.name.clone(),
             status: if r.status.is_empty() { "ok".into() } else { r.status },
             summary: r.summary,
@@ -71,11 +71,15 @@ pub async fn run_agent(
             files: r.files,
             raw: text.clone(),
         },
-        Err(_) => SubagentResult {
+        None => SubagentResult {
             role: def.name.clone(),
-            status: "ok".into(),
+            // BUG-P1-01 regression: a missing/unparseable JSON handoff is NOT a success.
+            status: "unparseable".into(),
             summary: text.chars().take(500).collect(),
-            findings: vec![],
+            findings: vec![format!(
+                "agent '{}' produced no balanced JSON handoff (truncated or non-JSON response)",
+                def.id
+            )],
             files: vec![],
             raw: text.clone(),
         },
@@ -84,7 +88,6 @@ pub async fn run_agent(
     if let Some(store) = &session {
         let _ = store.add_message(session_id, &format!("[{}:{}]", def.id, run.run_id), &text);
     }
-    out.raw = serde_json::to_string(&out).unwrap_or(text);
     Ok(out)
 }
 

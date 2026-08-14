@@ -100,24 +100,79 @@ struct RawOut {
     files: Vec<String>,
 }
 
-/// Extract a JSON object from model text that may be wrapped in markdown code fences
-/// (```json ... ```) or surrounded by prose. Returns the trimmed JSON text, or the original
-/// text if no JSON object can be carved out.
-pub(crate) fn extract_json_text(text: &str) -> String {
+/// Extract the **last top-level balanced JSON object** from model text. The text may be
+/// wrapped in markdown code fences (` ```json ... ``` `), surrounded by prose, or contain
+/// extra objects (e.g. a tool-call JSON followed by a handoff JSON). Returns the slice
+/// `[start, end]` of the balanced object, or `None` if no balanced object can be found.
+///
+/// BUG-P1-01, P1-02 regression: the previous implementation used `t.rfind('}')` which could
+/// either capture too much (multiple objects) or fail on truncated responses, leading to a
+/// silent false-positive (`status = "ok"`) when the agent emitted an unparseable handoff.
+pub(crate) fn extract_json_text(text: &str) -> Option<String> {
     let t = text.trim();
+
+    // 1) Try a fenced code block first (```json ... ```).
     if let Some(start) = t.find("```") {
         let after = &t[start + 3..];
-        let after = after.trim_start_matches("json").trim_start();
+        let after = after.trim_start_matches("json").trim_start_matches("JSON").trim_start();
         if let Some(end) = after.find("```") {
-            return after[..end].trim().to_string();
+            let body = after[..end].trim();
+            if let Some(s) = last_balanced_json_object(body) {
+                return Some(s);
+            }
         }
     }
-    if let (Some(a), Some(b)) = (t.find('{'), t.rfind('}')) {
-        if a <= b {
-            return t[a..=b].to_string();
+
+    // 2) Fall back to scanning the entire text for a balanced top-level object.
+    last_balanced_json_object(t)
+}
+
+/// Walk `s` from left to right and return the **last** slice `[i, j]` such that `s[i..=j]`
+/// is a balanced top-level `{...}` (respecting string literals + escapes). Returns None
+/// if no such object exists.
+fn last_balanced_json_object(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut last: Option<(usize, usize)> = None;
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut escape = false;
+    let mut start: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_str {
+            match b {
+                b'\\' => escape = true,
+                b'"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(a) = start {
+                            last = Some((a, i));
+                            start = None;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    t.to_string()
+    last.map(|(a, b)| s[a..=b].to_string())
 }
 
 /// Run a single role to completion and parse its structured handoff.
@@ -151,8 +206,8 @@ pub async fn run_role(
 
     let text = exec.run(task).await?;
 
-    let mut out = match serde_json::from_str::<RawOut>(&extract_json_text(&text)) {
-        Ok(r) => SubagentResult {
+    let out = match extract_json_text(&text).and_then(|j| serde_json::from_str::<RawOut>(&j).ok()) {
+        Some(r) => SubagentResult {
             role: role.name.to_string(),
             status: if r.status.is_empty() { "ok".into() } else { r.status },
             summary: r.summary,
@@ -160,11 +215,17 @@ pub async fn run_role(
             files: r.files,
             raw: text.clone(),
         },
-        Err(_) => SubagentResult {
+        None => SubagentResult {
             role: role.name.to_string(),
-            status: "ok".into(),
+            // BUG-P1-01 regression: a missing/unparseable JSON handoff is NOT a success.
+            // Report `unparseable` so the orchestrator fails the verification instead of
+            // silently treating a truncated/non-JSON response as "ok".
+            status: "unparseable".into(),
             summary: text.chars().take(500).collect(),
-            findings: vec![],
+            findings: vec![format!(
+                "role '{}' produced no balanced JSON handoff (truncated or non-JSON response)",
+                role.name
+            )],
             files: vec![],
             raw: text.clone(),
         },
@@ -173,8 +234,6 @@ pub async fn run_role(
     if let Some(store) = &session {
         let _ = store.add_message(session_id, &format!("[{}]", role.name.to_uppercase()), &text);
     }
-    // Surface handoff as JSON for downstream logging/aggregation.
-    out.raw = serde_json::to_string(&out).unwrap_or(text);
     Ok(out)
 }
 
@@ -192,12 +251,44 @@ mod tests {
         let fenced = "Sure!\n```json\n{\"status\":\"ok\",\"summary\":\"x\"}\n```";
         assert_eq!(
             extract_json_text(fenced),
-            "{\"status\":\"ok\",\"summary\":\"x\"}"
+            Some("{\"status\":\"ok\",\"summary\":\"x\"}".to_string())
         );
         let prose = "Here is the result: {\"status\":\"failed\",\"summary\":\"bad\"} done.";
         assert_eq!(
             extract_json_text(prose),
-            "{\"status\":\"failed\",\"summary\":\"bad\"}"
+            Some("{\"status\":\"failed\",\"summary\":\"bad\"}".to_string())
         );
+    }
+
+    #[test]
+    fn extract_json_picks_last_balanced_object() {
+        // Two objects: the handoff JSON is the second one.
+        let text = "{\"tool\":\"x\"}\nthen\n{\"status\":\"ok\",\"summary\":\"done\"}";
+        assert_eq!(
+            extract_json_text(text),
+            Some("{\"status\":\"ok\",\"summary\":\"done\"}".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_json_handles_nested_braces() {
+        // Nested JSON object — braces inside strings must not confuse the parser.
+        let text = "result: {\"status\":\"ok\",\"summary\":\"a{b}c\",\"findings\":[]}";
+        assert_eq!(
+            extract_json_text(text).unwrap(),
+            "{\"status\":\"ok\",\"summary\":\"a{b}c\",\"findings\":[]}"
+        );
+    }
+
+    #[test]
+    fn extract_json_none_on_truncated() {
+        // Truncated fenced block — no closing brace.
+        let text = "```json\n{\"status\":\"ok\",\"summary\":\"truncated";
+        assert_eq!(extract_json_text(text), None);
+    }
+
+    #[test]
+    fn extract_json_none_on_no_json() {
+        assert_eq!(extract_json_text("just plain text, no json"), None);
     }
 }

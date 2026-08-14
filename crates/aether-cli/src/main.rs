@@ -109,6 +109,18 @@ async fn run() -> anyhow::Result<()> {
         if cli.plan {
             cmd.arg("--plan");
         }
+        if cli.json {
+            cmd.arg("--json");
+        }
+        if cli.debug {
+            cmd.arg("--debug");
+        }
+        if cli.traces {
+            cmd.arg("--traces");
+        }
+        if let Some(r) = &cli.resume {
+            cmd.arg("--resume").arg(r);
+        }
         cmd.stdout(std::fs::File::create(&log)?)
             .stderr(std::fs::File::create(&log)?);
         #[cfg(windows)]

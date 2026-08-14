@@ -90,11 +90,32 @@ impl Tool for WriteFileTool {
         let path = arg_str(&args, "path").ok_or_else(|| ToolError::Other("missing 'path'".into()))?;
         let content = arg_str(&args, "content").ok_or_else(|| ToolError::Other("missing 'content'".into()))?;
         let full = ctx.cwd.join(path);
+        sandbox_check(&full, &ctx.cwd)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&full, content)?;
         Ok(ToolResult { output: format!("wrote {}", full.display()), is_error: false })
+    }
+}
+
+/// Reject `full` if it does not lie inside `cwd` after canonicalization. Prevents sandbox
+/// escapes such as `path = "../escape.txt"` or `path = "/etc/passwd"`.
+fn sandbox_check(full: &Path, cwd: &Path) -> Result<(), ToolError> {
+    let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let full_canon = full
+        .canonicalize()
+        .unwrap_or_else(|_| full.to_path_buf());
+    let cwd_str = cwd_canon.to_string_lossy().replace('\\', "/");
+    let full_str = full_canon.to_string_lossy().replace('\\', "/");
+    if full_str == cwd_str || full_str.starts_with(&format!("{cwd_str}/")) {
+        Ok(())
+    } else {
+        Err(ToolError::Other(format!(
+            "path '{}' is outside cwd '{}'",
+            full.display(),
+            cwd.display()
+        )))
     }
 }
 

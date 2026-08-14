@@ -171,11 +171,16 @@ impl AgentRegistry {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-                    if let Ok(text) = std::fs::read_to_string(&path) {
-                        if let Ok(def) = toml::from_str::<AgentDefinition>(&text) {
-                            reg.agents.insert(def.id.clone(), def);
-                        }
-                    }
+if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(def) = toml::from_str::<AgentDefinition>(&text) {
+                reg.agents.insert(def.id.clone(), def);
+            } else {
+                eprintln!(
+                    "WARNING: failed to parse agent TOML at {}",
+                    path.display()
+                );
+            }
+        }
                 }
             }
         }

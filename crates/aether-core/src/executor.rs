@@ -219,12 +219,21 @@ fn estimate_tokens(msgs: &[Message]) -> usize {
     msgs.iter().map(|m| m.content.chars().count() / 4 + 16).sum()
 }
 
-/// Resolve a `Permission::Ask`: prompt the user when attached to a TTY, otherwise fail open
-/// for non-dangerous commands so non-interactive runs keep working (catastrophic commands are
-/// already forced to `Deny` by `Policy::check_bash`).
+/// Resolve a `Permission::Ask`:
+/// - **bash** keeps fail-open semantics in non-TTY environments because `Policy::check_bash`
+///   already hard-denies catastrophic commands. Safe bash falls through to the configured
+///   permission and we don't block non-interactive runs (CI, `--background`, piped input).
+/// - **All other categories** (`edit`, `delete`, `git_commit`, `network`) deny by default when
+///   stdin is not a TTY. There is no automatic safe answer for "may the agent overwrite a
+///   file or push to a network host" without a human; failing open was a silent footgun.
+/// - On a TTY, prompt the user with a y/N question.
 fn decide_permission(category: &str, tool: &str) -> Permission {
     if !std::io::stdin().is_terminal() {
-        return Permission::Allow;
+        return if category == "bash" {
+            Permission::Allow
+        } else {
+            Permission::Deny
+        };
     }
     eprint!("[ASK] allow {category} `{tool}`? [y/N] ");
     let _ = std::io::stderr().flush();
