@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::agents::definition::AgentDefinition;
 use crate::agents::lifecycle::AgentRun;
 use crate::executor::Executor;
-use crate::subagents::SubagentResult;
+use crate::subagents::{extract_json_text, SubagentResult};
 
 #[derive(Deserialize)]
 struct RawOut {
@@ -62,7 +62,7 @@ pub async fn run_agent(
 
     let text = exec.run(task).await?;
 
-    let mut out = match serde_json::from_str::<RawOut>(&text) {
+    let mut out = match serde_json::from_str::<RawOut>(&extract_json_text(&text)) {
         Ok(r) => SubagentResult {
             role: def.name.clone(),
             status: if r.status.is_empty() { "ok".into() } else { r.status },

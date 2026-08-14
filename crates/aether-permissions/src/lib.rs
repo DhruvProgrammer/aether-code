@@ -41,10 +41,11 @@ impl Policy {
         }
     }
 
-    /// Bash is always forced to `Ask` for dangerous commands, regardless of config.
+    /// Dangerous commands are always hard-denied, regardless of config. Less dangerous
+    /// commands fall through to the configured `bash` permission.
     pub fn check_bash(&self, command: &str) -> Permission {
         if is_dangerous(command) {
-            Permission::Ask
+            Permission::Deny
         } else {
             self.bash
         }

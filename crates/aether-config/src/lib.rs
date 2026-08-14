@@ -192,21 +192,15 @@ impl Default for DisplayConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubagentsConfig {
-    #[serde(default = "dft_false")]
+    /// Enable the multi-agent verification pipeline (Explorer + Tester + Reviewer, + Security
+    /// Reviewer on risk). When off, the loop still runs but skips the agent handoff pass.
+    #[serde(default = "dft_true")]
     pub enabled: bool,
-    #[serde(default = "dft_executor")]
-    pub reviewer_model: String,
-    #[serde(default = "dft_executor")]
-    pub tester_model: String,
 }
 
 impl Default for SubagentsConfig {
     fn default() -> Self {
-        SubagentsConfig {
-            enabled: dft_false(),
-            reviewer_model: dft_executor(),
-            tester_model: dft_executor(),
-        }
+        SubagentsConfig { enabled: dft_true() }
     }
 }
 

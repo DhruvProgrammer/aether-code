@@ -7,10 +7,12 @@ AETHER is a coding agent that talks to **any** OpenAI-compatible API (`/v1/chat/
 ## Highlights
 
 - **100% OpenAI-compatible.** Point it at OpenAI, Azure OpenAI, OpenRouter, NVIDIA NIM, MiniMax, GLM, vLLM, Ollama, or LM Studio — anything that serves `/v1/chat/completions`. No vendor lock-in.
-- **Two-LLM design (spec 1).** The Controller decomposes the task and writes a plan; the Executor implements it by calling tools. Read-only or explanatory tasks can be routed to a cheaper model (cost routing, 8).
+- **Two-LLM design (spec 1).** A **Controller** (SMALL model) decomposes the task, writes the plan, and orchestrates specialized workers; an **Executor / Implementer** (BIG model) implements it by calling tools. Read-only or explanatory tasks are routed to the SMALL model (cost routing, 8). The routing is enforced in exactly one place (`Agent::resolve`).
+- **Loop engineering (closed loop).** `Agent::run` is a plan → execute → verify → replan cycle driven by an explicit `EngineeringModel`. A `LoopEngine` circuit-breaker detects stagnation, tracks confidence, and decides **Continue / Escalate / Stop** instead of blindly retrying.
+- **First-class multi-agent subsystem.** A registry of agents (`agents/<id>.toml` + 10 built-ins: Explorer, Planner, Designer, Researcher, Implementer, Tester, Reviewer, Security Reviewer, Debugger, Documenter). After each implementation cycle the routed **verification pipeline** (Tester + Reviewer, + Security Reviewer on risk) runs and feeds the `EngineeringModel`.
 - **Memory-first (spec 9).** `aether-mind` stores a knowledge graph (`redb`), key/value facts, and a scalar-quantized vector index for semantic recall. Retrieval fuses vector similarity + keyword + 1-hop graph traversal.
-- **Reviewer / Tester subagents (spec 7).** After the Executor finishes, an optional Reviewer and Tester run structured handoff passes and feed diffs/results back to the Executor.
-- **Permissions + planning mode (spec 14).** Per-category policy (`read`/`edit`/`bash`/`delete`/`git_commit`/`network`) with `allow`/`ask`/`deny`. `--plan` runs read-only and returns a plan without touching files.
+- **BUILD / PLAN modes + Karpathy guidelines.** `--plan` is a read-only investigate → plan pass that never modifies files; BUILD MODE runs the full loop. Karpathy engineering guidelines are injected into the prompts.
+- **Permissions, fail-safe (spec 14).** Per-category policy (`read`/`edit`/`bash`/`delete`/`git_commit`/`network`) with `allow`/`ask`/`deny`. **Read-only agents cannot run shell commands** (only the Tester may, to run tests). **Dangerous commands (`rm -rf`, `git reset --hard`, `git push --force`, …) are always denied.** `ask` prompts interactively when attached to a terminal and otherwise fails open for non-dangerous commands so non-interactive runs still work.
 - **MCP client and server (spec 6).** `aether` can connect to external MCP servers and use their tools; `aether-mcp` is itself an MCP server exposing the memory tools.
 - **Local / cloud mode.** `--local` redirects every model at a local OpenAI-compatible endpoint (Ollama / llama.cpp by default) with zero config changes.
 - **Minimalist light UI.** Pantone-anchored, low-chroma terminal styling (`docs/design.md`). No emojis, no noise.
@@ -23,21 +25,23 @@ AETHER is to coding agents what a clean, dependency-light native binary is to th
 ## Architecture
 
 ```
-            +-------------+
- prompt --> |  Controller |  plans, writes a numbered plan, selects tools
-            +-----+-------+
-                  | plan
-            +-----v-------+
-         +->  Executor  -- calls tools (fs / terminal / git / memory / mcp) -+
-         |    (coder)                                                       |
-         |                                                                  v
-         |  optional handoff:  Reviewer --> Tester --> (diffs/results back to Executor)
-         +------------------------------------------------------------------+
-                              | uses
-                       +------v-------+
-                       |  aether-mind |  redb graph + kv + quantized vector, hybrid retrieval
-                       +--------------+
+                 ┌──────────────────────── AETHER run (one task) ────────────────────────┐
+                 │                                                                       │
+  task ────────► │  Controller (SMALL)  ──plans──►  Implementer (BIG) ──calls tools────┐   │
+                 │        │ loop-engineering: plan→execute→verify→replan              │   │
+                 │        │   Explorer (SMALL, read-only) gathers repo findings       │   │
+                 │        │   after each cycle: Tester + Reviewer (+Security) verify   │   │
+                 │        │   LoopEngine decides Continue / Escalate / Stop           │   │
+                 │        └───────────────────────────────────────────────────────────┘   │
+                 │                              │ uses                                    │
+                 │                       ┌──────v────────┐                               │
+                 │                       │  aether-mind  │  redb graph + kv + quantized   │
+                 │                       │  (memory)     │  vector, hybrid retrieval      │
+                 │                       └───────────────┘                               │
+                 └───────────────────────────────────────────────────────────────────────┘
 ```
+
+**Two-LLM, one enforcement point.** `Agent::resolve` maps `model = "controller"` → SMALL LLM and `model = "executor"` → BIG LLM. The `implementer` is the only BIG-LLM agent; every other agent (Explorer, Planner, Designer, Researcher, Tester, Reviewer, Security Reviewer, Debugger, Documenter) runs on the SMALL LLM. Read-only agents are mechanically denied write/commit and — except the Tester — shell access.
 
 Workspace crates (all MIT, edition 2021):
 
@@ -113,7 +117,7 @@ See `config.example.toml` for every field. Key groups:
 - **`[permissions]`** — `read`/`edit`/`bash`/`delete`/`git_commit`/`network` -> `allow`/`ask`/`deny`.
 - **`[context]`** — `max_tokens` (context compaction budget).
 - **`[display]`** — `theme = "light"`, `accent`, `emoji = false`.
-- **`[subagents]`** — `enabled`, `reviewer_model`, `tester_model`.
+- **`[subagents]`** — `enabled` (default `true`): toggles the multi-agent Explorer + Tester/Reviewer(+Security) verification pipeline.
 - **`[[mcp.servers]]`** — external MCP servers: `name`, `command`, `args`.
 
 ## Usage
@@ -141,9 +145,24 @@ Once memory is enabled, these tools are available to the agent (and to MCP clien
 
 AETHER also auto-discovers `AGENTS.md` / `CLAUDE.md` / `AETHER.md` / `CONTEXT.md` in the working directory as durable project context.
 
-### Subagents
+### Subagents / multi-agent subsystem
 
-Enable `[subagents] enabled = true` to run a Reviewer (reads the plan + final diff, suggests corrections) and a Tester (proposes/verifies runnable checks) after the Executor. Their structured results are handed back to the Executor for a fix pass. Reviewer/Tester are **read-only** roles and cannot modify files.
+Enable `[subagents] enabled = true` (default) to run the multi-agent verification pipeline. AETHER is built around a registry of agents:
+
+- **`agents/<id>.toml`** in the working directory overrides the 10 built-in agents (see the `agents/` folder in this repo for the schema). Each agent declares its `model` (`controller` = SMALL, `executor` = BIG), `mode` (`build`/`plan`, where `plan` is mechanically read-only), `tools` allow/deny lists, and optional `permissions`.
+- Built-in agents: `explorer`, `planner`, `designer`, `researcher`, `implementer`, `tester`, `reviewer`, `security-reviewer`, `debugger`, `documenter`.
+
+**How a BUILD task runs:**
+
+1. **Explore** (SMALL, read-only) — gathers repo findings before planning.
+2. **Plan** — the Controller writes a numbered implementation plan (Karpathy: simplest viable approach).
+3. **Implement** (BIG) — the Implementer executes the plan via tools, with context compaction and write-checkpoints.
+4. **Verify** — the routed pipeline runs **Tester** + **Reviewer**, and **Security Reviewer** when the task is high-risk or security-related. Each returns a structured `{"status","summary","findings"}` handoff.
+5. **Loop** — the `EngineeringModel` folds the verification into success criteria and confidence; the `LoopEngine` either continues (replan with the prior result), escalates with a briefing, or stops when criteria are met or the budget is exhausted.
+
+**How a PLAN task runs:** read-only `explorer` → Controller emits the structured PLAN document. Nothing is written. The plan can be carried into BUILD MODE interactively (`/plan` then `/build`), where BUILD MODE re-validates the plan before editing.
+
+All non-implementer agents are **read-only**: they cannot edit, delete, commit, or — except the Tester — run shell commands. Dangerous commands are always denied regardless of configuration.
 
 ### Checkpoints and rollback
 
@@ -179,7 +198,7 @@ The terminal UI follows a minimalist, low-chroma **Pantone** palette (Still Blue
 
 ## Status
 
-All six phases of `docs/plan.md` are implemented:
+All phases of `docs/plan.md` are implemented, including the later loop-engineering, BUILD/PLAN modes + Karpathy guidelines, and first-class multi-agent subsystems (Phases 7–9):
 
 1. Core two-LLM agent (Controller/Executor), OpenAI-compatible provider, fs/terminal tools.
 2. Permissions engine plus planning mode, git tools, SQLite sessions.
@@ -187,6 +206,9 @@ All six phases of `docs/plan.md` are implemented:
 4. Subagent orchestration (Reviewer/Tester handoff).
 5. Context compaction, cost routing, checkpoints/rollback, Pantone UI.
 6. MCP client, `aether-mind` as MCP server, local/cloud modes, quantized index.
+7. **Loop engineering** — closed plan/execute/verify/replan loop with an `EngineeringModel` + `LoopEngine` circuit-breaker.
+8. **BUILD / PLAN modes** + Karpathy guidelines; PLAN MODE is read-only.
+9. **Multi-agent subsystem** — registry, routing, lifecycle, and the Tester/Reviewer/Security verification pipeline.
 
 See `docs/plan.md` for the phased roadmap and `DEPENDENCIES.md` for the dependency ledger (including deferred `usearch` / `ratatui`).
 

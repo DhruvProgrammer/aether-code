@@ -192,7 +192,7 @@ impl Agent {
                         println!("[EXPLORE] {}\n", r.summary);
                         if !r.findings.is_empty() {
                             for f in &r.findings {
-                                eng.add_unknown(f);
+                                eng.add_fact(f);
                             }
                         }
                     }
@@ -274,7 +274,7 @@ impl Agent {
                 None,
             );
             let result = coder.run(&cycle_task).await?;
-            eng.record_action("execute plan via tools");
+            eng.record_action(&format!("execute plan (iter {})", iter + 1));
             eng.observe("executor", &summarize(&result), None, None);
 
             // Subagent handoff: the routed verification pipeline (spec §17-§18, §58).
@@ -315,9 +315,6 @@ impl Agent {
                                 None,
                                 None,
                             );
-                            for f in &r.findings {
-                                eng.add_unknown(f);
-                            }
                         }
                         Err(e) => eprintln!("{} failed: {e}", aid),
                     }

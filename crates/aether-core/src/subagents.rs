@@ -100,6 +100,26 @@ struct RawOut {
     files: Vec<String>,
 }
 
+/// Extract a JSON object from model text that may be wrapped in markdown code fences
+/// (```json ... ```) or surrounded by prose. Returns the trimmed JSON text, or the original
+/// text if no JSON object can be carved out.
+pub(crate) fn extract_json_text(text: &str) -> String {
+    let t = text.trim();
+    if let Some(start) = t.find("```") {
+        let after = &t[start + 3..];
+        let after = after.trim_start_matches("json").trim_start();
+        if let Some(end) = after.find("```") {
+            return after[..end].trim().to_string();
+        }
+    }
+    if let (Some(a), Some(b)) = (t.find('{'), t.rfind('}')) {
+        if a <= b {
+            return t[a..=b].to_string();
+        }
+    }
+    t.to_string()
+}
+
 /// Run a single role to completion and parse its structured handoff.
 pub async fn run_role(
     role: &Role,
@@ -131,7 +151,7 @@ pub async fn run_role(
 
     let text = exec.run(task).await?;
 
-    let mut out = match serde_json::from_str::<RawOut>(&text) {
+    let mut out = match serde_json::from_str::<RawOut>(&extract_json_text(&text)) {
         Ok(r) => SubagentResult {
             role: role.name.to_string(),
             status: if r.status.is_empty() { "ok".into() } else { r.status },
@@ -161,4 +181,23 @@ pub async fn run_role(
 /// Convenience: build a `Value` summary of a role result for the orchestrator prompt.
 pub fn result_to_value(r: &SubagentResult) -> Value {
     serde_json::json!(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_json_handles_fences_and_prose() {
+        let fenced = "Sure!\n```json\n{\"status\":\"ok\",\"summary\":\"x\"}\n```";
+        assert_eq!(
+            extract_json_text(fenced),
+            "{\"status\":\"ok\",\"summary\":\"x\"}"
+        );
+        let prose = "Here is the result: {\"status\":\"failed\",\"summary\":\"bad\"} done.";
+        assert_eq!(
+            extract_json_text(prose),
+            "{\"status\":\"failed\",\"summary\":\"bad\"}"
+        );
+    }
 }

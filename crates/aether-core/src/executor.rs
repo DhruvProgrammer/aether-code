@@ -10,6 +10,7 @@ use aether_tools::{Tool, ToolContext, ToolError, ToolResult};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -101,6 +102,10 @@ impl Executor {
             };
             let resp = self.provider.complete(req).await?;
 
+            if resp.tool_calls.is_empty() && resp.content.is_none() {
+                return Ok("The model returned an empty response; no actions were taken.".into());
+            }
+
             if resp.tool_calls.is_empty() {
                 return Ok(resp.content.unwrap_or_default());
             }
@@ -175,8 +180,7 @@ impl Executor {
         };
         let effective = match (policy_perm, tool.required_permission()) {
             (Permission::Deny, _) | (_, Permission::Deny) => Permission::Deny,
-            (Permission::Ask, _) => Permission::Ask,
-            (Permission::Allow, Permission::Ask) => Permission::Ask,
+            (Permission::Ask, _) | (Permission::Allow, Permission::Ask) => Permission::Ask,
             (Permission::Allow, Permission::Allow) => Permission::Allow,
         };
 
@@ -184,9 +188,15 @@ impl Executor {
             Permission::Deny => {
                 return Err(ToolError::Other(format!("permission denied by policy: {category}")));
             }
-            Permission::Ask => {
-                eprintln!("[ASK] {} `{}`", category, tc.name);
-            }
+            Permission::Ask => match decide_permission(category, &tc.name) {
+                Permission::Allow => {}
+                _ => {
+                    return Err(ToolError::Other(format!(
+                        "permission denied by user: {category} `{}`",
+                        tc.name
+                    )));
+                }
+            },
             Permission::Allow => {}
         }
 
@@ -207,6 +217,25 @@ impl Executor {
 
 fn estimate_tokens(msgs: &[Message]) -> usize {
     msgs.iter().map(|m| m.content.chars().count() / 4 + 16).sum()
+}
+
+/// Resolve a `Permission::Ask`: prompt the user when attached to a TTY, otherwise fail open
+/// for non-dangerous commands so non-interactive runs keep working (catastrophic commands are
+/// already forced to `Deny` by `Policy::check_bash`).
+fn decide_permission(category: &str, tool: &str) -> Permission {
+    if !std::io::stdin().is_terminal() {
+        return Permission::Allow;
+    }
+    eprint!("[ASK] allow {category} `{tool}`? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut s = String::new();
+    let _ = std::io::stdin().read_line(&mut s);
+    let ans = s.trim().to_ascii_lowercase();
+    if ans == "y" || ans == "yes" {
+        Permission::Allow
+    } else {
+        Permission::Deny
+    }
 }
 
 /// Compaction (spec §20): keep system + first user + recent tail; truncate long tool outputs.

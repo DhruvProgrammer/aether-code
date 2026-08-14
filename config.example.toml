@@ -74,11 +74,11 @@ base_url     = "https://api.openai.com/v1"
 model        = "gpt-4o-mini"
 api_key_env  = "OPENAI_API_KEY"
 
-# --- Subagents (§7): reviewer/tester run a structured handoff pass ---
+# --- Subagents (multi-agent verification pipeline) ---
+# When enabled, AETHER runs an Explorer before planning and a Tester + Reviewer (+ Security
+# Reviewer on risk) handoff pass after each implementation cycle. Disable to run the bare loop.
 [subagents]
-enabled         = false
-reviewer_model  = "executor"
-tester_model    = "executor"
+enabled = true
 
 # --- MCP client (§6): connect to external MCP servers; their tools are registered ---
 # [[mcp.servers]]
