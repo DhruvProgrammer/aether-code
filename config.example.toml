@@ -13,11 +13,22 @@ local_endpoint   = "http://127.0.0.1:11434/v1"
 
 [memory]
 enabled           = true
+# backend/graph_store/vector_store are descriptive of the embedded engine:
+#   - graph + key/value  -> `redb` (pure Rust, embedded)
+#   - vector index        -> pure-Rust scalar-quantized (f32 -> i8) cosine search.
+#     (`usearch` from the spec is deferred: it pulls a C++ toolchain; the Rust index
+#      keeps the binary dependency-free. See DEPENDENCIES.md.)
 backend           = "embedded"
 graph_store       = "redb"
-vector_store      = "usearch"
+vector_store      = "quantized"
+# Embeddings reuse the controller model's OpenAI-compatible /v1/embeddings endpoint,
+# so no separate embedding provider is configured.
 embedding_provider = "openai_compatible"
 memory_top_k      = 8
+# Where the memory graph is stored.
+path              = "~/.aether/mind.redb"
+# Opt-in: let the agent extract durable facts from results automatically.
+auto_extract      = false
 
 [permissions]
 read  = "allow"
