@@ -2,11 +2,10 @@
 mod ui;
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context;
 use clap::Parser;
 
 use aether_core::agent_loop::Agent;
@@ -45,7 +44,15 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("AETHER error: {e}");
+        pause_if_terminal();
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if cli.debug {
@@ -54,7 +61,16 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt().with_env_filter("info").init();
     }
 
-    let mut cfg = aether_config::Config::load(cli.config)?;
+    let cfg_path = cli.config.clone().unwrap_or_else(aether_config::Config::default_path);
+    let cfg_missing = !cfg_path.exists();
+    let mut cfg = match aether_config::Config::load(cli.config.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("AETHER: could not read config at {}: {}", cfg_path.display(), e);
+            pause_if_terminal();
+            std::process::exit(1);
+        }
+    };
 
     // Local mode (spec §6): point every model at the local OpenAI-compatible endpoint.
     if cli.local {
@@ -96,9 +112,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let controller_cfg = cfg
-        .model(&cfg.agent.controller_model)
-        .with_context(|| format!("model '{}' not configured", cfg.agent.controller_model))?;
+    if cfg.model(&cfg.agent.controller_model).is_none() || cfg.model(&cfg.agent.executor_model).is_none() {
+        setup_help(&cfg_path, cfg_missing);
+        std::process::exit(2);
+    }
+    let controller_cfg = cfg.model(&cfg.agent.controller_model).unwrap();
 
     let mut policy = aether_permissions::Policy::from_config(&cfg.permissions);
     if cli.plan {
@@ -216,6 +234,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         None => {
+            if !std::io::stdin().is_terminal() {
+                eprintln!("Usage: aether \"<task>\"");
+                eprintln!("  Run from a terminal with a task, or just 'aether' for interactive mode.");
+                return Ok(());
+            }
             println!("aether — type a task, or /exit to quit.");
             let mut line = String::new();
             loop {
@@ -241,4 +264,63 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Keep the console window open on error/exit when launched from Explorer (double-click),
+/// where the window would otherwise close instantly and hide the message. Only pauses when
+/// stdout is an actual terminal (so piped/CI usage is unaffected).
+fn pause_if_terminal() {
+    if std::io::stdout().is_terminal() {
+        eprint!("Press Enter to exit...");
+        let _ = std::io::stdout().flush();
+        let mut s = String::new();
+        let _ = std::io::stdin().read_line(&mut s);
+    }
+}
+
+/// Print a friendly first-run / misconfiguration message instead of a bare error.
+fn setup_help(cfg_path: &PathBuf, cfg_missing: bool) {
+    eprintln!();
+    eprintln!("AETHER needs a model configuration before it can run.");
+    if cfg_missing {
+        eprintln!("No config file was found at:");
+        eprintln!("  {}", cfg_path.display());
+        eprintln!("Create one (e.g. copy config.example.toml from the repo) with at least a");
+        eprintln!("[models.controller] and [models.executor] section. Minimum example:");
+    } else {
+        eprintln!(
+            "The config at {} is missing the '{}' and/or '{}' model.",
+            cfg_path.display(),
+            "controller",
+            "executor"
+        );
+        eprintln!("Add a [models.controller] and [models.executor] section. Minimum example:");
+    }
+    eprintln!();
+    eprintln!(
+        r#"  [agent]
+  controller_model = "controller"
+  executor_model   = "executor"
+
+  [models.controller]
+  provider    = "openai_compatible"
+  base_url    = "https://api.openai.com/v1"
+  model       = "gpt-4o-mini"
+  api_key_env = "OPENAI_API_KEY"
+
+  [models.executor]
+  provider    = "openai_compatible"
+  base_url    = "https://api.openai.com/v1"
+  model       = "gpt-4o"
+  api_key_env = "OPENAI_API_KEY"#
+    );
+    eprintln!();
+    eprintln!("Then set the API key via an ENVIRONMENT VARIABLE (AETHER never stores keys on disk):");
+    eprintln!("  CMD:        set OPENAI_API_KEY=sk-...");
+    eprintln!("  PowerShell:  $env:OPENAI_API_KEY = \"...\"");
+    eprintln!();
+    eprintln!("AETHER is a COMMAND-LINE tool, not a GUI app. Run it from a terminal, e.g.:");
+    eprintln!("  aether \"explain the main loop in src/main.rs\"");
+    eprintln!();
+    pause_if_terminal();
 }

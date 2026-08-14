@@ -118,6 +118,8 @@ See `config.example.toml` for every field. Key groups:
 
 ## Usage
 
+> **AETHER is a command-line tool, not a GUI app.** Double-clicking `aether.exe` opens a console window that prints setup help (and waits for Enter) — it does not open a graphical window. To use AETHER, open a terminal (CMD or PowerShell) and run it with a task, e.g. `aether "explain the main loop in src/main.rs"`. With no arguments it starts an interactive prompt.
+
 ```text
 aether "<task>"            Run a task non-interactively
 aether                     Start the interactive REPL (type /exit to quit)
