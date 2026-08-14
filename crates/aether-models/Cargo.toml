@@ -1,0 +1,14 @@
+[package]
+name = "aether-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aether-config = { path = "../aether-config" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+async-trait = "0.1"
+thiserror = "1"
+futures-util = "0.3"

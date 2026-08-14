@@ -1,0 +1,17 @@
+[package]
+name = "aether-mind"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+redb = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+async-trait = "0.1"
+aether-tools = { path = "../aether-tools" }
+aether-models = { path = "../aether-models" }
+aether-permissions = { path = "../aether-permissions" }

@@ -1,0 +1,74 @@
+# AETHER configuration — copy to ~/.aether/config.toml
+# No API keys are stored here; only the ENV VAR NAME to read at runtime.
+
+[agent]
+controller_model = "controller"
+executor_model   = "executor"
+max_iterations   = 30
+routing_policy   = "balanced"
+# Optional cheaper model for read-only/explanatory tasks (cost routing, §8).
+cheap_model      = "fast"
+# Endpoint used by `--local` mode (Ollama/llama.cpp are OpenAI-compatible).
+local_endpoint   = "http://127.0.0.1:11434/v1"
+
+[memory]
+enabled           = true
+backend           = "embedded"
+graph_store       = "redb"
+vector_store      = "usearch"
+embedding_provider = "openai_compatible"
+memory_top_k      = 8
+
+[permissions]
+read  = "allow"
+edit  = "allow"
+bash  = "ask"
+delete = "ask"
+git_commit = "ask"
+network = "ask"
+
+[context]
+max_tokens = 128000
+
+[display]
+theme  = "light"
+accent = "still-blue"
+emoji  = false
+
+# --- Models (OpenAI-compatible; any /v1/chat/completions endpoint works) ---
+[models.controller]
+provider     = "openai_compatible"
+base_url     = "https://api.openai.com/v1"
+model        = "gpt-4o-mini"
+api_key_env  = "OPENAI_API_KEY"
+
+[models.executor]
+provider     = "openai_compatible"
+base_url     = "https://api.openai.com/v1"
+model        = "gpt-4o"
+api_key_env  = "OPENAI_API_KEY"
+
+[models.fallback_executor]
+provider     = "openai_compatible"
+base_url     = "https://openrouter.ai/api/v1"
+model        = "openai/gpt-4o"
+api_key_env  = "OPENROUTER_API_KEY"
+
+[models.fast]
+provider     = "openai_compatible"
+base_url     = "https://api.openai.com/v1"
+model        = "gpt-4o-mini"
+api_key_env  = "OPENAI_API_KEY"
+
+# --- Subagents (§7): reviewer/tester run a structured handoff pass ---
+[subagents]
+enabled         = false
+reviewer_model  = "executor"
+tester_model    = "executor"
+
+# --- MCP client (§6): connect to external MCP servers; their tools are registered ---
+# [[mcp.servers]]
+# name    = "local-fs"
+# command = "/path/to/mcp-server"
+# args    = ["--root", "."]
+

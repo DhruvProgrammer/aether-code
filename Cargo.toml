@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aether-config",
+    "crates/aether-permissions",
+    "crates/aether-models",
+    "crates/aether-tools",
+    "crates/aether-core",
+    "crates/aether-cli",
+    "crates/aether-sessions",
+    "crates/aether-mind",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["aether contributors"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "abort"
+codegen-units = 1

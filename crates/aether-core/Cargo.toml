@@ -1,0 +1,17 @@
+[package]
+name = "aether-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aether-models = { path = "../aether-models" }
+aether-tools = { path = "../aether-tools" }
+aether-config = { path = "../aether-config" }
+aether-permissions = { path = "../aether-permissions" }
+aether-sessions = { path = "../aether-sessions" }
+aether-mind = { path = "../aether-mind" }
+async-trait = "0.1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

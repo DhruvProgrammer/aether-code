@@ -1,0 +1,14 @@
+[package]
+name = "aether-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aether-permissions = { path = "../aether-permissions" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["process", "rt-multi-thread"] }
