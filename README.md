@@ -205,19 +205,13 @@ How to run it safely:
 
 1. **Run it anyway.** In the SmartScreen dialog, click *More info* -> *Run anyway*. The file is safe.
 2. **Build from source (no warning at all).** A binary you compile yourself is not "downloaded from the internet", so Windows does not attach the Mark-of-the-Web and SmartScreen will not warn. See [Requirements and building](#requirements-and-building).
-3. **Use a signed release.** Code signing removes the warning entirely. The repo ships a GitHub Actions workflow (`.github/workflows/release.yml`) that builds with the standard MSVC toolchain and **automatically code-signs** the binaries when signing is configured. The workflow auto-detects one of two methods:
+3. **Use a signed release.** Code signing removes the warning entirely. The repo ships a GitHub Actions workflow (`.github/workflows/release.yml`) that builds with the standard MSVC toolchain and **automatically code-signs** the binaries if you provide a certificate:
 
-   **A. Azure Trusted Signing (recommended).** This is the same mechanism popular agents such as *jcode* use: it gives the `.exe` instant SmartScreen reputation without buying a traditional (expensive) EV certificate, via a low-cost Microsoft service. Configure in *Repository settings -> Secrets and variables -> Actions*:
-
-   - *Secrets*: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` (an Azure app registration federated to GitHub OIDC).
-   - *Variables*: `WINDOWS_SIGNING_ENDPOINT`, `WINDOWS_SIGNING_ACCOUNT`, `WINDOWS_SIGNING_CERTIFICATE_PROFILE` (from your Azure Trusted Signing account).
-
-   **B. Traditional PFX certificate.** In *Secrets*:
-
-   - `WINDOWS_CODESIGN_PFX` — the certificate exported as a **base64-encoded PFX** (`certutil -encode cert.pfx cert.b64`, then paste the file contents).
-   - `WINDOWS_CODESIGN_PASSWORD` — the PFX password.
-
-   Publish a release (or run the *Release (Windows)* workflow manually). The `.exe` files are signed with a SHA-256 timestamp, and SmartScreen stops warning. Until signing is configured, the release binaries are uploaded **unsigned** and SmartScreen will still warn.
+   - Obtain an Authenticode code-signing certificate (an **EV** certificate gives instant SmartScreen reputation; a standard **OV/IV** certificate builds reputation as downloads accumulate).
+   - In *Repository settings -> Secrets and variables -> Actions*, add:
+     - `WINDOWS_CODESIGN_PFX` — the certificate exported as a **base64-encoded PFX** (`certutil -encode cert.pfx cert.b64`, then paste the file contents).
+     - `WINDOWS_CODESIGN_PASSWORD` — the PFX password.
+   - Publish a release (or run the *Release (Windows)* workflow manually). The `.exe` files are signed with a SHA-256 timestamp, and SmartScreen stops warning. Until signing is configured, the release binaries are uploaded **unsigned** and SmartScreen will still warn.
 
 The MSVC build in CI also avoids the MinGW toolchain entirely, which further reduces false-positive heuristic flags from some antivirus products.
 

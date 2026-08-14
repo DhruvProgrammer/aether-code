@@ -1,22 +1,12 @@
 name: Release (Windows)
 
 # Builds the AETHER Windows binaries with the standard MSVC toolchain and uploads them to the
-# GitHub release. The binaries are Authenticode-signed when signing is configured, which removes
-# the Windows SmartScreen "unknown publisher" warning.
+# GitHub release. If a code-signing certificate is provided via repo secrets, the binaries are
+# Authenticode-signed (which removes the Windows SmartScreen "unknown publisher" warning).
 #
-# Two signing paths (the workflow auto-detects which is configured):
-#
-#  A) Azure Trusted Signing (recommended — same mechanism popular agents like jcode use; gives
-#     instant SmartScreen reputation without buying a traditional EV certificate). Requires:
-#       Secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
-#       Vars:    WINDOWS_SIGNING_ENDPOINT, WINDOWS_SIGNING_ACCOUNT, WINDOWS_SIGNING_CERTIFICATE_PROFILE
-#     (Set up an Azure Trusted Signing account, then an app registration for GitHub OIDC.)
-#
-#  B) Traditional PFX certificate (base64-encoded):
-#       Secret: WINDOWS_CODESIGN_PFX   (base64 of the .pfx)
-#       Secret: WINDOWS_CODESIGN_PASSWORD
-#
-# If neither is configured, the binaries are uploaded UNSIGNED (SmartScreen will still warn).
+# Secrets (optional, repository settings -> Actions -> secrets):
+#   WINDOWS_CODESIGN_PFX       base64-encoded PKCS#12 (.pfx) certificate
+#   WINDOWS_CODESIGN_PASSWORD  password for the .pfx
 
 on:
   release:
@@ -30,18 +20,11 @@ on:
 
 permissions:
   contents: write
-  id-token: write
 
 jobs:
   build:
     runs-on: windows-latest
     env:
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      WINDOWS_SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
-      WINDOWS_SIGNING_ACCOUNT: ${{ vars.WINDOWS_SIGNING_ACCOUNT }}
-      WINDOWS_SIGNING_CERTIFICATE_PROFILE: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_PROFILE }}
       WINDOWS_CODESIGN_PFX: ${{ secrets.WINDOWS_CODESIGN_PFX }}
       WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
     steps:
@@ -55,64 +38,21 @@ jobs:
       - name: Build release (MSVC)
         run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Determine signing mode
-        id: signing
-        shell: pwsh
-        run: |
-          $azureOk = -not (@($env:AZURE_CLIENT_ID, $env:AZURE_TENANT_ID, $env:AZURE_SUBSCRIPTION_ID, $env:WINDOWS_SIGNING_ENDPOINT, $env:WINDOWS_SIGNING_ACCOUNT, $env:WINDOWS_SIGNING_CERTIFICATE_PROFILE) | Where-Object { [string]::IsNullOrWhiteSpace($_) })
-          $pfxOk = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_PFX)
-          if ($azureOk) { "mode=azure" | Out-File -Append $env:GITHUB_OUTPUT }
-          elseif ($pfxOk) { "mode=pfx" | Out-File -Append $env:GITHUB_OUTPUT }
-          else { "mode=none" | Out-File -Append $env:GITHUB_OUTPUT }
-          Write-Host "signing mode: $(if ($azureOk) { 'azure' } elseif ($pfxOk) { 'pfx' } else { 'none' })"
-
-      - name: Azure login (OIDC)
-        if: steps.signing.outputs.mode == 'azure'
-        uses: azure/login@v3
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Sign with Azure Trusted Signing
-        if: steps.signing.outputs.mode == 'azure'
-        uses: azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.WINDOWS_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_PROFILE }}
-          files: |
-            target\x86_64-pc-windows-msvc\release\aether.exe
-            target\x86_64-pc-windows-msvc\release\aether-mcp.exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      - name: Decode PFX (if provided)
-        if: steps.signing.outputs.mode == 'pfx'
+      - name: Decode code-signing certificate
+        if: ${{ env.WINDOWS_CODESIGN_PFX != '' }}
         shell: pwsh
         run: |
           $bytes = [System.Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX)
           Set-Content -Path cert.pfx -Value $bytes -Encoding Byte
 
-      - name: Sign with PFX (signtool)
-        if: steps.signing.outputs.mode == 'pfx'
+      - name: Sign binaries
+        if: ${{ env.WINDOWS_CODESIGN_PFX != '' }}
         shell: pwsh
         run: |
           $signtool = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $signtool) { $signtool = "signtool.exe" } else { $signtool = $signtool.FullName }
           foreach ($exe in @("target\x86_64-pc-windows-msvc\release\aether.exe", "target\x86_64-pc-windows-msvc\release\aether-mcp.exe")) {
             & $signtool sign /f cert.pfx /p $env:WINDOWS_CODESIGN_PASSWORD /fd sha256 /tr http://timestamp.digicert.com /td sha256 /d "AETHER coding agent" $exe
-          }
-
-      - name: Verify signature
-        if: steps.signing.outputs.mode != 'none'
-        shell: pwsh
-        run: |
-          foreach ($exe in @("target\x86_64-pc-windows-msvc\release\aether.exe", "target\x86_64-pc-windows-msvc\release\aether-mcp.exe")) {
-            $sig = Get-AuthenticodeSignature -LiteralPath $exe
-            if ($sig.Status -ne 'Valid') { throw "Authenticode verification failed for $exe : $($sig.Status) $($sig.StatusMessage)" }
-            Write-Host "Signed by: $($sig.SignerCertificate.Subject)"
           }
 
       - name: Package release asset
