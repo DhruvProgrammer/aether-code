@@ -163,8 +163,19 @@ embed: POST {base_url}/embeddings
 - Design rationale in `docs/AGENT_ARCHITECTURE.md`; `agents/*.toml` ship the 10 definitions.
   6 new unit tests (registry validity/override/enable-disable, router routing/verification/security,
   lifecycle depth/child limits, context build) — full-suite 20 tests pass; `cargo build` clean.
-- Out of scope this pass: Phase 4 foreground/background/resume/lanes & worktrees, Phase 6 tracing
-  (`traces` table), and the MCP/Jonathans tool-server port — tracked as follow-ups.
+- Out of scope this pass: Phase 4 foreground/background/resume/lanes & worktrees and the
+  MCP/Jonathans tool-server port — tracked as follow-ups.
+
+**Phase 10 — Tracing table (✅ complete 2026-08-14)**
+- New `traces` table in `aether-sessions` (spec §34 / Phase 6): point-in-time records of what an
+  agent or the loop did, for debugging, replay, and audit. `record_trace(session_id, kind, agent,
+  parent, summary, payload)` + `list_traces(session_id, limit)` (newest-first).
+- Wired through `Agent::run`: `explore`, `plan` (controller), `execute` (implementer), each
+  verification `verify` (tester/reviewer/security-reviewer with status+summary), and the loop
+  `decision` (CONTINUE/STOP/ESCALATE) are all traced. No-op when the session store is disabled.
+- CLI: `--traces` prints the session's trace log after a non-interactive run; `/traces` in the
+  REPL prints it on demand. Output is `HH:MM:SS  kind       agent           summary`.
+- Regression test in `aether-sessions` covers record + newest-first list.
 
 ---
 

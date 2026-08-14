@@ -39,6 +39,9 @@ struct Cli {
     /// Emit machine-parseable JSON (exit non-zero on failure).
     #[arg(long)]
     json: bool,
+    /// Print the session's trace log (agent actions / decisions / verification) after running.
+    #[arg(long)]
+    traces: bool,
     /// Path to config.toml (defaults to ~/.aether/config.toml).
     #[arg(long)]
     config: Option<PathBuf>,
@@ -192,7 +195,7 @@ async fn run() -> anyhow::Result<()> {
         cfg.agent.executor_model.clone(),
         providers,
         Some(store.clone()),
-        session_id,
+        session_id.clone(),
         mind,
         embedder,
         cfg.memory.auto_extract,
@@ -222,21 +225,24 @@ async fn run() -> anyhow::Result<()> {
     match cli.task.or(cli.prompt) {
         Some(task) => {
             let outcome = agent.run(&format(&task), current_mode, None).await?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "mode": current_mode.label(),
-                        "plan": outcome.plan,
-                        "result": outcome.result,
-                        "review": outcome.review,
-                        "test": outcome.test,
-                        "engineering": outcome.engineering
-                    })
-                );
-            } else {
-                println!("\n{}\n", outcome.result);
-            }
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "mode": current_mode.label(),
+                            "plan": outcome.plan,
+                            "result": outcome.result,
+                            "review": outcome.review,
+                            "test": outcome.test,
+                            "engineering": outcome.engineering
+                        })
+                    );
+                } else {
+                    println!("\n{}\n", outcome.result);
+                }
+                if cli.traces {
+                    print_traces(&store, &session_id);
+                }
         }
         None => {
             if !std::io::stdin().is_terminal() {
@@ -274,6 +280,10 @@ async fn run() -> anyhow::Result<()> {
                     println!("Current mode: {}\nAvailable modes: BUILD, PLAN", current_mode);
                     continue;
                 }
+                if task == "/traces" {
+                    print_traces(&store, &session_id);
+                    continue;
+                }
                 // In BUILD MODE, reuse a plan produced earlier in PLAN MODE (spec §22).
                 let plan_arg: Option<String> = if current_mode.is_plan() { None } else { last_plan.clone() };
                 match agent.run(&format(task), current_mode, plan_arg.as_deref()).await {
@@ -290,6 +300,21 @@ async fn run() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Print a session's trace log (agent actions / decisions / verification) for debugging.
+fn print_traces(store: &SessionStore, session_id: &str) {
+    match store.list_traces(session_id, 200) {
+        Ok(traces) if traces.is_empty() => ui::note("no traces recorded for this session"),
+        Ok(traces) => {
+            ui::section("[traces]", &format!("{} event(s)", traces.len()));
+            for t in traces.iter().rev() {
+                let when = t.ts.get(11..19).unwrap_or(&t.ts);
+                println!("  {}  {:<9} {:<14} {}", when, t.kind, t.agent, t.summary);
+            }
+        }
+        Err(e) => ui::error(&e.to_string()),
+    }
 }
 
 /// Keep the console window open on error/exit when launched from Explorer (double-click),

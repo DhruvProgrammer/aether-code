@@ -195,6 +195,7 @@ impl Agent {
                                 eng.add_fact(f);
                             }
                         }
+                        trace(&self.session, &self.session_id, "explore", "explorer", &r.summary);
                     }
                     Err(e) => eprintln!("explorer failed: {e}"),
                 }
@@ -252,6 +253,7 @@ impl Agent {
             println!("[PLAN {}]\n{plan}\n", iter + 1);
             eng.set_strategy(&plan);
             eng.add_decision(&format!("plan iteration {}", iter + 1), "controller produced plan", 0.6);
+            trace(&self.session, &self.session_id, "plan", "controller", &plan.chars().take(240).collect::<String>());
 
             // Cost routing (§8): pick Coder model by task intent.
             let coder_model = crate::router::select_model(
@@ -276,6 +278,7 @@ impl Agent {
             let result = coder.run(&cycle_task).await?;
             eng.record_action(&format!("execute plan (iter {})", iter + 1));
             eng.observe("executor", &summarize(&result), None, None);
+            trace(&self.session, &self.session_id, "execute", "implementer", &summarize(&result));
 
             // Subagent handoff: the routed verification pipeline (spec §17-§18, §58).
             let mut review: Option<SubagentResult> = None;
@@ -302,6 +305,13 @@ impl Agent {
                     {
                         Ok(r) => {
                             println!("[{}] {}\n", r.role.to_uppercase(), r.summary);
+                            trace(
+                                &self.session,
+                                &self.session_id,
+                                "verify",
+                                &aid,
+                                &format!("{}: {}", r.status, r.summary.chars().take(240).collect::<String>()),
+                            );
                             match aid.as_str() {
                                 "tester" => test = Some(r.clone()),
                                 "reviewer" => review = Some(r.clone()),
@@ -373,11 +383,16 @@ impl Agent {
 
             match eng.decide(iter + 1, loop_budget) {
                 LoopAction::Escalate => {
+                    trace(&self.session, &self.session_id, "decision", "loop-engine", "ESCALATE");
                     escalation = Some(eng.escalation_briefing());
                     break;
                 }
-                LoopAction::Stop => break,
+                LoopAction::Stop => {
+                    trace(&self.session, &self.session_id, "decision", "loop-engine", "STOP");
+                    break;
+                }
                 LoopAction::Continue => {
+                    trace(&self.session, &self.session_id, "decision", "loop-engine", "CONTINUE");
                     prev_result = Some(final_result.clone());
                     continue;
                 }
@@ -439,7 +454,8 @@ impl Agent {
         {
             Ok(r) => {
                 println!("[EXPLORE] {}\n", r.summary);
-                exploration = r.summary;
+                exploration = r.summary.clone();
+                trace(&self.session, &self.session_id, "explore", "explorer", &r.summary);
             }
             Err(e) => eprintln!("explorer failed: {e}"),
         }
@@ -497,6 +513,13 @@ impl Agent {
 
 fn summarize(s: &str) -> String {
     s.lines().take(12).collect::<Vec<_>>().join("\n")
+}
+
+/// Record a trace event for debugging/replay (spec Phase 6). No-op when session store is off.
+fn trace(store: &Option<Arc<SessionStore>>, session_id: &str, kind: &str, agent: &str, summary: &str) {
+    if let Some(s) = store {
+        let _ = s.record_trace(session_id, kind, agent, None, summary, "");
+    }
 }
 
 #[derive(Debug, Clone, Default)]
