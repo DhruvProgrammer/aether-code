@@ -1,0 +1,72 @@
+name: Release (Windows)
+
+# Builds the AETHER Windows binaries with the standard MSVC toolchain and uploads them to the
+# GitHub release. If a code-signing certificate is provided via repo secrets, the binaries are
+# Authenticode-signed (which removes the Windows SmartScreen "unknown publisher" warning).
+#
+# Secrets (optional, repository settings -> Actions -> secrets):
+#   WINDOWS_CODESIGN_PFX       base64-encoded PKCS#12 (.pfx) certificate
+#   WINDOWS_CODESIGN_PASSWORD  password for the .pfx
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload the assets to"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSVC target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release (MSVC)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Decode code-signing certificate
+        if: ${{ secrets.WINDOWS_CODESIGN_PFX != '' }}
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PFX: ${{ secrets.WINDOWS_CODESIGN_PFX }}
+        run: |
+          $bytes = [System.Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX)
+          Set-Content -Path cert.pfx -Value $bytes -Encoding Byte
+
+      - name: Sign binaries
+        if: ${{ secrets.WINDOWS_CODESIGN_PFX != '' }}
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+        run: |
+          $signtool = Get-ChildItem "C:\Program Files*\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $signtool) { $signtool = "signtool.exe" } else { $signtool = $signtool.FullName }
+          foreach ($exe in @("target\x86_64-pc-windows-msvc\release\aether.exe", "target\x86_64-pc-windows-msvc\release\aether-mcp.exe")) {
+            & $signtool sign /f cert.pfx /p $env:WINDOWS_CODESIGN_PASSWORD /fd sha256 /tr http://timestamp.digicert.com /td sha256 /d "AETHER coding agent" $exe
+          }
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\aether.exe, target\x86_64-pc-windows-msvc\release\aether-mcp.exe, README.md, config.example.toml, LICENSE dist
+          Compress-Archive -Path dist\* -DestinationPath aether-windows-x86_64.zip -Force
+
+      - name: Upload to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "release") { "${{ github.event.release.tag_name }}" } else { "${{ inputs.tag }}" }
+          gh release upload $tag aether-windows-x86_64.zip target\x86_64-pc-windows-msvc\release\aether.exe target\x86_64-pc-windows-msvc\release\aether-mcp.exe --clobber

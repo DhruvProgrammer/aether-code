@@ -195,6 +195,24 @@ See `docs/plan.md` for the phased roadmap and `DEPENDENCIES.md` for the dependen
 - `docs/config.md` — configuration reference.
 - `DEPENDENCIES.md` — every dependency and why it is justified (or deferred).
 
+## Security, SmartScreen and code signing
+
+**AETHER is not malware.** When you first run the downloaded `.exe`, Windows may show a *"Windows protected your PC"* / SmartScreen dialog. That is **not** a virus detection — Windows Defender's malware engine does **not** flag AETHER (verify on your own machine with `MpCmdRun.exe -Scan -ScanType 3 -File aether.exe`). The warning appears because the prebuilt binary is **unsigned** (unknown publisher); SmartScreen blocks unknown-publisher downloads until the publisher earns reputation.
+
+How to run it safely:
+
+1. **Run it anyway.** In the SmartScreen dialog, click *More info* -> *Run anyway*. The file is safe.
+2. **Build from source (no warning at all).** A binary you compile yourself is not "downloaded from the internet", so Windows does not attach the Mark-of-the-Web and SmartScreen will not warn. See [Requirements and building](#requirements-and-building).
+3. **Use a signed release.** Code signing removes the warning entirely. The repo ships a GitHub Actions workflow (`.github/workflows/release.yml`) that builds with the standard MSVC toolchain and **automatically code-signs** the binaries if you provide a certificate:
+
+   - Obtain an Authenticode code-signing certificate (an **EV** certificate gives instant SmartScreen reputation; a standard **OV/IV** certificate builds reputation as downloads accumulate).
+   - In *Repository settings -> Secrets and variables -> Actions*, add:
+     - `WINDOWS_CODESIGN_PFX` — the certificate exported as a **base64-encoded PFX** (`certutil -encode cert.pfx cert.b64`, then paste the file contents).
+     - `WINDOWS_CODESIGN_PASSWORD` — the PFX password.
+   - Publish a release (or run the *Release (Windows)* workflow manually). The `.exe` files are signed with a SHA-256 timestamp, and SmartScreen stops warning.
+
+The MSVC build in CI also avoids the MinGW toolchain entirely, which further reduces false-positive heuristic flags from some antivirus products.
+
 ## License
 
 MIT. See `LICENSE`.
