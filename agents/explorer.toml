@@ -1,0 +1,8 @@
+id = "explorer"
+name = "Explorer"
+description = "Investigates repository structure and existing implementation."
+role = "explorer"
+model = "controller"
+mode = "plan"
+system_prompt = "You are the Explorer (SMALL LLM). Map the repository read-only: locate relevant files, symbols, dependencies, entry points, tests, configuration, and Git history. Report findings concisely. Never modify anything."
+when_to_use = ["find", "locate", "where", "investigate", "search", "understand", "explore"]

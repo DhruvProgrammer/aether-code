@@ -127,6 +127,45 @@ embed: POST {base_url}/embeddings
   store (`kv` table) for inspection and future resume. 8 unit tests cover confidence, refutation,
   stagnation signatures, the circuit breaker, and success closing the loop.
 
+**Phase 8 — BUILD/PLAN modes + Karpathy guidelines (✅ complete 2026-08-14)**
+- New `aether-core::mode` module: explicit `Mode` enum (`Build` default / `Plan`) plus the
+  Karpathy policy + BUILD/PLAN system-prompt fragments (spec: build_plan_modes).
+- `Agent::run` now takes a `Mode` (+ optional `existing_plan`). `PLAN MODE` is a read-only
+  investigate→plan path: the read-only `EXPLORER` role inspects the repo, then the Controller
+  emits the structured PLAN document (Goal/Facts/Assumptions/Unknowns/Hypotheses/Approach/
+  Verification/Risks/Files). No executor runs, so nothing is modified.
+- `BUILD MODE` keeps the existing closed engineering loop; Karpathy guidelines are injected into
+  both the Controller plan prompt and the Executor (Coder) system prompt. When a plan was produced
+  earlier in PLAN MODE, BUILD MODE loads and re-validates it before editing (spec §22).
+- `skills/karpathy-guidelines/SKILL.md` is the authoritative guideline source; it is auto-discovered
+  by the existing skill index and its policy is injected into prompts (spec §40).
+- CLI: `--plan` selects PLAN MODE; interactive `/plan`, `/build`, `/mode` commands toggle/show the
+  mode (context and `last_plan` are preserved across switches, spec §24-§25). `--json` now reports
+  the active `mode`.
+
+**Phase 9 — Multi-agent subsystem (✅ complete 2026-08-14)**
+- New `aether-core::agents` module (spec: full_design.md, phases 2-3 + partial 5) makes agents
+  first-class: `definition` (TOML `AgentDefinition` + `AgentBudget`/`AgentPermissions`),
+  `registry` (10 built-in agents + `agents/<id>.toml` overrides from cwd, validated),
+  `router` (keyword/heuristic routing + `select_verification` = Tester + Reviewer, + Security
+  Reviewer on risk/security), `context` (builds the agent prompt), `lifecycle` (depth/child
+  limits), and `runner` (the `AgentTool` primitive that runs an agent on the resolved two-LLM
+  model with effective tools + policy).
+- Two-LLM is enforced in one place: `Agent::resolve()` maps `model = "controller"` → SMALL LLM,
+  `"executor"` → BIG LLM. `implementer` is the only BIG-LLM agent; all others (Explorer, Planner,
+  Designer, Tester, Reviewer, Security Reviewer, Debugger, Researcher, Documenter) run on the
+  SMALL LLM. Verification agents additionally run read-only (PLAN-mode policy).
+- Wired into `Agent::run`: the SMALL-LLM `explorer` gathers repo findings before the Controller
+  plans (BUILD MODE); after each implementation cycle the routed verification pipeline replaces the
+  old hardcoded reviewer/tester block; the LoopEngine's success criteria and confidence are fed by
+  the agents' structured `SubagentResult` (status/summary/findings). `reviewer_model`/`tester_model`
+  config fields were removed.
+- Design rationale in `docs/AGENT_ARCHITECTURE.md`; `agents/*.toml` ship the 10 definitions.
+  6 new unit tests (registry validity/override/enable-disable, router routing/verification/security,
+  lifecycle depth/child limits, context build) — full-suite 20 tests pass; `cargo build` clean.
+- Out of scope this pass: Phase 4 foreground/background/resume/lanes & worktrees, Phase 6 tracing
+  (`traces` table), and the MCP/Jonathans tool-server port — tracked as follow-ups.
+
 ---
 
 ## 4. Optimization guardrails (best code)

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 use aether_core::agent_loop::Agent;
+use aether_core::mode::Mode;
 use aether_models::ModelProvider;
 use aether_mind::{Mind, skills::SkillIndex};
 use aether_permissions::Permission;
@@ -200,8 +201,6 @@ async fn run() -> anyhow::Result<()> {
         policy,
         subagent_tools,
         cfg.subagents.enabled,
-        cfg.subagents.reviewer_model.clone(),
-        cfg.subagents.tester_model.clone(),
         cfg.agent.cheap_model.clone(),
         cfg.agent.max_iterations,
         cfg.context.max_tokens,
@@ -210,20 +209,24 @@ async fn run() -> anyhow::Result<()> {
 
     let format = |task: &str| -> String {
         if cli.plan {
-            format!("{task}\n\n(PLANNING MODE — do not modify files. Return a numbered plan only.)")
+            format!("{task}\n\n(PLAN MODE — read-only. Produce the structured PLAN document; do not modify files.)")
         } else {
             task.to_string()
         }
     };
 
     ui::banner("aether");
+    let mut current_mode: Mode = if cli.plan { Mode::Plan } else { Mode::Build };
+    let mut last_plan: Option<String> = None;
+
     match cli.task.or(cli.prompt) {
         Some(task) => {
-            let outcome = agent.run(&format(&task)).await?;
+            let outcome = agent.run(&format(&task), current_mode, None).await?;
             if cli.json {
                 println!(
                     "{}",
                     serde_json::json!({
+                        "mode": current_mode.label(),
                         "plan": outcome.plan,
                         "result": outcome.result,
                         "review": outcome.review,
@@ -241,7 +244,7 @@ async fn run() -> anyhow::Result<()> {
                 eprintln!("  Run from a terminal with a task, or just 'aether' for interactive mode.");
                 return Ok(());
             }
-            println!("aether — type a task, or /exit to quit.");
+            println!("aether — mode: {}. Type a task, /plan, /build, /mode, or /exit.", current_mode);
             let mut line = String::new();
             loop {
                 print!("aether> ");
@@ -257,8 +260,29 @@ async fn run() -> anyhow::Result<()> {
                 if task == "/exit" || task == "/quit" {
                     break;
                 }
-                match agent.run(&format(task)).await {
-                    Ok(o) => println!("\n{}\n", o.result),
+                if task == "/plan" {
+                    current_mode = Mode::Plan;
+                    ui::note("switched to PLAN MODE (read-only)");
+                    continue;
+                }
+                if task == "/build" {
+                    current_mode = Mode::Build;
+                    ui::note("switched to BUILD MODE");
+                    continue;
+                }
+                if task == "/mode" {
+                    println!("Current mode: {}\nAvailable modes: BUILD, PLAN", current_mode);
+                    continue;
+                }
+                // In BUILD MODE, reuse a plan produced earlier in PLAN MODE (spec §22).
+                let plan_arg: Option<String> = if current_mode.is_plan() { None } else { last_plan.clone() };
+                match agent.run(&format(task), current_mode, plan_arg.as_deref()).await {
+                    Ok(o) => {
+                        if current_mode.is_plan() {
+                            last_plan = Some(o.plan.clone());
+                        }
+                        println!("\n{}\n", o.result);
+                    }
                     Err(e) => ui::error(&e.to_string()),
                 }
             }

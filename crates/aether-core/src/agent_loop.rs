@@ -3,9 +3,11 @@
 //! subagents run a structured handoff pass (spec §4, §7, §29).
 //!
 //! Wrapped by a *loop-engineering* outer loop: an explicit `EngineeringModel` is
-//! maintained across plan→execute→verify→replan cycles. The loop engine detects
-//! stagnation, enforces budgets, tracks hypotheses/evidence/confidence, and acts as
-//! a circuit breaker that escalates or stops instead of retrying blindly.
+//! maintained across plan→execute→verify→replan cycles. The multi-agent subsystem
+//! (`crate::agents`) lets the SMALL LLM (controller) orchestrate specialized workers
+//! (Explorer/Planner/Designer/Tester/Reviewer/Security Reviewer/…); the BIG LLM
+//! (executor) implements via the `implementer` agent. The LoopEngine is the circuit
+//! breaker that escalates or stops instead of blind-retrying.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,9 +18,13 @@ use aether_models::ModelProvider;
 use aether_permissions::Policy;
 use aether_sessions::SessionStore;
 use aether_tools::Tool;
+use crate::agents::{
+    AgentRegistry, AgentRouter, AgentStatus, LifecycleTracker, build_agent_context, run_agent,
+};
 use crate::eng::{LoopAction, LoopEngine, LoopState};
 use crate::executor::Executor;
-use crate::subagents::{run_role, SubagentResult, REVIEWER, TESTER};
+use crate::mode::Mode;
+use crate::subagents::{run_role, SubagentResult, EXPLORER};
 
 const CODER_SYSTEM: &str = "You are the Coder (Executor). Implement the task using the available \
                             tools. When the work is complete, reply with a final summary and no tool calls.";
@@ -38,8 +44,6 @@ pub struct Agent {
     policy: Policy,
     tools: HashMap<String, Arc<dyn Tool>>,
     subagents_enabled: bool,
-    reviewer_model: String,
-    tester_model: String,
     cheap_model: Option<String>,
     max_iterations: u32,
     context_max_tokens: u32,
@@ -63,8 +67,6 @@ impl Agent {
         policy: Policy,
         tools: HashMap<String, Arc<dyn Tool>>,
         subagents_enabled: bool,
-        reviewer_model: String,
-        tester_model: String,
         cheap_model: Option<String>,
         max_iterations: u32,
         context_max_tokens: u32,
@@ -85,8 +87,6 @@ impl Agent {
             policy,
             tools,
             subagents_enabled,
-            reviewer_model,
-            tester_model,
             cheap_model,
             max_iterations,
             context_max_tokens,
@@ -94,22 +94,45 @@ impl Agent {
         }
     }
 
+    /// Resolve an agent's `model` key ("controller" = SMALL LLM, "executor" = BIG LLM) to a
+    /// provider + model string. This is the single enforcement point for two-LLM routing.
+    fn resolve(&self, key: &str) -> (Arc<dyn ModelProvider>, String) {
+        if key == "executor" {
+            (
+                self.providers
+                    .get(&self.executor_model)
+                    .cloned()
+                    .unwrap_or_else(|| self.controller.clone()),
+                self.executor_model.clone(),
+            )
+        } else {
+            (self.controller.clone(), self.controller_model.clone())
+        }
+    }
+
     fn provider_for(&self, key: &str) -> Arc<dyn ModelProvider> {
         self.providers
             .get(key)
             .cloned()
-            .or_else(|| self.providers.get(&self.executor_model).cloned())
             .unwrap_or_else(|| self.controller.clone())
     }
 
-    pub async fn run(&self, task: &str) -> anyhow::Result<AgentOutcome> {
+    pub async fn run(
+        &self,
+        task: &str,
+        mode: Mode,
+        existing_plan: Option<&str>,
+    ) -> anyhow::Result<AgentOutcome> {
         if let Some(store) = &self.session {
             let _ = store.add_message(&self.session_id, "user", task);
         }
 
+        // Agent subsystem: registry (TOML + builtins) and lifecycle tracker (depth/child limits).
+        let registry = AgentRegistry::load_from_dir(&self.cwd);
+        let mut lifecycle = LifecycleTracker::new(3, 5);
+
         // --- Loop engineering: establish the EngineeringModel -------------------
         let mut eng = LoopEngine::new(task);
-        eng.set_success_criteria(vec!["reviewer passes".into(), "tester passes".into()]);
         eng.model.loop_state = LoopState::Understanding;
         println!("{}", eng.render_panel());
 
@@ -123,6 +146,79 @@ impl Agent {
             }
         }
 
+        // PLAN MODE: read-only investigate -> plan. Never modify the project (spec §13-§21).
+        if mode.is_plan() {
+            return self.run_plan(task, &context).await;
+        }
+
+        // BUILD MODE may be asked to implement an existing plan; load + validate it (§22).
+        let plan_context: String = if let Some(p) = existing_plan {
+            format!(
+                "{task}\n\n# Existing plan to implement\nValidate it is still fresh (files/requirements may have changed) before editing. Do not follow a stale plan blindly.\n{p}"
+            )
+        } else {
+            task.to_string()
+        };
+
+        // Multi-agent: Explorer (SMALL LLM) gathers repo findings before the Controller plans.
+        let mut exploration = String::new();
+        if self.subagents_enabled {
+            if let Some(explorer_def) = registry.find("explorer") {
+                let mut run = lifecycle.start("explorer", None, &self.session_id, None, None);
+                let (prov, model) = self.resolve(&explorer_def.model);
+                let ctx = build_agent_context(
+                    explorer_def,
+                    &format!("Investigate the repository to plan this change:\n{task}"),
+                    Mode::Build,
+                    "",
+                    "",
+                );
+                match run_agent(
+                    explorer_def,
+                    prov,
+                    &model,
+                    &self.tools,
+                    &self.policy,
+                    &self.cwd,
+                    self.session.clone(),
+                    &self.session_id,
+                    &run,
+                    &ctx,
+                )
+                .await
+                {
+                    Ok(r) => {
+                        exploration = r.summary.clone();
+                        println!("[EXPLORE] {}\n", r.summary);
+                        if !r.findings.is_empty() {
+                            for f in &r.findings {
+                                eng.add_unknown(f);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("explorer failed: {e}"),
+                }
+                lifecycle.finish(&mut run, AgentStatus::Completed);
+            }
+        }
+        if !exploration.is_empty() {
+            context.push_str(&format!("\n## Explorer findings\n{}", exploration));
+        }
+
+        // Verification plan (Tester + Reviewer, + Security Reviewer on risk/security). Its ids also
+        // drive the engineering success criteria.
+        let verify_ids: Vec<String> = if self.subagents_enabled {
+            let high_risk = eng.model.risk_level == "high";
+            AgentRouter::select_verification(&registry, task, high_risk)
+        } else {
+            Vec::new()
+        };
+        let mut criteria = vec!["reviewer passes".to_string(), "tester passes".to_string()];
+        if verify_ids.iter().any(|i| i == "security-reviewer") {
+            criteria.push("security passes".to_string());
+        }
+        eng.set_success_criteria(criteria);
+
         let loop_budget = self.loop_budget.max(1);
         let mut prev_result: Option<String> = None;
         let mut final_result = String::new();
@@ -134,9 +230,9 @@ impl Agent {
         for iter in 0..loop_budget {
             eng.model.iteration = iter;
             let cycle_task: String = match &prev_result {
-                None => task.to_string(),
+                None => plan_context.clone(),
                 Some(prev) => format!(
-                    "{task}\n\n# Prior attempt result (adapt — do not repeat past failures)\n{prev}\n\n# Engineering state\n{}\n",
+                    "{plan_context}\n\n# Prior attempt result (adapt — do not repeat past failures)\n{prev}\n\n# Engineering state\n{}\n",
                     eng.state_summary()
                 ),
             };
@@ -147,6 +243,7 @@ impl Agent {
                 &self.controller_model,
                 &cycle_task,
                 &context,
+                Mode::Build,
             )
             .await?;
             if let Some(store) = &self.session {
@@ -173,98 +270,91 @@ impl Agent {
                 self.context_max_tokens,
                 self.session.clone(),
                 self.session_id.clone(),
-                CODER_SYSTEM.to_string(),
+                format!("{CODER_SYSTEM}\n{}", crate::mode::KARPATHY_POLICY),
                 None,
             );
             let result = coder.run(&cycle_task).await?;
             eng.record_action("execute plan via tools");
             eng.observe("executor", &summarize(&result), None, None);
 
-            // Subagent handoff: Reviewer + Tester (spec §7).
+            // Subagent handoff: the routed verification pipeline (spec §17-§18, §58).
             let mut review: Option<SubagentResult> = None;
             let mut test: Option<SubagentResult> = None;
-            if self.subagents_enabled {
-                let ctx = format!("Original task:\n{task}\n\nImplementation result:\n{result}");
-                if !self.reviewer_model.is_empty() {
-                    let p = self.provider_for(&self.reviewer_model);
-                    match run_role(
-                        &REVIEWER,
-                        p,
-                        &self.reviewer_model,
+            let mut security: Option<SubagentResult> = None;
+            for aid in &verify_ids {
+                if let Some(def) = registry.find(aid) {
+                    let mut run = lifecycle.start(aid, None, &self.session_id, None, None);
+                    let (prov, model) = self.resolve(&def.model);
+                    let ctx = format!("Original task:\n{task}\n\nImplementation result:\n{result}");
+                    match run_agent(
+                        def,
+                        prov,
+                        &model,
                         &self.tools,
                         &self.policy,
                         &self.cwd,
                         self.session.clone(),
                         &self.session_id,
+                        &run,
                         &ctx,
                     )
                     .await
                     {
                         Ok(r) => {
-                            println!("[REVIEW] {}\n", r.summary);
-                            review = Some(r);
+                            println!("[{}] {}\n", r.role.to_uppercase(), r.summary);
+                            match aid.as_str() {
+                                "tester" => test = Some(r.clone()),
+                                "reviewer" => review = Some(r.clone()),
+                                "security-reviewer" => security = Some(r.clone()),
+                                _ => {}
+                            }
+                            eng.add_evidence(
+                                &format!("{}: {}", r.role, r.summary),
+                                &aid,
+                                0.8,
+                                None,
+                                None,
+                            );
+                            for f in &r.findings {
+                                eng.add_unknown(f);
+                            }
                         }
-                        Err(e) => eprintln!("reviewer failed: {e}"),
+                        Err(e) => eprintln!("{} failed: {e}", aid),
                     }
-                }
-                if !self.tester_model.is_empty() {
-                    let p = self.provider_for(&self.tester_model);
-                    match run_role(
-                        &TESTER,
-                        p,
-                        &self.tester_model,
-                        &self.tools,
-                        &self.policy,
-                        &self.cwd,
-                        self.session.clone(),
-                        &self.session_id,
-                        &ctx,
-                    )
-                    .await
-                    {
-                        Ok(r) => {
-                            println!("[TEST] {}\n", r.summary);
-                            test = Some(r);
-                        }
-                        Err(e) => eprintln!("tester failed: {e}"),
-                    }
+                    lifecycle.finish(&mut run, AgentStatus::Completed);
                 }
             }
             last_review = review.clone();
             last_test = test.clone();
 
             // Update the EngineeringModel from verification evidence.
-            if self.subagents_enabled {
+            if verify_ids.is_empty() {
+                eng.mark_criteria_met("reviewer passes");
+                eng.mark_criteria_met("tester passes");
+            } else {
                 if let Some(r) = &review {
-                    let pass = r.status == "ok";
-                    if pass {
+                    if r.status == "ok" {
                         eng.mark_criteria_met("reviewer passes");
-                        eng.add_evidence(&format!("review: {}", r.summary), "review", 0.9, None, None);
                     } else {
                         eng.note_failure(&format!("reviewer: {}", r.summary));
-                        eng.add_evidence(&format!("review: {}", r.summary), "review", 0.3, None, None);
-                    }
-                    for f in &r.findings {
-                        eng.add_unknown(f);
                     }
                 }
                 if let Some(t) = &test {
-                    let pass = t.status == "ok";
-                    if pass {
+                    if t.status == "ok" {
                         eng.mark_criteria_met("tester passes");
-                        eng.add_evidence(&format!("test: {}", t.summary), "test", 0.9, None, None);
                     } else {
                         eng.note_failure(&format!("tester: {}", t.summary));
-                        eng.add_evidence(&format!("test: {}", t.summary), "test", 0.3, None, None);
                     }
                 }
-            } else {
-                // No verifier configured: avoid redundant re-execution; close after one cycle.
-                eng.mark_criteria_met("reviewer passes");
-                eng.mark_criteria_met("tester passes");
+                if let Some(s) = &security {
+                    if s.status == "ok" {
+                        eng.mark_criteria_met("security passes");
+                    } else {
+                        eng.note_failure(&format!("security: {}", s.summary));
+                    }
+                }
             }
 
-            // Next-best-action guidance for the next cycle (or the human).
             if eng.detect_stagnation() {
                 eng.set_next_best_action("STOP — approach is not converging; escalate to human");
             } else if !eng.model.unknowns.is_empty() {
@@ -273,7 +363,6 @@ impl Agent {
                 eng.set_next_best_action("Continue implementing remaining plan steps");
             }
 
-            // Persist the engineering model for inspection / resume.
             if let Some(store) = &self.session {
                 let _ = store.set_kv(
                     &self.session_id,
@@ -282,7 +371,7 @@ impl Agent {
                 );
             }
 
-            final_result = format!("{result}\n{}", self.handoff_text(&review, &test));
+            final_result = format!("{result}\n{}", self.handoff_text(&review, &test, &security));
             println!("{}", eng.render_panel());
 
             match eng.decide(iter + 1, loop_budget) {
@@ -308,7 +397,6 @@ impl Agent {
             );
         }
 
-        // Best-effort memory extraction (spec §9.3). Never blocks the user.
         if self.auto_extract {
             if let (Some(mind), Some(prov)) = (&self.mind, &self.embedder) {
                 let transcript = format!(
@@ -334,7 +422,59 @@ impl Agent {
         Ok(outcome)
     }
 
-    fn handoff_text(&self, review: &Option<SubagentResult>, test: &Option<SubagentResult>) -> String {
+    /// PLAN MODE: investigate the repository (read-only) and produce a structured plan.
+    /// Never modifies application source (spec §13-§21); Karpathy guidelines apply.
+    async fn run_plan(&self, task: &str, context: &str) -> anyhow::Result<AgentOutcome> {
+        let mut exploration = String::new();
+        let p = self.controller.clone();
+        match run_role(
+            &EXPLORER,
+            p,
+            &self.controller_model,
+            &self.tools,
+            &self.policy,
+            &self.cwd,
+            self.session.clone(),
+            &self.session_id,
+            &format!("Investigate the repository to plan this change:\n{task}"),
+        )
+        .await
+        {
+            Ok(r) => {
+                println!("[EXPLORE] {}\n", r.summary);
+                exploration = r.summary;
+            }
+            Err(e) => eprintln!("explorer failed: {e}"),
+        }
+
+        let plan_input = format!("{context}\n\n# Repository Exploration\n{exploration}");
+        let plan = crate::controller::plan(
+            self.controller.as_ref(),
+            &self.controller_model,
+            task,
+            &plan_input,
+            Mode::Plan,
+        )
+        .await?;
+        if let Some(store) = &self.session {
+            let _ = store.add_message(&self.session_id, "assistant", &format!("[PLAN]\n{plan}"));
+        }
+        println!("[PLAN MODE]\n{plan}\n");
+        Ok(AgentOutcome {
+            plan: plan.clone(),
+            result: plan,
+            review: None,
+            test: None,
+            engineering: String::new(),
+        })
+    }
+
+    fn handoff_text(
+        &self,
+        review: &Option<SubagentResult>,
+        test: &Option<SubagentResult>,
+        security: &Option<SubagentResult>,
+    ) -> String {
         let mut s = String::new();
         if let Some(r) = review {
             s.push_str(&format!("\n## Reviewer ({})\n{}\n", r.status, r.summary));
@@ -345,6 +485,12 @@ impl Agent {
         if let Some(t) = test {
             s.push_str(&format!("\n## Tester ({})\n{}\n", t.status, t.summary));
             for f in &t.findings {
+                s.push_str(&format!("- {f}\n"));
+            }
+        }
+        if let Some(sec) = security {
+            s.push_str(&format!("\n## Security Reviewer ({})\n{}\n", sec.status, sec.summary));
+            for f in &sec.findings {
                 s.push_str(&format!("- {f}\n"));
             }
         }
