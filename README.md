@@ -1,5 +1,9 @@
 # AETHER
 
+<p align="center">
+  <img src="assets/aether.jpg" alt="AETHER" width="720" />
+</p>
+
 > Lightweight, Rust-native, OpenAI-API-compatible coding agent with an embedded persistent memory engine.
 
 AETHER is a coding agent that talks to **any** OpenAI-compatible API (`/v1/chat/completions` + `/v1/embeddings`) and ships as a single small Windows `.exe`. It uses a two-model architecture — a **Controller** that plans and an **Executor** that codes — plus an embedded memory engine (`aether-mind`) that remembers users, projects, and facts across sessions so context never gets lost in a flat transcript.
