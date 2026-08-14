@@ -132,6 +132,26 @@ impl SessionStore {
         Ok(out)
     }
 
+    /// Fetch a single session's metadata by id (used for resume).
+    pub fn get(&self, session_id: &str) -> Result<Option<SessionMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, task, plan, result FROM sessions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map((session_id,), |r| {
+            Ok(SessionMeta {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                task: r.get(2)?,
+                plan: r.get(3)?,
+                result: r.get(4)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     /// Record a before-state snapshot so a write can be rolled back (spec §15).
     pub fn add_checkpoint(
         &self,

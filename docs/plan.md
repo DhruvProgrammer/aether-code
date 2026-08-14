@@ -177,6 +177,26 @@ embed: POST {base_url}/embeddings
   REPL prints it on demand. Output is `HH:MM:SS  kind       agent           summary`.
 - Regression test in `aether-sessions` covers record + newest-first list.
 
+**Phase 11 — Resume + git worktrees + background runs (✅ complete 2026-08-14)**
+- **Resume (spec: foreground/background + lanes):** `--resume <session_id>` reloads a prior
+  session's persisted `EngineeringModel` (`kv` table, written by Phase 7) plus its stored plan, then
+  continues the loop under the *same* session id. `SessionStore::get(id)` was added for plan lookup.
+  `Agent::run` takes a `session_override` so all persistence (messages / kv / traces / run record)
+  targets the resumed id — the continuation is recorded as one continuous session. Interactive
+  `/resume <id>` does the same from the REPL.
+- **Git worktree isolation (spec: worktrees):** `--worktree` creates a fresh `git worktree add`
+  (branch `aether/<short>`) next to the repo and runs the entire agent there, so its edits never
+  touch the user's main working tree. The worktree + branch are left in place for the user to review
+  and merge manually (no auto-merge). Bails clearly if not a git repo.
+- **Background runs (spec: lanes/background):** `--background "<task>"` spawns a detached child
+  process of `aether` (with `--session-id <uuid>` and a log file under `~/.aether/background/`),
+  prints the session id immediately, and returns. The child runs to completion independently; the
+  parent's terminal is free. The result is still a normal session you can later inspect with
+  `--resume <id>` / `--traces` (`/traces`). This gives real foreground/background semantics across
+  processes without destabilizing the single-loop harness.
+- Session id is printed at startup (`session: <id>`) so users can reference it for resume/traces.
+- Remaining spec follow-up: true in-process lanes/concurrency + the MCP/Jonathans tool-server port.
+
 ---
 
 ## 4. Optimization guardrails (best code)

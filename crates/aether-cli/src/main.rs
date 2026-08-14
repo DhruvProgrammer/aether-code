@@ -3,7 +3,8 @@ mod ui;
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -42,6 +43,19 @@ struct Cli {
     /// Print the session's trace log (agent actions / decisions / verification) after running.
     #[arg(long)]
     traces: bool,
+    /// Resume a previous session id (reloads its engineering state + plan and continues).
+    #[arg(long)]
+    resume: Option<String>,
+    /// Run the agent inside a git worktree so its edits are isolated and reviewable.
+    #[arg(long)]
+    worktree: bool,
+    /// Run a task as a detached background process; prints a session id you can later
+    /// inspect with `--resume <id>` / `--traces`.
+    #[arg(long)]
+    background: Option<String>,
+    /// Internal: force a specific session id (used by `--background` to spawn a child).
+    #[arg(long, hide = true)]
+    session_id: Option<String>,
     /// Path to config.toml (defaults to ~/.aether/config.toml).
     #[arg(long)]
     config: Option<PathBuf>,
@@ -75,6 +89,41 @@ async fn run() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
+
+    // Background run (Phase 4): spawn a detached child process with a fixed session id so the
+    // parent can return immediately. The child runs the same binary to completion on its own.
+    if let Some(task) = &cli.background {
+        let id = uuid::Uuid::new_v4().to_string();
+        let log_dir = aether_config::Config::default_dir().join("background");
+        std::fs::create_dir_all(&log_dir)?;
+        let log = log_dir.join(format!("{id}.log"));
+        let exe = std::env::current_exe()?;
+        let mut cmd = Command::new(exe);
+        cmd.arg(task).arg("--session-id").arg(&id);
+        if let Some(c) = &cli.config {
+            cmd.arg("--config").arg(c);
+        }
+        if cli.local {
+            cmd.arg("--local");
+        }
+        if cli.plan {
+            cmd.arg("--plan");
+        }
+        cmd.stdout(std::fs::File::create(&log)?)
+            .stderr(std::fs::File::create(&log)?);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x00000200 | 0x00000008); // NEW_PROCESS_GROUP | DETACHED_PROCESS
+        }
+        let _ = cmd.spawn()?;
+        ui::section("[background]", &format!("session {id}"));
+        ui::note(&format!("log: {}", log.display()));
+        ui::note(&format!(
+            "inspect later:  aether --resume {id}   |   aether --traces (after --resume)"
+        ));
+        return Ok(());
+    }
 
     // Local mode (spec §6): point every model at the local OpenAI-compatible endpoint.
     if cli.local {
@@ -187,7 +236,31 @@ async fn run() -> anyhow::Result<()> {
     let subagent_tools = tools;
 
     let store = SessionStore::open(&aether_config::Config::default_dir().join("sessions.db"))?;
-    let session_id = store.new_session()?;
+
+    // Resume reuses the prior session id (and its persisted engineering state); otherwise we
+    // start fresh (or adopt the id passed by `--background`).
+    let (session_id, resume_plan): (String, Option<String>) = if let Some(id) = &cli.resume {
+        let plan = store.get(id).ok().flatten().and_then(|m| m.plan);
+        ui::note(&format!("resuming session {id}"));
+        (id.clone(), plan)
+    } else if let Some(id) = &cli.session_id {
+        (id.clone(), None)
+    } else {
+        (store.new_session()?, None)
+    };
+
+    // Worktree isolation (Phase 4): run inside a git worktree so agent edits are reviewable
+    // and never touch the user's main working tree until they merge.
+    let base_cwd = std::env::current_dir()?;
+    let run_cwd = if cli.worktree {
+        make_worktree(&base_cwd)?
+    } else {
+        base_cwd.clone()
+    };
+    if cli.worktree {
+        ui::note(&format!("working in git worktree: {}", run_cwd.display()));
+    }
+    ui::note(&format!("session: {session_id}"));
 
     let agent = Agent::new(
         controller,
@@ -200,7 +273,7 @@ async fn run() -> anyhow::Result<()> {
         embedder,
         cfg.memory.auto_extract,
         cfg.memory.memory_top_k,
-        std::env::current_dir()?,
+        run_cwd,
         policy,
         subagent_tools,
         cfg.subagents.enabled,
@@ -224,7 +297,9 @@ async fn run() -> anyhow::Result<()> {
 
     match cli.task.or(cli.prompt) {
         Some(task) => {
-            let outcome = agent.run(&format(&task), current_mode, None).await?;
+            let outcome = agent
+                .run(&format(&task), current_mode, resume_plan.as_deref(), cli.resume.as_deref())
+                .await?;
                 if cli.json {
                     println!(
                         "{}",
@@ -284,9 +359,31 @@ async fn run() -> anyhow::Result<()> {
                     print_traces(&store, &session_id);
                     continue;
                 }
+                if task.starts_with("/resume") {
+                    let id = task.split_whitespace().nth(1);
+                    match id {
+                        Some(id) => match store.get(id) {
+                            Ok(Some(meta)) => {
+                                let plan = meta.plan.clone();
+                                let t = meta.task.clone().unwrap_or_else(|| task.to_string());
+                                ui::note(&format!("resuming session {id}"));
+                                match agent
+                                    .run(&t, current_mode, plan.as_deref(), Some(id))
+                                    .await
+                                {
+                                    Ok(o) => println!("\n{}\n", o.result),
+                                    Err(e) => ui::error(&e.to_string()),
+                                }
+                            }
+                            _ => ui::error("session not found"),
+                        },
+                        None => ui::warn("usage: /resume <session_id>"),
+                    }
+                    continue;
+                }
                 // In BUILD MODE, reuse a plan produced earlier in PLAN MODE (spec §22).
                 let plan_arg: Option<String> = if current_mode.is_plan() { None } else { last_plan.clone() };
-                match agent.run(&format(task), current_mode, plan_arg.as_deref()).await {
+                match agent.run(&format(task), current_mode, plan_arg.as_deref(), None).await {
                     Ok(o) => {
                         if current_mode.is_plan() {
                             last_plan = Some(o.plan.clone());
@@ -330,6 +427,42 @@ fn pause_if_terminal() {
 }
 
 /// Print a friendly first-run / misconfiguration message instead of a bare error.
+/// Create a git worktree (Phase 4) so the agent's edits are isolated from the user's main
+/// working tree. Returns the worktree path; the caller runs the agent there. The worktree and
+/// its branch are left in place for the user to review and merge manually.
+fn make_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("--worktree requires a git repository; this directory is not one");
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let root_path = Path::new(&root);
+    let repo_name = root_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string());
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let parent = root_path.parent().unwrap_or_else(|| Path::new("."));
+    let wt = parent.join(format!("{repo_name}-aether-{short}"));
+    let branch = format!("aether/{short}");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["worktree", "add", "--force", "-b", &branch])
+        .arg(&wt)
+        .arg("HEAD")
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to create git worktree at {}", wt.display());
+    }
+    Ok(wt)
+}
+
 fn setup_help(cfg_path: &PathBuf, cfg_missing: bool) {
     eprintln!();
     eprintln!("AETHER needs a model configuration before it can run.");

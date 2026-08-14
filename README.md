@@ -15,6 +15,7 @@ AETHER is a coding agent that talks to **any** OpenAI-compatible API (`/v1/chat/
 - **Permissions, fail-safe (spec 14).** Per-category policy (`read`/`edit`/`bash`/`delete`/`git_commit`/`network`) with `allow`/`ask`/`deny`. **Read-only agents cannot run shell commands** (only the Tester may, to run tests). **Dangerous commands (`rm -rf`, `git reset --hard`, `git push --force`, …) are always denied.** `ask` prompts interactively when attached to a terminal and otherwise fails open for non-dangerous commands so non-interactive runs still work.
 - **MCP client and server (spec 6).** `aether` can connect to external MCP servers and use their tools; `aether-mcp` is itself an MCP server exposing the memory tools.
 - **Local / cloud mode.** `--local` redirects every model at a local OpenAI-compatible endpoint (Ollama / llama.cpp by default) with zero config changes.
+- **Resume, worktrees, and background runs.** `--resume <id>` continues a prior session (its engineering state and plan reload automatically). `--worktree` runs the agent in a git worktree so its edits never touch your main working tree until you merge. `--background "<task>"` runs a task as a detached process and returns immediately with a session id you can inspect later via `--resume` / `--traces`. Every run prints its `session: <id>`.
 - **Minimalist light UI.** Pantone-anchored, low-chroma terminal styling (`docs/design.md`). No emojis, no noise.
 - **Small and dependency-justified.** A single static `.exe`; every dependency is justified against the spec (30). RAM target is ~60 MB with embeddings off.
 
@@ -129,10 +130,16 @@ aether "<task>"            Run a task non-interactively
 aether                     Start the interactive REPL (type /exit to quit)
 aether --plan "<task>"     Read-only planning mode (returns a plan, no file changes)
 aether --local "<task>"    Point all models at the local endpoint (Ollama / llama.cpp)
+aether --resume <id>       Continue a previous session (reloads its engineering state + plan)
+aether --worktree "<task>" Run inside a git worktree (edits isolated, review/merge manually)
+aether --background "<t>"  Run as a detached background process; prints a session id to inspect later
+aether --traces "<task>"   Print the session's trace log (agent actions / decisions) after running
 aether --rollback <id>     Restore the last file-write checkpoint for a session
 aether --config path.toml  Use a specific config file
 aether --json "<task>"     Emit machine-parseable JSON (plan / result / review / test)
 ```
+
+**REPL commands:** `/plan`, `/build`, `/mode` (toggle/show BUILD/PLAN mode), `/traces` (print the current session's trace log), `/resume <id>` (continue a previous session), `/exit`. The session id is printed at startup (`session: <id>`) so you can resume or trace it later.
 
 ### Memory tools
 

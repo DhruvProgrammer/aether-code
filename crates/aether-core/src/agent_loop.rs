@@ -122,9 +122,13 @@ impl Agent {
         task: &str,
         mode: Mode,
         existing_plan: Option<&str>,
+        resume_session: Option<&str>,
     ) -> anyhow::Result<AgentOutcome> {
+        // When resuming, all persistence (messages / kv / traces / run record) targets the
+        // resumed session so the continuation is recorded under the same id.
+        let sid = resume_session.unwrap_or(&self.session_id);
         if let Some(store) = &self.session {
-            let _ = store.add_message(&self.session_id, "user", task);
+            let _ = store.add_message(sid, "user", task);
         }
 
         // Agent subsystem: registry (TOML + builtins) and lifecycle tracker (depth/child limits).
@@ -133,6 +137,15 @@ impl Agent {
 
         // --- Loop engineering: establish the EngineeringModel -------------------
         let mut eng = LoopEngine::new(task);
+        // Resume: seed the model from a prior session's persisted engineering state.
+        if let (Some(rs), Some(store)) = (resume_session, &self.session) {
+            if let Ok(Some(json)) = store.get_kv(rs, "engineering") {
+                if let Ok(m) = serde_json::from_str::<crate::eng::EngineeringModel>(&json) {
+                    eng.model = m;
+                    println!("[RESUME] loaded engineering state from session {rs}");
+                }
+            }
+        }
         eng.model.loop_state = LoopState::Understanding;
         println!("{}", eng.render_panel());
 
@@ -164,7 +177,7 @@ impl Agent {
         let mut exploration = String::new();
         if self.subagents_enabled {
             if let Some(explorer_def) = registry.find("explorer") {
-                let mut run = lifecycle.start("explorer", None, &self.session_id, None, None);
+                let mut run = lifecycle.start("explorer", None, sid, None, None);
                 let (prov, model) = self.resolve(&explorer_def.model);
                 let ctx = build_agent_context(
                     explorer_def,
@@ -181,7 +194,7 @@ impl Agent {
                     &self.policy,
                     &self.cwd,
                     self.session.clone(),
-                    &self.session_id,
+                    sid,
                     &run,
                     &ctx,
                 )
@@ -195,7 +208,7 @@ impl Agent {
                                 eng.add_fact(f);
                             }
                         }
-                        trace(&self.session, &self.session_id, "explore", "explorer", &r.summary);
+                trace(&self.session, &self.session_id, "explore", "explorer", &r.summary);
                     }
                     Err(e) => eprintln!("explorer failed: {e}"),
                 }
@@ -248,12 +261,12 @@ impl Agent {
             )
             .await?;
             if let Some(store) = &self.session {
-                let _ = store.add_message(&self.session_id, "assistant", &format!("[PLAN {}]\n{plan}", iter + 1));
+                let _ = store.add_message(sid, "assistant", &format!("[PLAN {}]\n{plan}", iter + 1));
             }
             println!("[PLAN {}]\n{plan}\n", iter + 1);
             eng.set_strategy(&plan);
             eng.add_decision(&format!("plan iteration {}", iter + 1), "controller produced plan", 0.6);
-            trace(&self.session, &self.session_id, "plan", "controller", &plan.chars().take(240).collect::<String>());
+            trace(&self.session, sid, "plan", "controller", &plan.chars().take(240).collect::<String>());
 
             // Cost routing (§8): pick Coder model by task intent.
             let coder_model = crate::router::select_model(
@@ -278,7 +291,7 @@ impl Agent {
             let result = coder.run(&cycle_task).await?;
             eng.record_action(&format!("execute plan (iter {})", iter + 1));
             eng.observe("executor", &summarize(&result), None, None);
-            trace(&self.session, &self.session_id, "execute", "implementer", &summarize(&result));
+            trace(&self.session, sid, "execute", "implementer", &summarize(&result));
 
             // Subagent handoff: the routed verification pipeline (spec §17-§18, §58).
             let mut review: Option<SubagentResult> = None;
@@ -286,7 +299,7 @@ impl Agent {
             let mut security: Option<SubagentResult> = None;
             for aid in &verify_ids {
                 if let Some(def) = registry.find(aid) {
-                    let mut run = lifecycle.start(aid, None, &self.session_id, None, None);
+                    let mut run = lifecycle.start(aid, None, sid, None, None);
                     let (prov, model) = self.resolve(&def.model);
                     let ctx = format!("Original task:\n{task}\n\nImplementation result:\n{result}");
                     match run_agent(
@@ -297,7 +310,7 @@ impl Agent {
                         &self.policy,
                         &self.cwd,
                         self.session.clone(),
-                        &self.session_id,
+                        sid,
                         &run,
                         &ctx,
                     )
@@ -307,7 +320,7 @@ impl Agent {
                             println!("[{}] {}\n", r.role.to_uppercase(), r.summary);
                             trace(
                                 &self.session,
-                                &self.session_id,
+                                sid,
                                 "verify",
                                 &aid,
                                 &format!("{}: {}", r.status, r.summary.chars().take(240).collect::<String>()),
@@ -372,7 +385,7 @@ impl Agent {
 
             if let Some(store) = &self.session {
                 let _ = store.set_kv(
-                    &self.session_id,
+                    sid,
                     "engineering",
                     &serde_json::to_string(&eng.model).unwrap_or_default(),
                 );
@@ -383,16 +396,16 @@ impl Agent {
 
             match eng.decide(iter + 1, loop_budget) {
                 LoopAction::Escalate => {
-                    trace(&self.session, &self.session_id, "decision", "loop-engine", "ESCALATE");
+                    trace(&self.session, sid, "decision", "loop-engine", "ESCALATE");
                     escalation = Some(eng.escalation_briefing());
                     break;
                 }
                 LoopAction::Stop => {
-                    trace(&self.session, &self.session_id, "decision", "loop-engine", "STOP");
+                    trace(&self.session, sid, "decision", "loop-engine", "STOP");
                     break;
                 }
                 LoopAction::Continue => {
-                    trace(&self.session, &self.session_id, "decision", "loop-engine", "CONTINUE");
+                    trace(&self.session, sid, "decision", "loop-engine", "CONTINUE");
                     prev_result = Some(final_result.clone());
                     continue;
                 }
@@ -400,9 +413,9 @@ impl Agent {
         }
 
         if let Some(store) = &self.session {
-            let _ = store.add_message(&self.session_id, "assistant", &final_result);
+            let _ = store.add_message(sid, "assistant", &final_result);
             let _ = store.record_run(
-                &self.session_id,
+                sid,
                 task,
                 &eng.model.current_strategy.clone().unwrap_or_default(),
                 &final_result,
