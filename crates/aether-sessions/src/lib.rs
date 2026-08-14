@@ -56,6 +56,12 @@ impl SessionStore {
                 path TEXT NOT NULL,
                 before_content TEXT,
                 ts TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS kv(
+                session_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (session_id, key)
             );",
         )?;
         Ok(Arc::new(Self { conn }))
@@ -147,6 +153,26 @@ impl SessionStore {
                 ts: r.get(4)?,
             })
         })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist an arbitrary key/value blob for a session (used for the engineering model).
+    pub fn set_kv(&self, session_id: &str, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO kv(session_id, key, value) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(session_id, key) DO UPDATE SET value = ?3",
+            (session_id, key, value),
+        )?;
+        Ok(())
+    }
+
+    /// Read a previously stored key/value blob, if any.
+    pub fn get_kv(&self, session_id: &str, key: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT value FROM kv WHERE session_id = ?1 AND key = ?2")?;
+        let mut rows = stmt.query_map((session_id, key), |r| r.get::<_, String>(0))?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),

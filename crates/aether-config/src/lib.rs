@@ -33,6 +33,10 @@ pub struct AgentConfig {
     pub executor_model: String,
     #[serde(default = "dft_max_iter")]
     pub max_iterations: u32,
+    /// Outer closed-loop budget: how many plan→execute→verify→replan cycles the
+    /// engineering loop may run before the circuit breaker hard-stops (spec: loop engineering).
+    #[serde(default = "dft_loop_budget")]
+    pub loop_budget: u32,
     #[serde(default = "dft_policy")]
     pub routing_policy: String,
     /// Optional cheaper model key for trivial tasks (spec §8 cost routing).
@@ -45,6 +49,7 @@ pub struct AgentConfig {
 fn dft_controller() -> String { "controller".into() }
 fn dft_executor() -> String { "executor".into() }
 fn dft_max_iter() -> u32 { 30 }
+fn dft_loop_budget() -> u32 { 3 }
 fn dft_policy() -> String { "balanced".into() }
 fn dft_local_endpoint() -> String { "http://127.0.0.1:11434/v1".into() }
 
@@ -54,6 +59,7 @@ impl Default for AgentConfig {
             controller_model: dft_controller(),
             executor_model: dft_executor(),
             max_iterations: dft_max_iter(),
+            loop_budget: dft_loop_budget(),
             routing_policy: dft_policy(),
             cheap_model: None,
             local_endpoint: dft_local_endpoint(),

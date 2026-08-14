@@ -5,6 +5,9 @@
 controller_model = "controller"
 executor_model   = "executor"
 max_iterations   = 30
+# Outer closed-loop budget: how many plan->execute->verify->replan cycles the
+# loop-engineering circuit breaker may run before it hard-stops (loop engineering).
+loop_budget      = 3
 routing_policy   = "balanced"
 # Optional cheaper model for read-only/explanatory tasks (cost routing, §8).
 cheap_model      = "fast"

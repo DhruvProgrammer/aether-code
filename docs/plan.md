@@ -112,6 +112,21 @@ embed: POST {base_url}/embeddings
   Any OpenAI-compatible local server works unchanged since the provider is already
   OpenAI-compatible.
 
+**Phase 7 — loop engineering (✅ complete 2026-08-14)**
+- New `aether-core::eng` module: an explicit `EngineeringModel` (goal, success criteria,
+  facts, unknowns, hypotheses with confidence + validation actions, evidence, observations,
+  decisions, actions, failures, risks, current strategy, next-best-action, confidence, risk
+  level, loop state) is the single source of truth the Controller/Executor reason against.
+- The outer `Agent::run` loop is now a closed plan→execute→verify→replan cycle driven by the
+  model. The `LoopEngine` acts as a mechanical circuit breaker: it detects stagnation (repeated
+  identical failures / actions), enforces the `loop_budget`, tracks hypothesis confidence, and
+  decides `Continue` / `Escalate` / `Stop`. On stagnation or low-confidence+high-risk it escalates
+  with a structured briefing instead of blind-retrying.
+- Expectation-vs-observation tracking, evidence-weighted confidence, and a compact
+  "AETHER ENGINEERING RUN" panel are printed each cycle; the model is persisted to the session
+  store (`kv` table) for inspection and future resume. 8 unit tests cover confidence, refutation,
+  stagnation signatures, the circuit breaker, and success closing the loop.
+
 ---
 
 ## 4. Optimization guardrails (best code)

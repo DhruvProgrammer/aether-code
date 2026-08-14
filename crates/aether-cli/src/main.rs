@@ -205,6 +205,7 @@ async fn run() -> anyhow::Result<()> {
         cfg.agent.cheap_model.clone(),
         cfg.agent.max_iterations,
         cfg.context.max_tokens,
+        cfg.agent.loop_budget,
     );
 
     let format = |task: &str| -> String {
@@ -226,7 +227,8 @@ async fn run() -> anyhow::Result<()> {
                         "plan": outcome.plan,
                         "result": outcome.result,
                         "review": outcome.review,
-                        "test": outcome.test
+                        "test": outcome.test,
+                        "engineering": outcome.engineering
                     })
                 );
             } else {

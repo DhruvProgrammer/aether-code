@@ -3,6 +3,7 @@
 
 pub mod agent_loop;
 pub mod controller;
+pub mod eng;
 pub mod executor;
 pub mod router;
 pub mod subagents;
