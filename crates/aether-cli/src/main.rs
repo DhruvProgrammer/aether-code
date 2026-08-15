@@ -1,5 +1,6 @@
 //! CLI entrypoint (spec §23, §24). OpenAI-compatible coding agent.
 mod ui;
+mod tui;
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -19,7 +20,7 @@ use aether_tools::Tool;
 
 #[derive(Parser)]
 #[command(name = "aether", version, about = "OpenAI-compatible coding agent")]
-struct Cli {
+pub struct Cli {
     /// Task to run non-interactively.
     task: Option<String>,
     /// Task to run non-interactively (explicit flag).
@@ -59,6 +60,10 @@ struct Cli {
     /// Path to config.toml (defaults to ~/.aether/config.toml).
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Launch the interactive TUI. The TUI is also auto-launched when no task is
+    /// supplied and stdin/stdout are both TTYs.
+    #[arg(long)]
+    tui: bool,
 }
 
 #[tokio::main]
@@ -77,6 +82,15 @@ async fn run() -> anyhow::Result<()> {
         tracing_subscriber::fmt().with_env_filter("debug").init();
     } else {
         tracing_subscriber::fmt().with_env_filter("info").init();
+    }
+
+    // TUI dispatch: when the user runs `aether` with no task and on a real
+    // terminal, drop into the ratatui front-end. `--tui` is explicit.
+    let has_task = cli.task.is_some() || cli.prompt.is_some();
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if cli.tui || (interactive && !has_task && cli.background.is_none() && cli.resume.is_none() && cli.rollback.is_none() && cli.traces == false) {
+        let args: Vec<String> = std::env::args().collect();
+        return tui::run_tui(cli, args).await;
     }
 
     let cfg_path = cli.config.clone().unwrap_or_else(aether_config::Config::default_path);
