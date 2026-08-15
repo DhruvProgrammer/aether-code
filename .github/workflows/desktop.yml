@@ -43,7 +43,7 @@ jobs:
         working-directory: packages/app
 
       - name: Build aether CLI (release)
-        run: cargo build -p aether-cli -p aether-mcp --release
+        run: cargo build -p aether-cli --release --bins
 
       - name: Copy CLI into Tauri resources
         shell: bash
