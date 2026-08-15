@@ -14,6 +14,11 @@ cheap_model      = "fast"
 # Endpoint used by `--local` mode (Ollama/llama.cpp are OpenAI-compatible).
 local_endpoint   = "http://127.0.0.1:11434/v1"
 
+# LLM 3 — VISUAL FRONTEND REVIEWER (3-LLM visual engineering). OPTIONAL. When set, frontend
+# tasks are rendered, screenshotted, and critiqued by a multimodal model; the loop continues
+# until the reviewer APPROVES or the configured limit is reached. Leave unset to disable.
+# reviewer_model   = "reviewer"
+
 [memory]
 enabled           = true
 # backend/graph_store/vector_store are descriptive of the embedded engine:
@@ -74,6 +79,13 @@ base_url     = "https://api.openai.com/v1"
 model        = "gpt-4o-mini"
 api_key_env  = "OPENAI_API_KEY"
 
+# LLM 3 (optional): a multimodal/vision model for frontend visual review.
+# [models.reviewer]
+# provider     = "openai_compatible"
+# base_url     = "https://api.openai.com/v1"
+# model        = "gpt-4o"          # any vision-capable model (OpenAI, Gemini, etc.)
+# api_key_env  = "OPENAI_API_KEY"
+
 # --- Subagents (multi-agent verification pipeline) ---
 # When enabled, AETHER runs an Explorer before planning and a Tester + Reviewer (+ Security
 # Reviewer on risk) handoff pass after each implementation cycle. Disable to run the bare loop.
@@ -85,4 +97,19 @@ enabled = true
 # name    = "local-fs"
 # command = "/path/to/mcp-server"
 # args    = ["--root", "."]
+
+# --- Frontend visual engineering (3-LLM visual review, spec) ---
+# Active only when `agent.reviewer_model` is set AND `capture_command` is set AND the task
+# is a frontend task (or `force = true`). Screenshots go to ~/.aether/temp-screenshots/<id>/
+# and are deleted after the run. The capture command receives `{out}` (target png path) and
+# `{cwd}` (project dir); the preview command (optional) starts a dev server before capture.
+# [frontend]
+# capture_command = "npx --yes playwright screenshot --full-page {out}"   # writes png to {out}
+# preview_command = "npm run dev"                                          # optional; killed after capture
+# max_visual_iterations = 5
+# force = false
+# [frontend.acceptance]
+# require_no_critical = true
+# require_no_major = false
+# min_score = 90
 

@@ -25,6 +25,8 @@ use crate::eng::{LoopAction, LoopEngine, LoopState};
 use crate::executor::Executor;
 use crate::mode::Mode;
 use crate::subagents::{run_role, SubagentResult, EXPLORER};
+use crate::visual::{CorrectionExecutor, VisualReviewEngine, should_run_visual_review};
+use aether_config::FrontendConfig;
 
 const CODER_SYSTEM: &str = "You are the Coder (Executor). Implement the task using the available \
                             tools. When the work is complete, reply with a final summary and no tool calls.";
@@ -48,6 +50,11 @@ pub struct Agent {
     max_iterations: u32,
     context_max_tokens: u32,
     loop_budget: u32,
+    /// LLM 3 — VISUAL FRONTEND REVIEWER (optional). When `Some`, the 3-LLM visual loop may run.
+    reviewer: Option<Arc<dyn ModelProvider>>,
+    reviewer_model: Option<String>,
+    /// Frontend visual-engineering configuration (spec: 3-LLM visual review).
+    frontend: FrontendConfig,
 }
 
 impl Agent {
@@ -71,6 +78,9 @@ impl Agent {
         max_iterations: u32,
         context_max_tokens: u32,
         loop_budget: u32,
+        reviewer: Option<Arc<dyn ModelProvider>>,
+        reviewer_model: Option<String>,
+        frontend: FrontendConfig,
     ) -> Self {
         Self {
             controller,
@@ -91,6 +101,9 @@ impl Agent {
             max_iterations,
             context_max_tokens,
             loop_budget,
+            reviewer,
+            reviewer_model,
+            frontend,
         }
     }
 
@@ -434,6 +447,33 @@ impl Agent {
             }
         }
 
+        // --- Visual engineering loop (LLM 3): the 3-LLM frontend QA stage (spec §10) -------
+        // Runs only for frontend tasks when LLM 3 (reviewer) is configured. LLM 1 (executor)
+        // is mandatory and implements corrections; LLM 3 only critiques and approves.
+        if !mode.is_plan() {
+            if let Some(reviewer) = &self.reviewer {
+                if should_run_visual_review(task, &self.reviewer_model, &self.frontend) {
+                    println!("[VISUAL] entering 3-LLM visual engineering loop (FRONTEND_READY)");
+                    let engine = VisualReviewEngine::new(
+                        reviewer.clone(),
+                        self.reviewer_model.clone().unwrap_or_default(),
+                        self.controller.clone(),
+                        self.controller_model.clone(),
+                        self.frontend.clone(),
+                        self.cwd.clone(),
+                        self.session.clone(),
+                        sid.to_string(),
+                    );
+                    let report = engine.run(task, &eng.model.current_strategy.clone().unwrap_or_default(), self).await;
+                    println!("{}", report.summary);
+                    final_result.push_str(&format!("\n\n## Visual Review\n{}\n", report.summary));
+                    if let Some(store) = &self.session {
+                        let _ = store.add_message(sid, "assistant", &format!("[VISUAL] {}", report.summary));
+                    }
+                }
+            }
+        }
+
         let mut outcome = AgentOutcome {
             plan: eng.model.current_strategy.clone().unwrap_or_default(),
             result: final_result,
@@ -526,6 +566,28 @@ impl Agent {
 
 fn summarize(s: &str) -> String {
     s.lines().take(12).collect::<Vec<_>>().join("\n")
+}
+
+/// LLM 1 boundary for the visual loop: LLM 3's evidence flows to LLM 2 (correction plan),
+/// then here to actually implement the correction via the BIG EXECUTOR. LLM 3 never calls this.
+#[async_trait::async_trait(?Send)]
+impl CorrectionExecutor for Agent {
+    async fn implement_correction(&self, plan: &str) -> anyhow::Result<String> {
+        let coder = Executor::new(
+            self.provider_for(&self.executor_model),
+            self.executor_model.clone(),
+            self.tools.clone(),
+            self.policy.clone(),
+            self.cwd.clone(),
+            self.max_iterations,
+            self.context_max_tokens,
+            self.session.clone(),
+            self.session_id.clone(),
+            format!("{CODER_SYSTEM}\n{}", crate::mode::KARPATHY_POLICY),
+            None,
+        );
+        coder.run(plan).await
+    }
 }
 
 /// Record a trace event for debugging/replay (spec Phase 6). No-op when session store is off.

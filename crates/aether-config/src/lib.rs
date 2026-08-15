@@ -23,6 +23,10 @@ pub struct Config {
     pub subagents: SubagentsConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Frontend visual-engineering subsystem (spec: 3-LLM visual review). Controls the
+    /// optional LLM 3 screenshot/review loop and its acceptance policy.
+    #[serde(default)]
+    pub frontend: FrontendConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +49,11 @@ pub struct AgentConfig {
     /// Endpoint used when running in local mode (`--local`), e.g. a local OpenAI-compatible server.
     #[serde(default = "dft_local_endpoint")]
     pub local_endpoint: String,
+    /// LLM 3 — VISUAL FRONTEND REVIEWER (spec: 3-LLM visual engineering). Optional multimodal
+    /// model key from `models`. When `None`, the visual-review loop is disabled and the system
+    /// degrades gracefully to normal frontend development.
+    #[serde(default)]
+    pub reviewer_model: Option<String>,
 }
 fn dft_controller() -> String { "controller".into() }
 fn dft_executor() -> String { "executor".into() }
@@ -63,6 +72,7 @@ impl Default for AgentConfig {
             routing_policy: dft_policy(),
             cheap_model: None,
             local_endpoint: dft_local_endpoint(),
+            reviewer_model: None,
         }
     }
 }
@@ -208,6 +218,71 @@ impl Default for SubagentsConfig {
 pub struct McpConfig {
     #[serde(default)]
     pub servers: Vec<McpServerConfig>,
+}
+
+/// Frontend visual-engineering configuration (spec: 3-LLM visual review).
+///
+/// LLM 3 (the visual reviewer) is optional. When `reviewer_model` (in `AgentConfig`) is unset,
+/// no `capture_command` is configured, or the task is not a frontend task, the system degrades
+/// gracefully and the visual loop never starts.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FrontendConfig {
+    /// Shell command that renders the frontend and writes a screenshot PNG. The tokens
+    /// `{out}` (target png path) and `{cwd}` (project dir) are substituted before running.
+    /// When `None`, the visual-review loop cannot capture and is skipped.
+    #[serde(default)]
+    pub capture_command: Option<String>,
+    /// Optional shell command that starts a local preview/dev server before capture (and is
+    /// killed afterwards). The token `{cwd}` is substituted.
+    #[serde(default)]
+    pub preview_command: Option<String>,
+    /// Hard cap on visual-review iterations (loop protection). 0 disables the loop.
+    #[serde(default = "dft_max_visual")]
+    pub max_visual_iterations: u32,
+    /// Force the visual-review loop on for every task (useful for testing). Auto-detected otherwise.
+    #[serde(default)]
+    pub force: bool,
+    /// Explicit acceptance policy (spec §12). Score is supporting evidence only.
+    #[serde(default)]
+    pub acceptance: VisualAcceptanceConfig,
+}
+
+fn dft_max_visual() -> u32 { 5 }
+
+impl Default for FrontendConfig {
+    fn default() -> Self {
+        FrontendConfig {
+            capture_command: None,
+            preview_command: None,
+            max_visual_iterations: dft_max_visual(),
+            force: false,
+            acceptance: VisualAcceptanceConfig::default(),
+        }
+    }
+}
+
+/// Explicit visual-acceptance contract (spec §12). Approval is NOT purely numeric.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VisualAcceptanceConfig {
+    /// Reject unless there are zero `critical` issues.
+    #[serde(default = "dft_true")]
+    pub require_no_critical: bool,
+    /// Reject unless there are zero `major` issues.
+    #[serde(default = "dft_false")]
+    pub require_no_major: bool,
+    /// Optional minimum score (0-100); supporting evidence only.
+    #[serde(default)]
+    pub min_score: Option<u32>,
+}
+
+impl Default for VisualAcceptanceConfig {
+    fn default() -> Self {
+        VisualAcceptanceConfig {
+            require_no_critical: dft_true(),
+            require_no_major: dft_false(),
+            min_score: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

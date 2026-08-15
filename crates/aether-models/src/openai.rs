@@ -56,6 +56,28 @@ impl OpenAICompatibleProvider {
         if let Some(eb) = &self.extra_body {
             merge_json(&mut body, eb);
         }
+        // Multimodal: extend the last `user` message with image parts (spec: LLM 3 vision).
+        if let Some(imgs) = &req.images {
+            if !imgs.is_empty() {
+                if let Some(arr) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                    if let Some(idx) = arr.iter().rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")) {
+                        let text = arr[idx]
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
+                        for url in imgs {
+                            parts.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": { "url": url }
+                            }));
+                        }
+                        arr[idx]["content"] = serde_json::Value::Array(parts);
+                    }
+                }
+            }
+        }
         body
     }
 }

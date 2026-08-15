@@ -9,3 +9,4 @@ pub mod executor;
 pub mod mode;
 pub mod router;
 pub mod subagents;
+pub mod visual;

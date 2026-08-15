@@ -37,6 +37,10 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     pub stream: bool,
     pub tools: Option<Vec<serde_json::Value>>,
+    /// Optional multimodal image inputs (e.g. base64 `data:` URLs) sent to a vision model.
+    /// When present, the last `user` message's content is extended with image parts. Text-only
+    /// calls leave this `None`, so existing behavior is unchanged.
+    pub images: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]

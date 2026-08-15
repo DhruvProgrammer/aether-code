@@ -13,6 +13,8 @@ aether-sessions = { path = "../aether-sessions" }
 aether-mind = { path = "../aether-mind" }
 async-trait = "0.1"
 anyhow = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["process", "rt", "time", "io-util", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

@@ -202,6 +202,24 @@ async fn run() -> anyhow::Result<()> {
     }
     let controller: Arc<dyn ModelProvider> = Arc::from(aether_models::build_provider(controller_cfg)?);
 
+    // LLM 3 — VISUAL FRONTEND REVIEWER (optional, multimodal). Degrades gracefully when unset.
+    let reviewer: Option<Arc<dyn ModelProvider>> = match &cfg.agent.reviewer_model {
+        Some(key) => match cfg.model(key) {
+            Some(mc) => match aether_models::build_provider(mc) {
+                Ok(p) => Some(Arc::from(p)),
+                Err(e) => {
+                    ui::warn(&format!("reviewer model '{key}' unavailable: {e}"));
+                    None
+                }
+            },
+            None => {
+                ui::warn(&format!("reviewer model '{key}' not found in [models]; visual review disabled"));
+                None
+            }
+        },
+        None => None,
+    };
+
     // Memory engine (spec §9). Embeddings reuse the controller provider.
     let (mind, embedder): (Option<Arc<Mind>>, Option<Arc<dyn ModelProvider>>) = if cfg.memory.enabled {
         let mind_path = aether_config::expand_tilde(&cfg.memory.path);
@@ -294,6 +312,9 @@ async fn run() -> anyhow::Result<()> {
         cfg.agent.max_iterations,
         cfg.context.max_tokens,
         cfg.agent.loop_budget,
+        reviewer,
+        cfg.agent.reviewer_model.clone(),
+        cfg.frontend.clone(),
     );
 
     let format = |task: &str| -> String {
