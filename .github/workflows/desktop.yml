@@ -52,6 +52,12 @@ jobs:
           cp target/release/aether.exe crates/aether-desktop/binaries/aether.exe
           cp target/release/aether-mcp.exe crates/aether-desktop/binaries/aether-mcp.exe
 
+      - name: Stage frontend dist for Tauri
+        shell: bash
+        run: |
+          mkdir -p crates/aether-desktop/dist
+          cp -r packages/app/dist/. crates/aether-desktop/dist/
+
       - name: Build Tauri installer
         working-directory: crates/aether-desktop
         env:

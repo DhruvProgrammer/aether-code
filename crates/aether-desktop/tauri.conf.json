@@ -5,7 +5,7 @@
   "identifier": "dev.aether.desktop",
   "build": {
     "devUrl": "http://localhost:5173",
-    "frontendDist": "../packages/app/dist"
+    "frontendDist": "dist"
   },
   "app": {
     "windows": [
@@ -31,10 +31,10 @@
       "icons/icon.ico",
       "icons/icon.png"
     ],
-    "resources": {
-      "../binaries/aether.exe": "aether.exe",
-      "../binaries/aether-mcp.exe": "aether-mcp.exe"
-    },
+    "resources": [
+      "binaries/aether.exe",
+      "binaries/aether-mcp.exe"
+    ],
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
