@@ -4,10 +4,8 @@
   "version": "0.9.0",
   "identifier": "dev.aether.desktop",
   "build": {
-    "beforeDevCommand": "npm --prefix ../../packages/app run dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm --prefix ../../packages/app run build",
-    "frontendDist": "../../packages/app/dist"
+    "frontendDist": "../packages/app/dist"
   },
   "app": {
     "windows": [
@@ -33,10 +31,10 @@
       "icons/icon.ico",
       "icons/icon.png"
     ],
-    "resources": [
-      "binaries/aether.exe",
-      "binaries/aether-mcp.exe"
-    ],
+    "resources": {
+      "../binaries/aether.exe": "aether.exe",
+      "../binaries/aether-mcp.exe": "aether-mcp.exe"
+    },
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
