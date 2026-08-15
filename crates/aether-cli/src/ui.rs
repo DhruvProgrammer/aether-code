@@ -16,8 +16,14 @@ pub const WARN: &str = "\x1b[38;2;232;169;76m";
 // Pantone 19-1664 "Red Maple" for errors.
 pub const ERR: &str = "\x1b[38;2;188;72;74m";
 
-pub fn banner(title: &str) {
-    println!("{}── {}{}{}{}", MUTED, BOLD, INK, title, RESET);
+pub fn banner(_title: &str) {
+    let lead = format!("{}  æ  {}{}AETHER{}", ACCENT, BOLD, INK, RESET);
+    let tail = format!("{}   rust-native coding agent   {}", MUTED, ACCENT);
+    let visible = "  æ  AETHER   rust-native coding agent   ".chars().count();
+    let bar = "─".repeat(visible);
+    println!("{}╭{}╮{}", ACCENT, bar, RESET);
+    println!("{}│{}{}{}│{}", ACCENT, lead, tail, ACCENT, RESET);
+    println!("{}╰{}╯{}", ACCENT, bar, RESET);
 }
 
 pub fn section(title: &str, body: &str) {

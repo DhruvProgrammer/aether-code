@@ -272,6 +272,7 @@ async fn run() -> anyhow::Result<()> {
     if cli.worktree {
         ui::note(&format!("working in git worktree: {}", run_cwd.display()));
     }
+    ui::banner("aether");
     ui::note(&format!("session: {session_id}"));
 
     let agent = Agent::new(
@@ -303,7 +304,6 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
-    ui::banner("aether");
     let mut current_mode: Mode = if cli.plan { Mode::Plan } else { Mode::Build };
     let mut last_plan: Option<String> = None;
 
