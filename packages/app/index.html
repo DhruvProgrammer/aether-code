@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>aether</title>
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <div class="brand">aether</div>
+        <nav>
+          <button data-view="task" class="active">Task</button>
+          <button data-view="settings">Settings</button>
+          <button data-view="history">History</button>
+        </nav>
+        <div class="footer" id="footer">v0.9.0</div>
+      </aside>
+      <main>
+        <section id="view-task" class="view">
+          <div class="card">
+            <h2>Task</h2>
+            <p class="muted">Run a task through the aether agent. <kbd>Ctrl/⌘ + Enter</kbd> to submit.</p>
+            <textarea id="task-input" placeholder="e.g. Refactor the auth module to use JWTs"></textarea>
+            <div class="row inline">
+              <input type="checkbox" id="plan-chk" />
+              <label for="plan-chk">Plan mode (read-only)</label>
+            </div>
+            <div class="actions">
+              <button id="run-btn" class="primary">Run</button>
+              <button id="cancel-btn" class="ghost" disabled>Cancel</button>
+              <span id="task-status" class="muted"></span>
+            </div>
+            <pre id="task-output" class="output"></pre>
+          </div>
+        </section>
+        <section id="view-settings" class="view hidden"></section>
+        <section id="view-history" class="view hidden"></section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

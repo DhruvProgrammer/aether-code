@@ -3,3 +3,9 @@
 Cargo.lock.orig
 .aether/
 temp-screenshots/
+# Tauri desktop binaries are produced by the release workflow; never committed.
+crates/aether-desktop/binaries/
+crates/aether-desktop/gen/
+# Frontend build output
+packages/app/dist/
+packages/app/node_modules/

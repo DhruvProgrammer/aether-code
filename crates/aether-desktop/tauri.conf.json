@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "aether",
+  "version": "0.9.0",
+  "identifier": "dev.aether.desktop",
+  "build": {
+    "beforeDevCommand": "npm --prefix ../../packages/app run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm --prefix ../../packages/app run build",
+    "frontendDist": "../../packages/app/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "aether",
+        "width": 1100,
+        "height": 760,
+        "minWidth": 800,
+        "minHeight": 560,
+        "resizable": true,
+        "decorations": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "resources": [
+      "binaries/aether.exe",
+      "binaries/aether-mcp.exe"
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "installMode": "perMachine",
+        "languages": ["English"],
+        "displayLanguageSelector": false
+      },
+      "wix": {
+        "language": ["en-US"]
+      }
+    },
+    "publisher": "aether",
+    "shortDescription": "OpenAI-compatible coding agent (desktop)",
+    "longDescription": "aether is an OpenAI-API-compatible coding agent. This desktop app wraps the aether CLI in a windowed UI with a Settings panel, Task runner, and Session History."
+  }
+}
