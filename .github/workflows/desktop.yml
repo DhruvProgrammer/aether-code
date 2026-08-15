@@ -10,9 +10,6 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 90
-    defaults:
-      run:
-        working-directory: aether
     steps:
       - uses: actions/checkout@v4
 
@@ -32,32 +29,31 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            aether/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('aether/Cargo.lock') }}
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-
 
       - name: Install npm deps
-        working-directory: aether/packages/app
         run: npm install
+        working-directory: packages/app
 
       - name: Build frontend
-        working-directory: aether/packages/app
         run: npm run build
+        working-directory: packages/app
 
       - name: Build aether CLI (release)
-        working-directory: aether
         run: cargo build -p aether-cli -p aether-mcp --release
 
       - name: Copy CLI into Tauri resources
         shell: bash
         run: |
-          mkdir -p aether/crates/aether-desktop/binaries
-          cp aether/target/release/aether.exe aether/crates/aether-desktop/binaries/aether-x86_64-pc-windows-msvc.exe
-          cp aether/target/release/aether-mcp.exe aether/crates/aether-desktop/binaries/aether-mcp-x86_64-pc-windows-msvc.exe
+          mkdir -p crates/aether-desktop/binaries
+          cp target/release/aether.exe crates/aether-desktop/binaries/aether.exe
+          cp target/release/aether-mcp.exe crates/aether-desktop/binaries/aether-mcp.exe
 
       - name: Build Tauri installer
-        working-directory: aether/crates/aether-desktop
+        working-directory: crates/aether-desktop
         env:
           TAURI_BUNDLER_TOOLS_GLOBAL: true
         run: |
@@ -68,8 +64,8 @@ jobs:
         id: locate
         shell: bash
         run: |
-          ls -la aether/crates/aether-desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis/
-          echo "artifact_dir=aether/crates/aether-desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis" >> $GITHUB_OUTPUT
+          ls -la crates/aether-desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis/
+          echo "artifact_dir=crates/aether-desktop/target/x86_64-pc-windows-msvc/release/bundle/nsis" >> $GITHUB_OUTPUT
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
