@@ -99,13 +99,25 @@ impl Tool for WriteFileTool {
     }
 }
 
+/// Normalize a canonicalized path by stripping the Windows extended-length `\\?\` prefix so
+/// two paths produced by different canonicalize results can be compared consistently.
+#[cfg(windows)]
+fn strip_unc(p: &Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+#[cfg(not(windows))]
+fn strip_unc(p: &Path) -> std::path::PathBuf { p.to_path_buf() }
+
 /// Reject `full` if it does not lie inside `cwd` after canonicalization. Prevents sandbox
 /// escapes such as `path = "../escape.txt"` or `path = "/etc/passwd"`.
 fn sandbox_check(full: &Path, cwd: &Path) -> Result<(), ToolError> {
-    let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let full_canon = full
-        .canonicalize()
-        .unwrap_or_else(|_| full.to_path_buf());
+    let cwd_canon = strip_unc(&cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()));
+    let full_canon = strip_unc(&full.canonicalize().unwrap_or_else(|_| full.to_path_buf()));
     let cwd_str = cwd_canon.to_string_lossy().replace('\\', "/");
     let full_str = full_canon.to_string_lossy().replace('\\', "/");
     if full_str == cwd_str || full_str.starts_with(&format!("{cwd_str}/")) {
@@ -266,4 +278,57 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
     ];
     v.extend(git_tools());
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp_cwd(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aether-tool-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[tokio::test]
+    async fn write_file_sandbox_rejects_path_traversal() {
+        let cwd = tmp_cwd("sandbox");
+        let ctx = ToolContext { cwd: cwd.clone() };
+        // `..` escape must be rejected.
+        let res = WriteFileTool
+            .execute(serde_json::json!({ "path": "../escape.txt", "content": "no" }), &ctx)
+            .await;
+        assert!(res.is_err(), "write_file must reject paths outside cwd");
+        // Absolute path must be rejected.
+        let res = WriteFileTool
+            .execute(serde_json::json!({ "path": "C:\\Windows\\System32\\evil.txt", "content": "no" }), &ctx)
+            .await;
+        assert!(res.is_err(), "write_file must reject absolute paths outside cwd");
+    }
+
+    #[tokio::test]
+    async fn write_file_accepts_cwd_and_subdir() {
+        let cwd = tmp_cwd("sandbox-ok");
+        let ctx = ToolContext { cwd: cwd.clone() };
+        let res = WriteFileTool
+            .execute(serde_json::json!({ "path": "inside.txt", "content": "ok" }), &ctx)
+            .await;
+        assert!(res.is_ok(), "write_file within cwd should succeed: {:?}", res);
+        let res = WriteFileTool
+            .execute(serde_json::json!({ "path": "sub/inside.txt", "content": "ok" }), &ctx)
+            .await;
+        assert!(res.is_ok(), "write_file within cwd subdir should succeed: {:?}", res);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_file_reports_missing_path() {
+        let cwd = tmp_cwd("read");
+        let ctx = ToolContext { cwd };
+        let res = ReadFileTool
+            .execute(serde_json::json!({ "path": "does-not-exist.txt" }), &ctx)
+            .await;
+        assert!(res.is_err());
+    }
 }

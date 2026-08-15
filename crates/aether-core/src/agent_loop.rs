@@ -141,7 +141,9 @@ impl Agent {
         // resumed session so the continuation is recorded under the same id.
         let sid = resume_session.unwrap_or(&self.session_id);
         if let Some(store) = &self.session {
-            let _ = store.add_message(sid, "user", task);
+            if let Err(e) = store.add_message(sid, "user", task) {
+                eprintln!("aether: session persist failed (user message): {e}");
+            }
         }
 
         // Agent subsystem: registry (TOML + builtins) and lifecycle tracker (depth/child limits).
@@ -221,7 +223,7 @@ impl Agent {
                                 eng.add_fact(f);
                             }
                         }
-                trace(&self.session, &self.session_id, "explore", "explorer", &r.summary);
+                persist_trace(&self.session, &self.session_id, "explore", "explorer", &r.summary);
                     }
                     Err(e) => eprintln!("explorer failed: {e}"),
                 }
@@ -274,12 +276,14 @@ impl Agent {
             )
             .await?;
             if let Some(store) = &self.session {
-                let _ = store.add_message(sid, "assistant", &format!("[PLAN {}]\n{plan}", iter + 1));
+                if let Err(e) = store.add_message(sid, "assistant", &format!("[PLAN {}]\n{plan}", iter + 1)) {
+                    eprintln!("aether: session persist failed (plan message): {e}");
+                }
             }
             println!("[PLAN {}]\n{plan}\n", iter + 1);
             eng.set_strategy(&plan);
             eng.add_decision(&format!("plan iteration {}", iter + 1), "controller produced plan", 0.6);
-            trace(&self.session, sid, "plan", "controller", &plan.chars().take(240).collect::<String>());
+            persist_trace(&self.session, sid, "plan", "controller", &plan.chars().take(240).collect::<String>());
 
             // Cost routing (§8): pick Coder model by task intent.
             let coder_model = crate::router::select_model(
@@ -304,7 +308,7 @@ impl Agent {
             let result = coder.run(&cycle_task).await?;
             eng.record_action(&format!("execute plan (iter {})", iter + 1));
             eng.observe("executor", &summarize(&result), None, None);
-            trace(&self.session, sid, "execute", "implementer", &summarize(&result));
+            persist_trace(&self.session, sid, "execute", "implementer", &summarize(&result));
 
             // Subagent handoff: the routed verification pipeline (spec §17-§18, §58).
             let mut review: Option<SubagentResult> = None;
@@ -331,7 +335,7 @@ impl Agent {
                     {
                         Ok(r) => {
                             println!("[{}] {}\n", r.role.to_uppercase(), r.summary);
-                            trace(
+                            persist_trace(
                                 &self.session,
                                 sid,
                                 "verify",
@@ -397,11 +401,13 @@ impl Agent {
             }
 
             if let Some(store) = &self.session {
-                let _ = store.set_kv(
+                if let Err(e) = store.set_kv(
                     sid,
                     "engineering",
                     &serde_json::to_string(&eng.model).unwrap_or_default(),
-                );
+                ) {
+                    eprintln!("aether: session persist failed (engineering kv): {e}");
+                }
             }
 
             final_result = format!("{result}\n{}", self.handoff_text(&review, &test, &security));
@@ -409,16 +415,16 @@ impl Agent {
 
             match eng.decide(iter + 1, loop_budget) {
                 LoopAction::Escalate => {
-                    trace(&self.session, sid, "decision", "loop-engine", "ESCALATE");
+                    persist_trace(&self.session, sid, "decision", "loop-engine", "ESCALATE");
                     escalation = Some(eng.escalation_briefing());
                     break;
                 }
                 LoopAction::Stop => {
-                    trace(&self.session, sid, "decision", "loop-engine", "STOP");
+                    persist_trace(&self.session, sid, "decision", "loop-engine", "STOP");
                     break;
                 }
                 LoopAction::Continue => {
-                    trace(&self.session, sid, "decision", "loop-engine", "CONTINUE");
+                    persist_trace(&self.session, sid, "decision", "loop-engine", "CONTINUE");
                     prev_result = Some(final_result.clone());
                     continue;
                 }
@@ -426,13 +432,17 @@ impl Agent {
         }
 
         if let Some(store) = &self.session {
-            let _ = store.add_message(sid, "assistant", &final_result);
-            let _ = store.record_run(
+            if let Err(e) = store.add_message(sid, "assistant", &final_result) {
+                eprintln!("aether: session persist failed (final message): {e}");
+            }
+            if let Err(e) = store.record_run(
                 sid,
                 task,
                 &eng.model.current_strategy.clone().unwrap_or_default(),
                 &final_result,
-            );
+            ) {
+                eprintln!("aether: session persist failed (record_run): {e}");
+            }
         }
 
         if self.auto_extract {
@@ -468,7 +478,9 @@ impl Agent {
                     println!("{}", report.summary);
                     final_result.push_str(&format!("\n\n## Visual Review\n{}\n", report.summary));
                     if let Some(store) = &self.session {
-                        let _ = store.add_message(sid, "assistant", &format!("[VISUAL] {}", report.summary));
+                        if let Err(e) = store.add_message(sid, "assistant", &format!("[VISUAL] {}", report.summary)) {
+                            eprintln!("aether: session persist failed (visual message): {e}");
+                        }
                     }
                 }
             }
@@ -508,7 +520,7 @@ impl Agent {
             Ok(r) => {
                 println!("[EXPLORE] {}\n", r.summary);
                 exploration = r.summary.clone();
-                trace(&self.session, &self.session_id, "explore", "explorer", &r.summary);
+                persist_trace(&self.session, &self.session_id, "explore", "explorer", &r.summary);
             }
             Err(e) => eprintln!("explorer failed: {e}"),
         }
@@ -591,7 +603,8 @@ impl CorrectionExecutor for Agent {
 }
 
 /// Record a trace event for debugging/replay (spec Phase 6). No-op when session store is off.
-fn trace(store: &Option<Arc<SessionStore>>, session_id: &str, kind: &str, agent: &str, summary: &str) {
+/// Named `persist_trace` to avoid shadowing the `tracing` crate's macros.
+fn persist_trace(store: &Option<Arc<SessionStore>>, session_id: &str, kind: &str, agent: &str, summary: &str) {
     if let Some(s) = store {
         let _ = s.record_trace(session_id, kind, agent, None, summary, "");
     }

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aether-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aether-config",
  "aether-core",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "aether-config"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "dirs",
  "serde",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "aether-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aether-config",
  "aether-mind",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "aether-mind"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aether-models",
  "aether-permissions",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "aether-models"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aether-config",
  "async-trait",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "aether-permissions"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aether-config",
  "serde",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "aether-sessions"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "aether-tools"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aether-permissions",
  "anyhow",

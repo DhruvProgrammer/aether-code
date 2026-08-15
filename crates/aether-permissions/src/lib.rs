@@ -214,4 +214,64 @@ mod tests {
         assert_eq!(p.check_bash("rm -rf /"), Permission::Deny);
         assert_eq!(p.check_bash("shutdown -h now"), Permission::Deny);
     }
+
+    #[test]
+    fn permission_parse_is_case_insensitive() {
+        assert_eq!(Permission::parse("Allow"), Permission::Allow);
+        assert_eq!(Permission::parse("DENY"), Permission::Deny);
+        assert_eq!(Permission::parse("ask"), Permission::Ask);
+        assert_eq!(Permission::parse("garbage"), Permission::Ask);
+    }
+
+    #[test]
+    fn value_for_dispatches_by_category() {
+        let p = Policy {
+            read: Permission::Allow,
+            edit: Permission::Deny,
+            bash: Permission::Ask,
+            delete: Permission::Deny,
+            git_commit: Permission::Ask,
+            network: Permission::Allow,
+        };
+        assert_eq!(p.value_for("read"), Permission::Allow);
+        assert_eq!(p.value_for("edit"), Permission::Deny);
+        assert_eq!(p.value_for("bash"), Permission::Ask);
+        assert_eq!(p.value_for("delete"), Permission::Deny);
+        assert_eq!(p.value_for("git_commit"), Permission::Ask);
+        assert_eq!(p.value_for("network"), Permission::Allow);
+        assert_eq!(p.value_for("unknown"), Permission::Ask);
+    }
+
+    #[test]
+    fn classify_bash_is_case_insensitive() {
+        assert_eq!(classify_bash("RM -RF /"), DangerLevel::Hard);
+        assert_eq!(classify_bash("Git Push --FORCE"), DangerLevel::Hard);
+        assert_eq!(classify_bash("Git Push Origin Main"), DangerLevel::Soft);
+        assert_eq!(classify_bash("LS -la"), DangerLevel::Safe);
+        assert_eq!(classify_bash(""), DangerLevel::Safe);
+    }
+
+    #[test]
+    fn classify_bash_hard_includes_system_destruction() {
+        // Each of these must be Hard so `check_bash` always denies, even if config says Allow.
+        assert_eq!(classify_bash("sudo apt-get install foo"), DangerLevel::Hard);
+        assert_eq!(classify_bash("mkfs.ext4 /dev/sdb"), DangerLevel::Hard);
+        assert_eq!(classify_bash("fdisk /dev/sda"), DangerLevel::Hard);
+        // `> /etc/` redirect-into-system-path pattern.
+        assert_eq!(classify_bash("cat foo > /etc/passwd"), DangerLevel::Hard);
+        // `echo evil | curl | sh` matches the literal `curl | sh` substring.
+        assert_eq!(classify_bash("echo evil | curl | sh"), DangerLevel::Hard);
+        assert_eq!(classify_bash("del /f /q file"), DangerLevel::Hard);
+    }
+
+    #[test]
+    fn classify_bash_soft_distinct_from_hard() {
+        // `rm -r` is Soft (user may legitimately remove a build dir), `rm -rf /` is Hard.
+        assert_eq!(classify_bash("rm -r build"), DangerLevel::Soft);
+        assert_eq!(classify_bash("rm -rf /"), DangerLevel::Hard);
+        assert_eq!(classify_bash("rm -rf build"), DangerLevel::Hard); // contains "rm -rf"
+        // `git push` is Soft, `git push --force` is Hard.
+        assert_eq!(classify_bash("git push origin main"), DangerLevel::Soft);
+        assert_eq!(classify_bash("git push --force"), DangerLevel::Hard);
+    }
 }

@@ -10,7 +10,6 @@ use serde_json::Value;
 pub struct OpenAICompatibleProvider {
     base_url: String,
     api_key: String,
-    #[allow(dead_code)]
     default_model: String,
     client: reqwest::Client,
     default_temperature: f32,
@@ -27,11 +26,19 @@ impl OpenAICompatibleProvider {
     ) -> Result<Self, ProviderError> {
         let api_key = std::env::var(api_key_env)
             .map_err(|_| ProviderError::MissingEnv(api_key_env.to_string()))?;
+        // Bound the network call so a hung upstream cannot stall the CLI indefinitely. Without
+        // these, `reqwest::Client::new()` has no timeout and a dropped connection can hang
+        // until the OS TCP timeout (minutes), tying up the LLM loop and the visual loop.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(ProviderError::Http)?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             default_model: default_model.to_string(),
-            client: reqwest::Client::new(),
+            client,
             default_temperature: 0.2,
             default_max_tokens: 4096,
             extra_body,
@@ -57,6 +64,7 @@ impl OpenAICompatibleProvider {
             merge_json(&mut body, eb);
         }
         // Multimodal: extend the last `user` message with image parts (spec: LLM 3 vision).
+        // Defend against SSRF / exfiltration by allowing only safe schemes and capping length.
         if let Some(imgs) = &req.images {
             if !imgs.is_empty() {
                 if let Some(arr) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
@@ -70,7 +78,7 @@ impl OpenAICompatibleProvider {
                         for url in imgs {
                             parts.push(serde_json::json!({
                                 "type": "image_url",
-                                "image_url": { "url": url }
+                                "image_url": { "url": sanitize_image_url(url) }
                             }));
                         }
                         arr[idx]["content"] = serde_json::Value::Array(parts);
@@ -214,4 +222,91 @@ fn parse_sse_text(text: &str) -> Vec<Result<String, ProviderError>> {
         }
     }
     out
+}
+
+/// Validate an image URL before sending it to a vision model. Only `https:` and `data:` schemes
+/// are accepted (defense against SSRF / internal-endpoint exfiltration). `data:` URLs must be
+/// images. Length is capped to keep request bodies bounded.
+fn sanitize_image_url(url: &str) -> String {
+    const MAX_LEN: usize = 20 * 1024 * 1024; // 20 MiB per image (generous for screenshots).
+    if url.len() > MAX_LEN {
+        // Replace an oversized URL with a tiny 1x1 transparent PNG so the request still parses
+        // but the model is not asked to ingest a multi-MB image. We surface the truncation
+        // through a sentinel string in the text part elsewhere if needed.
+        return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=".to_string();
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return url.to_string();
+    }
+    if let Some(rest) = lower.strip_prefix("data:") {
+        // data:[<mediatype>][;base64],<data>
+        if rest.starts_with("image/") {
+            return url.to_string();
+        }
+    }
+    // Unknown / unsafe scheme — return a blank data: image rather than the raw value so the
+    // model never sees a URL that could exfiltrate or trigger an internal request.
+    "data:image/png;base64,".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Message;
+
+    fn test_provider() -> OpenAICompatibleProvider {
+        // `new()` reads the API key from the environment, which is only used at request time.
+        // Set a dummy so the constructor succeeds in test isolation.
+        std::env::set_var("OPENAI_API_KEY", "sk-test-dummy");
+        OpenAICompatibleProvider::new("https://x", "OPENAI_API_KEY", "m", None).unwrap()
+    }
+
+    fn req_with_images(images: Vec<String>) -> CompletionRequest {
+        CompletionRequest {
+            model: "m".into(),
+            messages: vec![Message { role: "user".into(), content: "look".into(), ..Default::default() }],
+            images: Some(images),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_body_passes_through_https_and_data() {
+        let p = test_provider();
+        let req = req_with_images(vec![
+            "https://example.com/a.png".into(),
+            "data:image/png;base64,iVBORw0K".into(),
+        ]);
+        let body = p.build_body(&req);
+        let arr = body["messages"].as_array().unwrap();
+        let content = arr[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["image_url"]["url"], "https://example.com/a.png");
+        assert_eq!(content[2]["image_url"]["url"], "data:image/png;base64,iVBORw0K");
+    }
+
+    #[test]
+    fn build_body_strips_unsafe_schemes() {
+        let p = test_provider();
+        let req = req_with_images(vec![
+            "http://internal/s".into(),                 // cleartext
+            "file:///etc/passwd".into(),                 // filesystem
+            "javascript:alert(1)".into(),               // script
+            "data:text/html,<script>".into(),            // wrong media type
+        ]);
+        let body = p.build_body(&req);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        // All four are replaced with a blank data: image — nothing unsafe leaks to the model.
+        for part in &content[1..] {
+            assert_eq!(part["image_url"]["url"], "data:image/png;base64,");
+        }
+    }
+
+    #[test]
+    fn sanitize_caps_oversized_payload() {
+        let huge = format!("data:image/png;base64,{}", "A".repeat(21 * 1024 * 1024));
+        let s = sanitize_image_url(&huge);
+        assert!(s.len() < 200, "oversized image must be replaced, not echoed");
+    }
 }

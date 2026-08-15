@@ -385,6 +385,7 @@ impl LoopEngine {
             _ => None,
         };
         if matched == Some(false) {
+            debug_assert!(expected.is_some() && actual.is_some(), "matched == Some(false) requires both expected and actual to be Some");
             self.add_unknown(&format!("Expected {} but observed {}", expected.unwrap(), actual.unwrap()));
         }
         self.model.observations.push(Observation {
@@ -583,7 +584,7 @@ impl LoopEngine {
         ));
         s.push_str(&format!("│ Goal: {}\n", m.goal));
         if !m.current_strategy.as_deref().unwrap_or("").is_empty() {
-            let strat: String = m.current_strategy.as_ref().unwrap().chars().take(80).collect();
+            let strat: String = m.current_strategy.as_deref().unwrap_or("").chars().take(80).collect();
             s.push_str(&format!("│ Strategy: {}\n", strat));
         }
         if !m.hypotheses.is_empty() {

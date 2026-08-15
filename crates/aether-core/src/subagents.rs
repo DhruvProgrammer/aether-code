@@ -129,8 +129,8 @@ pub(crate) fn extract_json_text(text: &str) -> Option<String> {
 
 /// Walk `s` from left to right and return the **last** slice `[i, j]` such that `s[i..=j]`
 /// is a balanced top-level `{...}` (respecting string literals + escapes). Returns None
-/// if no such object exists.
-fn last_balanced_json_object(s: &str) -> Option<String> {
+/// if no such object exists. Shared by `extract_json_text` and the visual review parser.
+pub(crate) fn last_balanced_json_object(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut last: Option<(usize, usize)> = None;
     let mut depth: i32 = 0;
@@ -290,5 +290,35 @@ mod tests {
     #[test]
     fn extract_json_none_on_no_json() {
         assert_eq!(extract_json_text("just plain text, no json"), None);
+    }
+
+    #[test]
+    fn last_balanced_handles_escaped_quotes_in_string() {
+        // String contains an escaped quote + a literal `{` — neither should confuse the scanner.
+        let text = r#"{"description":"he said \"{\" and left","score":92}"#;
+        assert_eq!(
+            last_balanced_json_object(text).as_deref(),
+            Some(r#"{"description":"he said \"{\" and left","score":92}"#)
+        );
+    }
+
+    #[test]
+    fn last_balanced_returns_last_when_multiple_objects() {
+        // Two top-level objects separated by prose — the last one wins.
+        let text = r#"{"a":1} some chatter {"b":2}"#;
+        assert_eq!(last_balanced_json_object(text).as_deref(), Some(r#"{"b":2}"#));
+    }
+
+    #[test]
+    fn last_balanced_deeply_nested() {
+        let text = r#"{"a":{"b":{"c":1}}}"#;
+        assert_eq!(last_balanced_json_object(text).as_deref(), Some(text));
+    }
+
+    #[test]
+    fn last_balanced_none_on_empty_or_unbalanced() {
+        assert_eq!(last_balanced_json_object(""), None);
+        assert_eq!(last_balanced_json_object("{"), None);
+        assert_eq!(last_balanced_json_object("not json"), None);
     }
 }

@@ -14,7 +14,6 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[allow(dead_code)]
 pub struct Executor {
     provider: Arc<dyn ModelProvider>,
     model: String,

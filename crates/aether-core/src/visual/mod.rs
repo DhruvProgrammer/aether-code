@@ -262,27 +262,37 @@ impl TempScreenshotWorkspace {
         capture_command: &str,
         preview_command: &Option<String>,
     ) -> Result<Screenshot> {
-        // Optional preview server, killed on cleanup.
+        // Defense in depth: the `{cwd}` and `{out}` tokens are substituted into a shell string
+        // (`cmd /C` / `sh -c`). Escape both values for the active shell so a path containing
+        // spaces, `&`, `()`, etc. (e.g. `C:\Program Files (x86)\…`) cannot inject commands.
+        // The `capture_command` / `preview_command` strings themselves are user-controlled
+        // (config-trusted) — same trust model as the `bash` tool.
+        let cwd_esc = shell_escape(cwd);
+        let out = self.root.join("shot.png");
+        let out_esc = shell_escape(&out);
+
+        // Optional preview server, killed on cleanup. Sleep is conditional: only when the
+        // spawn actually produced a child do we wait for the server to come up.
         if let Some(preview) = preview_command {
-            let cmd = preview.replace("{cwd}", &cwd.to_string_lossy());
+            let cmd = preview.replace("{cwd}", &cwd_esc);
             let (shell, flag) = shell_pair();
-            let child = tokio::process::Command::new(shell)
+            if let Ok(child) = tokio::process::Command::new(shell)
                 .arg(flag)
                 .arg(&cmd)
                 .current_dir(cwd)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .ok();
-            self.preview_child = child;
-            // Give the server a moment to come up.
-            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            {
+                self.preview_child = Some(child);
+                // Give the server a moment to come up.
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
         }
 
-        let out = self.root.join("shot.png");
         let cmd = capture_command
-            .replace("{out}", &out.to_string_lossy())
-            .replace("{cwd}", &cwd.to_string_lossy());
+            .replace("{out}", &out_esc)
+            .replace("{cwd}", &cwd_esc);
         let (shell, flag) = shell_pair();
         let status = tokio::process::Command::new(shell)
             .arg(flag)
@@ -300,8 +310,12 @@ impl TempScreenshotWorkspace {
         if !out.exists() {
             anyhow::bail!("screenshot capture command did not produce {}", out.display());
         }
-        let bytes = std::fs::read(&out)?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let bytes = tokio::fs::read(&out).await?;
+        // base64 is synchronous and CPU-bound — offload so we don't stall the runtime.
+        let encoded = tokio::task::spawn_blocking(move || {
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        })
+        .await?;
         Ok(Screenshot {
             path: out,
             data_url: format!("data:image/png;base64,{encoded}"),
@@ -318,16 +332,20 @@ impl Drop for TempScreenshotWorkspace {
     fn drop(&mut self) {
         if let Some(mut c) = self.preview_child.take() {
             let _ = c.start_kill();
+            // Best-effort reap so the preview server does not linger as a zombie on Unix.
+            // Non-blocking: if the process is still tearing down, the OS reaps it on parent exit.
+            let _ = c.try_wait();
         }
         self.cleanup();
     }
 }
 
 /// Remove a specific execution's screenshot workspace regardless of how we exit (spec §17).
+/// Only the per-execution subdirectory is removed; the parent `temp-screenshots/` is left in
+/// place so concurrent sessions cannot delete each other's roots.
 pub fn cleanup_workspace(exec_id: &str) {
     let root = aether_config::Config::default_dir().join("temp-screenshots").join(exec_id);
     let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(aether_config::Config::default_dir().join("temp-screenshots"));
 }
 
 fn shell_pair() -> (&'static str, &'static str) {
@@ -335,6 +353,23 @@ fn shell_pair() -> (&'static str, &'static str) {
         ("cmd", "/C")
     } else {
         ("sh", "-c")
+    }
+}
+
+/// Escape a path for safe substitution into a `cmd /C` or `sh -c` string. The result is
+/// already wrapped in the appropriate quotes so a path containing spaces, `&`, `()`, etc.
+/// (e.g. `C:\Program Files (x86)\…`) is passed to the program as a single literal argument
+/// rather than being reinterpreted by the shell.
+fn shell_escape(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if cfg!(target_os = "windows") {
+        // cmd.exe: wrap in double quotes; escape any embedded `"` by doubling it.
+        let escaped = s.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        // sh: wrap in single quotes; a `'` inside becomes `'\''` (close, escaped, reopen).
+        let escaped = s.replace('\'', "'\\''");
+        format!("'{escaped}'")
     }
 }
 
@@ -733,7 +768,9 @@ fn issue_signature(r: &VisualReviewResult) -> String {
 /// Extract the first balanced JSON object from free text and parse it into a review result.
 /// Missing fields default; a non-`approved` status is assumed when absent.
 fn parse_review(text: &str) -> VisualReviewResult {
-    let json = extract_json_object(text).unwrap_or_default();
+    // Use the shared string-aware balanced-JSON scanner so a `{` inside a string literal
+    // (e.g. `{"description":"use {curly} here"}`) is not mis-parsed.
+    let json = crate::subagents::last_balanced_json_object(text).unwrap_or_default();
     match serde_json::from_str::<VisualReviewResult>(&json) {
         Ok(mut r) => {
             if r.status.is_empty() {
@@ -760,28 +797,6 @@ fn parse_review(text: &str) -> VisualReviewResult {
 }
 
 /// Scan for the outermost `{ ... }` block (balanced braces).
-fn extract_json_object(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut start = None;
-    let mut depth = 0i32;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'{' {
-            if depth == 0 {
-                start = Some(i);
-            }
-            depth += 1;
-        } else if b == b'}' {
-            depth -= 1;
-            if depth == 0 {
-                if let Some(s) = start {
-                    return Some(text[s..=i].to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +852,33 @@ mod tests {
         // min_score respected
         let acc2 = VisualAcceptanceConfig { require_no_critical: true, require_no_major: false, min_score: Some(90) };
         assert!(!VisualReviewPolicy::evaluate(&accepted("approved", 80, vec![]), &acc2));
+    }
+
+    #[test]
+    fn acceptance_policy_require_no_major() {
+        let acc = VisualAcceptanceConfig { require_no_critical: true, require_no_major: true, min_score: None };
+        // approved, only minor issues -> ok
+        let minor = accepted("approved", 90, vec![VisualIssue {
+            severity: "minor".into(), category: "spacing".into(), component: "p".into(),
+            description: "tiny".into(), recommendation: "r".into(), relevant_file: None,
+        }]);
+        assert!(VisualReviewPolicy::evaluate(&minor, &acc));
+        // approved, has a major issue -> rejected
+        let major = accepted("approved", 90, vec![VisualIssue {
+            severity: "major".into(), category: "hierarchy".into(), component: "h".into(),
+            description: "big".into(), recommendation: "r".into(), relevant_file: None,
+        }]);
+        assert!(!VisualReviewPolicy::evaluate(&major, &acc));
+    }
+
+    #[test]
+    fn parse_review_handles_braces_in_string() {
+        // A `{` inside a JSON string literal must not split the object.
+        let text = r#"{"status":"approved","score":90,"issues":[{"severity":"minor","category":"copy","component":"cta","description":"use {curly} here","recommendation":"avoid"}]}"#;
+        let r = parse_review(text);
+        assert_eq!(r.status, "approved");
+        assert_eq!(r.issues.len(), 1);
+        assert!(r.issues[0].description.contains("{curly}"));
     }
 
     #[test]

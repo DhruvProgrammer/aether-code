@@ -47,3 +47,59 @@ pub fn select_model(task: &str, cheap: Option<&str>, capable: &str, controller: 
         capable.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(task: &str) -> String {
+        select_model(task, Some("fast"), "executor", "controller")
+    }
+
+    #[test]
+    fn read_only_short_goes_cheap() {
+        assert_eq!(route("explain the diff"), "fast");
+        assert_eq!(route("what is the main loop?"), "fast");
+        assert_eq!(route("find the parser bug"), "fast");
+    }
+
+    #[test]
+    fn implements_goes_capable() {
+        assert_eq!(route("implement the new endpoint"), "executor");
+        assert_eq!(route("fix the parser bug in main.rs"), "executor");
+        assert_eq!(route("refactor the agent loop"), "executor");
+        assert_eq!(route("build a beautiful landing page"), "executor");
+    }
+
+    #[test]
+    fn long_read_only_without_implement_keyword_goes_capable() {
+        // The router routes long read-only tasks (>= 120 chars) to the capable model even
+        // without an implement keyword, to avoid under-thinking a complex question.
+        let task = "explain how the visual engineering loop, the controller, the executor, \
+                    and the temporary screenshot manager interact across iterations.";
+        assert_eq!(route(task), "executor");
+    }
+
+    #[test]
+    fn medium_read_only_still_cheap() {
+        // Under 120 chars + read-only intent → cheap.
+        let task = "explain how the visual loop reaches the acceptance policy and escalates";
+        assert!(task.len() < 120);
+        assert_eq!(route(task), "fast");
+    }
+
+    #[test]
+    fn ambiguous_long_task_defaults_capable() {
+        let task = "consider the tradeoffs of the new feature and propose a plan for how to \
+                    integrate it with the existing module without breaking anything.";
+        assert_eq!(route(task), "executor");
+    }
+
+    #[test]
+    fn cheap_falls_back_to_controller_when_none() {
+        assert_eq!(
+            select_model("explain the diff", None, "executor", "controller"),
+            "controller"
+        );
+    }
+}

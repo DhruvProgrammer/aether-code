@@ -364,6 +364,68 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::io::stdout().flush();
     }
+
+    fn tmp_store(tag: &str) -> (std::path::PathBuf, std::sync::Arc<SessionStore>) {
+        let dir = std::env::temp_dir().join(format!("aether-sess-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sessions.db");
+        let _ = std::fs::remove_file(&path);
+        let store = SessionStore::open(&path).unwrap();
+        (path, store)
+    }
+
+    #[test]
+    fn messages_roundtrip_chronological() {
+        let (path, store) = tmp_store("msg");
+        let sid = store.new_session().unwrap();
+        store.add_message(&sid, "user", "first").unwrap();
+        store.add_message(&sid, "assistant", "second").unwrap();
+        store.add_message(&sid, "user", "third").unwrap();
+        let msgs = store.get_messages(&sid, 10).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].content, "first");
+        assert_eq!(msgs[1].content, "second");
+        assert_eq!(msgs[2].content, "third");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn add_message_full_persists_tool_calls() {
+        let (path, store) = tmp_store("msgfull");
+        let sid = store.new_session().unwrap();
+        let tcs = vec![serde_json::json!({"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}})];
+        store.add_message_full(&sid, "assistant", "", Some(&tcs), None).unwrap();
+        store.add_message_full(&sid, "tool", "[read_file]\nhi", None, Some("call_1")).unwrap();
+        let msgs = store.get_messages(&sid, 10).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].tool_calls.is_some());
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("call_1"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn kv_set_get_roundtrip_and_overwrite() {
+        let (path, store) = tmp_store("kv");
+        let sid = store.new_session().unwrap();
+        assert_eq!(store.get_kv(&sid, "engineering").unwrap(), None);
+        store.set_kv(&sid, "engineering", r#"{"goal":"x"}"#).unwrap();
+        assert_eq!(store.get_kv(&sid, "engineering").unwrap().as_deref(), Some(r#"{"goal":"x"}"#));
+        // Overwrite (upsert).
+        store.set_kv(&sid, "engineering", r#"{"goal":"y"}"#).unwrap();
+        assert_eq!(store.get_kv(&sid, "engineering").unwrap().as_deref(), Some(r#"{"goal":"y"}"#));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn checkpoint_roundtrip() {
+        let (path, store) = tmp_store("ckpt");
+        let sid = store.new_session().unwrap();
+        store.add_checkpoint(&sid, "write_file", "foo.rs", Some("old content")).unwrap();
+        let cp = store.last_checkpoint(&sid).unwrap().expect("checkpoint present");
+        assert_eq!(cp.path, "foo.rs");
+        assert_eq!(cp.before_content.as_deref(), Some("old content"));
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[derive(Debug, Clone)]
