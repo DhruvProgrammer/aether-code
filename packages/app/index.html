@@ -61,17 +61,23 @@
     <div class="h-10 bg-app-topbar border-b border-app-border flex items-center justify-between px-3 shrink-0">
       <div class="flex items-center space-x-4">
         <div class="flex items-center space-x-2 text-app-textSecondary">
-          <i class="w-4 h-4 cursor-pointer hover:text-app-textPrimary" data-lucide="menu"></i>
-          <i class="w-4 h-4 cursor-pointer hover:text-app-textPrimary" data-lucide="layout-grid"></i>
+          <i class="w-4 h-4" data-lucide="menu"></i>
+          <i class="w-4 h-4" data-lucide="layout-grid"></i>
         </div>
         <div id="tabs" class="flex items-center space-x-1">
           <!-- tabs injected by JS -->
         </div>
-        <i class="w-4 h-4 text-app-textSecondary cursor-pointer hover:text-app-textPrimary" data-lucide="plus" id="new-tab-btn"></i>
+        <button id="new-tab-btn" class="text-app-textSecondary hover:text-app-textPrimary" title="New tab">
+          <i class="w-4 h-4" data-lucide="plus"></i>
+        </button>
       </div>
       <div class="flex items-center space-x-3 text-app-textSecondary">
-        <i class="w-4 h-4 cursor-pointer hover:text-app-textPrimary" data-lucide="settings" id="open-settings-btn"></i>
-        <i class="w-4 h-4 cursor-pointer hover:text-app-textPrimary" data-lucide="folder-open" id="open-history-btn"></i>
+        <button id="open-settings-btn" class="hover:text-app-textPrimary" title="Settings">
+          <i class="w-4 h-4" data-lucide="settings"></i>
+        </button>
+        <button id="open-history-btn" class="hover:text-app-textPrimary" title="History">
+          <i class="w-4 h-4" data-lucide="folder-open"></i>
+        </button>
         <span class="text-xs font-mono" id="version-label">v…</span>
       </div>
     </div>

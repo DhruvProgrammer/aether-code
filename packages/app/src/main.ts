@@ -78,26 +78,12 @@ function renderTabs() {
       return `<div class="flex items-center ${i === app.active ? "bg-app-surface" : ""} rounded-md px-3 py-1 border ${cls} cursor-pointer group relative" data-tab="${i}">
         <div class="bg-app-brand text-app-bg text-xs font-bold px-1.5 py-0.5 rounded mr-2">T</div>
         <span class="text-sm font-medium pr-6 truncate max-w-[200px] ${labelCls}">${escapeHtml(s.title)}</span>
-        <i class="w-3.5 h-3.5 absolute right-2 text-app-textSecondary group-hover:text-app-error" data-lucide="x" data-close-tab="${i}"></i>
+        <button type="button" class="absolute right-2 text-app-textSecondary hover:text-app-error" data-close-tab="${i}" title="Close tab">
+          <i class="w-3.5 h-3.5" data-lucide="x"></i>
+        </button>
       </div>`;
     })
     .join("");
-  el.querySelectorAll<HTMLDivElement>("[data-tab]").forEach((d) => {
-    d.addEventListener("click", (e) => {
-      const t = e.target as HTMLElement;
-      if (t.dataset.closeTab != null) {
-        const idx = parseInt(t.dataset.closeTab, 10);
-        if (app.tabs.length > 1) {
-          app.tabs.splice(idx, 1);
-          if (app.active >= app.tabs.length) app.active = app.tabs.length - 1;
-          renderAll();
-        }
-        return;
-      }
-      app.active = parseInt(d.dataset.tab!, 10);
-      renderAll();
-    });
-  });
 }
 
 function renderStream() {
@@ -473,11 +459,33 @@ async function boot() {
   app.tabs.push(createSession("Welcome"));
   renderAll();
 
-  // Top-bar buttons.
+  // Top-bar buttons (stable <button> wrappers with ids).
   document.querySelector("#new-tab-btn")!.addEventListener("click", newTab);
   document.querySelector("#open-settings-btn")!.addEventListener("click", () => openModal("settings"));
   document.querySelector("#open-history-btn")!.addEventListener("click", () => openModal("history"));
   document.querySelector("#modal-close")!.addEventListener("click", closeModal);
+
+  // Event delegation for tabs (their inner DOM is replaced on every renderTabs).
+  document.querySelector("#tabs")!.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    const closeBtn = t.closest<HTMLElement>("[data-close-tab]");
+    if (closeBtn) {
+      const idx = parseInt(closeBtn.dataset.closeTab!, 10);
+      if (app.tabs.length > 1) {
+        app.tabs.splice(idx, 1);
+        if (app.active >= app.tabs.length) app.active = app.tabs.length - 1;
+        renderAll();
+      }
+      return;
+    }
+    const tabEl = t.closest<HTMLElement>("[data-tab]");
+    if (tabEl) {
+      app.active = parseInt(tabEl.dataset.tab!, 10);
+      renderAll();
+    }
+  });
+
+  // Modal backdrop click (delegation on the modal).
   document.querySelector("#modal")!.addEventListener("click", (e) => {
     if (e.target === document.querySelector("#modal")) closeModal();
   });
