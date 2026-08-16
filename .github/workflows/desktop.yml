@@ -52,7 +52,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p crates/aether-desktop/binaries
-          cp target/release/aether.exe crates/aether-desktop/binaries/aether.exe
+          # Rename the CLI to aether-cli.exe so it doesn't collide with the
+          # Tauri app exe (which NSIS installs as aether.exe at the install
+          # root).
+          cp target/release/aether.exe crates/aether-desktop/binaries/aether-cli.exe
           cp target/release/aether-mcp.exe crates/aether-desktop/binaries/aether-mcp.exe
 
       - name: Stage frontend dist for Tauri

@@ -71,6 +71,7 @@ export const api = {
   cancelTask: (session_id: string) => invoke<boolean>("cancel_task", { sessionId: session_id }),
   aetherDir: () => invoke<string>("aether_dir_str"),
   version: () => invoke<string>("version"),
+  locateCli: () => invoke<{ found: string | null; searched: string[] }>("locate_cli"),
 };
 
 export const events = {

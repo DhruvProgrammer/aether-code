@@ -230,7 +230,12 @@ async fn run_task(
     }
     let plan = plan.unwrap_or(false);
     let exe = locate_aether_binary(&app).ok_or_else(|| {
-        "could not locate aether.exe (bundled or on PATH)".to_string()
+        "could not locate aether-cli.exe. The aether desktop app needs the aether CLI to run tasks. \
+         If you installed aether from the NSIS installer, the CLI should be at \
+         C:\\Program Files\\aether\\aether-cli.exe. If you installed from a portable zip, place \
+         aether.exe in the same directory as aether-desktop.exe, or add aether.exe to your PATH. \
+         You can also set the AETHER_CLI_PATH environment variable to point at the CLI."
+            .to_string()
     })?;
 
     let session_id = format!(
@@ -357,34 +362,90 @@ async fn cancel_task(state: State<'_, Arc<RunState>>, session_id: String) -> Res
 #[cfg(not(windows))]
 fn nix_signal(_pid: u32) {}
 
-// Locate the bundled `aether.exe` next to this binary, or fall back to PATH.
+// Locate the bundled `aether-cli.exe` (the CLI). On a Windows NSIS install
+// the Tauri app exe is renamed to `aether.exe`, so the CLI ships under a
+// distinct name (`aether-cli.exe`) to avoid filename collision. We probe every
+// plausible location: parent of the running app exe, the Tauri resource
+// directory, the `resources/` subdir of the install dir, and finally the
+// system PATH. The `.exe`/`.com` suffix is added automatically by Tauri's
+// resource resolver on Windows.
 fn locate_aether_binary(app: &AppHandle) -> Option<PathBuf> {
+    // 0. Explicit override via env var (escape hatch).
+    if let Ok(p) = std::env::var("AETHER_CLI_PATH") {
+        let cand = PathBuf::from(p);
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+
+    // Order matters: check the install-root CLI name first (v0.9.1+), then the
+    // generic name (in case the user dropped `aether.exe` alongside manually),
+    // then PATH.
+    let names = ["aether-cli", "aether-cli.exe", "aether", "aether.exe"];
+
+    // 1. Next to the running Tauri app exe (typical NSIS install layout).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for name in ["aether.exe", "aether"] {
+            for name in &names {
                 let cand = dir.join(name);
                 if cand.exists() {
                     return Some(cand);
                 }
             }
-        }
-    }
-    // Bundled as a Tauri resource: app.path().resolve("aether", BaseDirectory::Resource).
-    if let Ok(p) = app.path().resolve("aether.exe", tauri::path::BaseDirectory::Resource) {
-        if p.exists() {
-            return Some(p);
-        }
-        if let Ok(p2) = app.path().resolve("aether", tauri::path::BaseDirectory::Resource) {
-            if p2.exists() {
-                return Some(p2);
+            // 2. <install-dir>/resources/ — Tauri 2 alternative resource layout.
+            let res_dir = dir.join("resources");
+            if res_dir.is_dir() {
+                for name in &names {
+                    let cand = res_dir.join(name);
+                    if cand.exists() {
+                        return Some(cand);
+                    }
+                }
             }
         }
     }
+
+    // 3. Tauri's resource API (resolves under BaseDirectory::Resource).
+    for name in &names {
+        if let Ok(p) = app.path().resolve(name, tauri::path::BaseDirectory::Resource) {
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    // 4. System PATH (handles dev mode where `aether` is on PATH).
     which::which("aether").ok()
 }
 
 #[tauri::command]
 fn aether_dir_str() -> String { aether_dir().display().to_string() }
+
+#[derive(Serialize)]
+struct LocateResult {
+    found: Option<String>,
+    searched: Vec<String>,
+}
+
+#[tauri::command]
+fn locate_cli(app: AppHandle) -> LocateResult {
+    let mut searched = Vec::new();
+    let names = ["aether-cli", "aether-cli.exe", "aether", "aether.exe"];
+
+    if let Ok(p) = std::env::var("AETHER_CLI_PATH") {
+        searched.push(format!("AETHER_CLI_PATH={p}"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in &names {
+                searched.push(dir.join(name).display().to_string());
+            }
+            searched.push(dir.join("resources").display().to_string() + "/*");
+        }
+    }
+    let found = locate_aether_binary(&app).map(|p| p.display().to_string());
+    LocateResult { found, searched }
+}
 
 #[tauri::command]
 fn version() -> String {
@@ -410,6 +471,7 @@ fn main() {
             cancel_task,
             aether_dir_str,
             version,
+            locate_cli,
         ])
         .run(tauri::generate_context!())
         .expect("error while running aether-desktop");
