@@ -33,7 +33,8 @@
     ],
     "resources": [
       "binaries/aether-cli.exe",
-      "binaries/aether-mcp.exe"
+      "binaries/aether-mcp.exe",
+      "resources/default-background.png"
     ],
     "windows": {
       "nsis": {

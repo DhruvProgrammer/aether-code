@@ -20,6 +20,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+mod background;
+
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
@@ -55,21 +57,47 @@ struct DesktopConfig {
     models: HashMap<String, ModelBlock>,
     #[serde(default, rename = "frontend")]
     frontend: FrontendBlock,
+    #[serde(default)]
+    appearance: AppearanceBlock,
 }
 
+/// The three model slots (spec §3). Each slot points to a key in `models`.
+/// - `model1`: Required — Big Executor.
+/// - `model2`: Optional — Small Controller.
+/// - `model3`: Optional — Visual Frontend Reviewer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct AgentBlock {
-    #[serde(default = "default_controller")]
-    controller_model: String,
     #[serde(default = "default_executor")]
     executor_model: String,
+    #[serde(default = "default_controller")]
+    controller_model: String,
     #[serde(default)]
     reviewer_model: Option<String>,
+    /// Slot-1 explicit key (preferred over `executor_model` when present).
+    #[serde(default)]
+    model1: Option<String>,
+    /// Slot-2 explicit key (preferred over `controller_model` when present).
+    #[serde(default)]
+    model2: Option<String>,
+    /// Slot-3 explicit key (preferred over `reviewer_model` when present).
+    #[serde(default)]
+    model3: Option<String>,
 }
 
 fn default_controller() -> String { "controller".into() }
 fn default_executor() -> String { "executor".into() }
 
+/// Custom OpenAI-compatible provider (spec §8).
+///
+/// Per spec §21 we expose ONLY:
+///   * Provider ID
+///   * Base URL
+///   * API Key
+///   * Models
+///
+/// Display Name and Headers are deliberately absent from this struct and from
+/// the UI. `extra_body` is an internal-only hook (used by the OpenAI-compatible
+/// provider to pass through extra JSON body fields) and is not surfaced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModelBlock {
     provider: String,
@@ -77,7 +105,7 @@ struct ModelBlock {
     model: String,
     #[serde(default = "default_api_key_env")]
     api_key_env: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     extra_body: Option<serde_json::Value>,
 }
 
@@ -96,6 +124,31 @@ struct FrontendBlock {
 }
 
 fn default_max_visual() -> u32 { 5 }
+
+/// Appearance block (spec §11-§18). Persisted in `~/.aether/config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppearanceBlock {
+    #[serde(default = "default_bg_enabled")]
+    background_enabled: bool,
+    #[serde(default = "default_bg_opacity")]
+    background_opacity: u8,
+    /// Resolved path to the user-chosen background. `None` ⇒ use bundled default.
+    #[serde(default)]
+    background_image: Option<String>,
+}
+
+fn default_bg_enabled() -> bool { true }
+fn default_bg_opacity() -> u8 { 60 }
+
+impl Default for AppearanceBlock {
+    fn default() -> Self {
+        AppearanceBlock {
+            background_enabled: default_bg_enabled(),
+            background_opacity: default_bg_opacity(),
+            background_image: None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tauri commands
@@ -453,6 +506,125 @@ fn version() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Background image (spec §11-§18)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct BackgroundPayload {
+    /// Image bytes (PNG or JPEG). May be empty if even the bundled default
+    /// could not be located — the renderer treats this as "no background".
+    data_base64: String,
+    /// "image/png" or "image/jpeg".
+    content_type: String,
+    /// True if the payload is the bundled default (not user-supplied).
+    is_default: bool,
+}
+
+/// Returns the active background image. If the user has selected a custom
+/// image, that file is read from disk. Otherwise the bundled default
+/// (`resources/default-background.png`) is used. If both fail, an empty
+/// payload is returned (the UI hides the background layer in that case).
+#[tauri::command]
+async fn get_background(app: AppHandle) -> Result<BackgroundPayload, String> {
+    // User-chosen image first.
+    let cfg_path = config_path();
+    if let Ok(txt) = std::fs::read_to_string(&cfg_path) {
+        if let Ok(parsed) = toml::from_str::<DesktopConfig>(&txt) {
+            if let Some(p) = parsed.appearance.background_image.as_deref() {
+                let path = PathBuf::from(p);
+                if path.exists() {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        let ct = if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg")).unwrap_or(false) {
+                            "image/jpeg"
+                        } else {
+                            "image/png"
+                        };
+                        return Ok(BackgroundPayload {
+                            data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+                            content_type: ct.into(),
+                            is_default: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Bundled default.
+    let candidates = [
+        "default-background.png",
+        "resources/default-background.png",
+    ];
+    for name in candidates.iter() {
+        if let Ok(p) = app.path().resolve(name, tauri::path::BaseDirectory::Resource) {
+            if p.exists() {
+                if let Ok(bytes) = std::fs::read(&p) {
+                    return Ok(BackgroundPayload {
+                        data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+                        content_type: "image/png".into(),
+                        is_default: true,
+                    });
+                }
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let cand = dir.join(name);
+                if cand.exists() {
+                    if let Ok(bytes) = std::fs::read(&cand) {
+                        return Ok(BackgroundPayload {
+                            data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+                            content_type: "image/png".into(),
+                            is_default: true,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(BackgroundPayload {
+        data_base64: String::new(),
+        content_type: "image/png".into(),
+        is_default: true,
+    })
+}
+
+#[derive(Serialize)]
+struct BackgroundValidation {
+    accepted: bool,
+    message: String,
+    width: u32,
+    height: u32,
+    saved_path: Option<String>,
+}
+
+/// Accepts raw image bytes (PNG or JPEG), validates dimensions against the
+/// canonical AETHER resolution, and persists the image to
+/// `~/.aether/background.png`. On rejection the image is NOT saved and a
+/// human-readable error is returned (spec §14).
+#[tauri::command]
+async fn set_background_image(bytes: Vec<u8>) -> Result<BackgroundValidation, String> {
+    let (w, h) = background::validate_dimensions_bytes(&bytes).map_err(|e| e.to_string())?;
+    let dir = aether_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = dir.join("background.png");
+    std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+    Ok(BackgroundValidation {
+        accepted: true,
+        message: format!("Accepted: {} x {} px", w, h),
+        width: w,
+        height: h,
+        saved_path: Some(dest.display().to_string()),
+    })
+}
+
+#[tauri::command]
+fn required_background_resolution() -> String {
+    background::required_resolution_label()
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -472,6 +644,9 @@ fn main() {
             aether_dir_str,
             version,
             locate_cli,
+            get_background,
+            set_background_image,
+            required_background_resolution,
         ])
         .run(tauri::generate_context!())
         .expect("error while running aether-desktop");

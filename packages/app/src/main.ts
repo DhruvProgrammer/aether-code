@@ -1,4 +1,12 @@
-import { api, events, type TaskExit, type TaskOutput } from "./api";
+import {
+  api,
+  events,
+  type TaskExit,
+  type TaskOutput,
+  type DesktopConfig,
+  type ModelBlock,
+  type AppearanceConfig,
+} from "./api";
 
 // ----- State -----
 
@@ -294,8 +302,13 @@ async function openModal(kind: "settings" | "history") {
     body.innerHTML = `<div class="text-app-textSecondary text-sm">Loading…</div>`;
     try {
       const r = await api.readConfig();
-      body.innerHTML = renderSettings(r.config, r.path);
-      wireSettings(body);
+      body.innerHTML = await renderSettings(r.config, r.path);
+      wireSettings(body, r.config);
+      await refreshBackgroundPreview(body);
+      applyBackgroundFromSettings(body);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const lucide = (window as any).lucide;
+      if (lucide?.createIcons) lucide.createIcons();
     } catch (e) {
       body.innerHTML = `<div class="text-app-error text-sm">Failed: ${escapeHtml(String(e))}</div>`;
     }
@@ -320,109 +333,457 @@ function closeModal() {
   modal.classList.remove("flex");
 }
 
-function renderSettings(cfg: import("./api").DesktopConfig, path: string): string {
-  const m = cfg.models ?? {};
-  const rows = Object.entries(m).map(([k, v]) => `
-    <tr class="border-b border-app-border">
-      <td class="py-2 pr-3"><input class="w-full bg-transparent border border-app-border rounded px-2 py-1 text-sm font-mono" data-mk="key" value="${escapeAttr(k)}" /></td>
-      <td class="py-2 pr-3"><input class="w-full bg-transparent border border-app-border rounded px-2 py-1 text-sm font-mono" data-mk="provider" value="${escapeAttr(v.provider)}" /></td>
-      <td class="py-2 pr-3"><input class="w-full bg-transparent border border-app-border rounded px-2 py-1 text-sm font-mono" data-mk="url" value="${escapeAttr(v.base_url)}" /></td>
-      <td class="py-2 pr-3"><input class="w-full bg-transparent border border-app-border rounded px-2 py-1 text-sm font-mono" data-mk="model" value="${escapeAttr(v.model)}" /></td>
-      <td class="py-2 pr-3"><input class="w-full bg-transparent border border-app-border rounded px-2 py-1 text-sm font-mono" data-mk="env" value="${escapeAttr(v.api_key_env)}" /></td>
-      <td class="py-2"><button class="text-app-error hover:text-app-error/70" data-mk="del">×</button></td>
-    </tr>`).join("");
+// ---------------------------------------------------------------------------
+// Settings (spec §1-§23)
+// ---------------------------------------------------------------------------
+//
+// The settings UI is organised in three horizontal sections:
+//
+//   AI / MODELS     — three compact cards side-by-side: Model 1 (Big Executor),
+//                     Model 2 (Small Controller), Model 3 (Visual Reviewer).
+//                     Each card exposes Model ID, Provider, Base URL, API Key.
+//                     Slots 2 and 3 may be left blank to disable them.
+//
+//   PROVIDERS       — OpenAI-compatible provider entries. Per spec §8 each
+//                     entry contains ONLY: Provider ID, Base URL, API Key,
+//                     Models. Display Name and Headers are intentionally
+//                     absent.
+//
+//   APPEARANCE      — native AETHER background image (enabled toggle, live
+//                     preview, opacity slider) and the required-resolution
+//                     gate. The bundled default ships with the application;
+//                     user-supplied images must be exactly 1920x1080 px and
+//                     are validated server-side (spec §13-§14).
+//
+// Validation rules (spec §7):
+//   * Model 1 — every field required.
+//   * Model 2/3 — completely empty is VALID; partially configured is INVALID
+//     and the UI shows which field is missing.
+
+interface SlotState {
+  model_id: string;
+  provider: string;
+  base_url: string;
+  api_key: string;
+}
+
+function emptySlot(): SlotState {
+  return { model_id: "", provider: "", base_url: "", api_key: "" };
+}
+
+function buildSlots(cfg: DesktopConfig): { m1: SlotState; m2: SlotState; m3: SlotState } {
+  const m1key = (cfg.agent.model1 || cfg.agent.executor_model || "executor").trim() || "executor";
+  const m2key = (cfg.agent.model2 ?? cfg.agent.controller_model ?? "").trim();
+  const m3key = (cfg.agent.model3 ?? cfg.agent.reviewer_model ?? "").trim();
+
+  const lookup = (key: string): ModelBlock | null => {
+    if (!key) return null;
+    const m = cfg.models[key];
+    if (!m) return null;
+    return m;
+  };
+
+  const fromKey = (key: string): SlotState => {
+    const m = lookup(key);
+    if (!m) return { ...emptySlot(), model_id: key };
+    return {
+      model_id: key,
+      provider: m.provider ?? "",
+      base_url: m.base_url ?? "",
+      api_key: m.api_key_env ?? "",
+    };
+  };
+
+  return {
+    m1: fromKey(m1key),
+    m2: m2key ? fromKey(m2key) : emptySlot(),
+    m3: m3key ? fromKey(m3key) : emptySlot(),
+  };
+}
+
+function renderSlotCard(opts: {
+  slot: 1 | 2 | 3;
+  role: string;
+  required: boolean;
+  state: SlotState;
+}): string {
+  const { slot, role, required, state } = opts;
+  const sfx = String(slot);
+  const pillCls = required ? "role-pill" : "role-pill opt";
+  return `
+    <div class="model-card" data-slot-card="${sfx}">
+      <div class="flex items-center justify-between">
+        <div>
+          <div class="slot-title">MODEL ${sfx}</div>
+          <div class="role-desc">${escapeHtml(role)}</div>
+        </div>
+        <span class="${pillCls}">${required ? "Required" : "Optional"}</span>
+      </div>
+      <div class="field">
+        <label>Model ID</label>
+        <input data-slot="${sfx}" data-field="model_id" value="${escapeAttr(state.model_id)}" placeholder="e.g. qwen-coder" />
+      </div>
+      <div class="field">
+        <label>Provider</label>
+        <input data-slot="${sfx}" data-field="provider" value="${escapeAttr(state.provider)}" placeholder="openai_compatible" />
+      </div>
+      <div class="field">
+        <label>Base URL</label>
+        <input data-slot="${sfx}" data-field="base_url" value="${escapeAttr(state.base_url)}" placeholder="https://api.example.com/v1" />
+      </div>
+      <div class="field">
+        <label>API Key</label>
+        <input data-slot="${sfx}" data-field="api_key" value="${escapeAttr(state.api_key)}" placeholder="OPENAI_API_KEY" />
+      </div>
+      <div class="validation-err" data-slot-err="${sfx}" style="display:none"></div>
+    </div>`;
+}
+
+function renderProviderRow(key: string, m: ModelBlock | null): string {
+  const v = m ?? { provider: "", base_url: "", model: "", api_key_env: "OPENAI_API_KEY" };
+  return `<div class="provider-row" data-prov-row="${escapeAttr(key)}">
+    <input data-prov="key" value="${escapeAttr(key)}" placeholder="provider-id" />
+    <input data-prov="provider" value="${escapeAttr(v.provider)}" placeholder="openai_compatible" />
+    <input data-prov="url" value="${escapeAttr(v.base_url)}" placeholder="https://api.example.com/v1" />
+    <input data-prov="model" value="${escapeAttr(v.model)}" placeholder="model-id" />
+    <input data-prov="env" value="${escapeAttr(v.api_key_env)}" placeholder="OPENAI_API_KEY" />
+    <button type="button" class="text-app-textSecondary hover:text-app-error" data-prov-del title="Remove">
+      <i class="w-4 h-4" data-lucide="trash-2"></i>
+    </button>
+  </div>`;
+}
+
+async function renderSettings(cfg: DesktopConfig, path: string): Promise<string> {
+  const slots = buildSlots(cfg);
+  const providerEntries = Object.entries(cfg.models ?? {});
+
+  // Required-resolution label is server-authoritative.
+  let requiredRes = "1920 x 1080 px";
+  try { requiredRes = await api.requiredBackgroundResolution(); } catch { /* default */ }
+
+  const appearance: AppearanceConfig = cfg.appearance ?? {
+    background_enabled: true,
+    background_opacity: 60,
+    background_image: null,
+  };
 
   return `
-    <div class="space-y-4">
+    <div class="space-y-1">
       <p class="text-app-textSecondary text-xs">Saved to <code class="font-mono">${escapeHtml(path)}</code></p>
 
-      <div class="space-y-2">
-        <label class="block text-xs uppercase tracking-wide text-app-textSecondary">API key (env: OPENAI_API_KEY)</label>
-        <input id="api-key" type="password" class="w-full bg-app-bg border border-app-border rounded px-3 py-2 text-sm font-mono" placeholder="sk-…" />
-        <p class="text-xs text-app-textSecondary">The aether CLI reads this from your shell environment; this field is for reference only.</p>
-      </div>
-
-      <div class="space-y-2">
-        <label class="block text-xs uppercase tracking-wide text-app-textSecondary">Models</label>
-        <table class="w-full text-sm">
-          <thead><tr class="text-app-textSecondary text-xs uppercase">
-            <th class="py-1 text-left">Key</th><th class="py-1 text-left">Provider</th><th class="py-1 text-left">Base URL</th><th class="py-1 text-left">Model</th><th class="py-1 text-left">API key env</th><th></th>
-          </tr></thead>
-          <tbody id="models-body">${rows}</tbody>
-        </table>
-        <button id="add-model" class="text-xs text-app-textSecondary hover:text-app-brand">+ Add model</button>
-      </div>
-
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs uppercase tracking-wide text-app-textSecondary mb-1">Controller</label>
-          <input id="ctrl" class="w-full bg-app-bg border border-app-border rounded px-3 py-2 text-sm font-mono" value="${escapeAttr(cfg.agent.controller_model)}" />
+      <!-- ───── AI / MODELS ───── -->
+      <section class="settings-section">
+        <h3>AI / Models</h3>
+        <p class="text-xs text-app-textSecondary mb-3">Three model slots, provider-independent. Model 1 is required; Model 2 and Model 3 are optional.</p>
+        <div class="settings-grid" id="slots-grid">
+          ${renderSlotCard({ slot: 1, role: "Big Executor", required: true,  state: slots.m1 })}
+          ${renderSlotCard({ slot: 2, role: "Controller",     required: false, state: slots.m2 })}
+          ${renderSlotCard({ slot: 3, role: "Visual Reviewer", required: false, state: slots.m3 })}
         </div>
-        <div>
-          <label class="block text-xs uppercase tracking-wide text-app-textSecondary mb-1">Executor</label>
-          <input id="exec" class="w-full bg-app-bg border border-app-border rounded px-3 py-2 text-sm font-mono" value="${escapeAttr(cfg.agent.executor_model)}" />
-        </div>
-        <div>
-          <label class="block text-xs uppercase tracking-wide text-app-textSecondary mb-1">Reviewer (optional)</label>
-          <input id="rev" class="w-full bg-app-bg border border-app-border rounded px-3 py-2 text-sm font-mono" value="${escapeAttr(cfg.agent.reviewer_model ?? "")}" />
-        </div>
-      </div>
+      </section>
 
-      <div class="flex items-center space-x-3 pt-3 border-t border-app-border">
-        <button id="save-btn" class="bg-app-brand text-app-bg font-semibold px-4 py-1.5 rounded text-sm hover:opacity-90">Save</button>
+      <!-- ───── PROVIDERS ───── -->
+      <section class="settings-section">
+        <h3>Providers</h3>
+        <p class="text-xs text-app-textSecondary mb-3">OpenAI-compatible providers. Each contains only the fields AETHER actually uses.</p>
+        <div class="provider-row header">
+          <div>Provider ID</div><div>Type</div><div>Base URL</div><div>Models</div><div>API Key</div><div></div>
+        </div>
+        <div id="providers-body" class="space-y-2 mt-2">
+          ${providerEntries.map(([k, m]) => renderProviderRow(k, m)).join("")}
+        </div>
+        <button id="add-provider" type="button" class="mt-3 text-xs text-app-textSecondary hover:text-app-brand inline-flex items-center">
+          <i class="w-3.5 h-3.5 mr-1" data-lucide="plus"></i> Add provider
+        </button>
+      </section>
+
+      <!-- ───── APPEARANCE ───── -->
+      <section class="settings-section">
+        <h3>Appearance</h3>
+        <p class="text-xs text-app-textSecondary mb-3">Native background image. Ships with a bundled default; user-supplied images must be exactly ${escapeHtml(requiredRes)}.</p>
+
+        <div class="flex items-center mb-4">
+          <div id="bg-toggle" class="toggle ${appearance.background_enabled ? "on" : ""}">
+            <div class="knob"></div>
+            <span class="label">Background Image ${appearance.background_enabled ? "ON" : "OFF"}</span>
+          </div>
+        </div>
+
+        <div class="bg-preview mb-3">
+          <img id="bg-preview-img" alt="background preview" />
+        </div>
+
+        <div class="flex items-center space-x-4">
+          <label class="text-xs uppercase tracking-wide text-app-textSecondary w-20">Opacity</label>
+          <input id="bg-opacity" type="range" min="0" max="100" value="${appearance.background_opacity}" class="opacity-slider flex-1" />
+          <span id="bg-opacity-label" class="text-xs font-mono w-12 text-right">${appearance.background_opacity}%</span>
+        </div>
+
+        <div class="mt-3 flex items-center space-x-3">
+          <button id="bg-upload" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary inline-flex items-center">
+            <i class="w-3.5 h-3.5 mr-1.5" data-lucide="upload"></i> Upload image
+          </button>
+          <input id="bg-upload-input" type="file" accept="image/png,image/jpeg" style="display:none" />
+          <button id="bg-reset" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary inline-flex items-center">
+            <i class="w-3.5 h-3.5 mr-1.5" data-lucide="rotate-ccw"></i> Reset to default
+          </button>
+        </div>
+        <div class="validation-err" id="bg-validation" style="display:none"></div>
+      </section>
+
+      <!-- ───── Save bar ───── -->
+      <div class="flex items-center space-x-3 pt-4 border-t border-app-border">
+        <button id="save-btn" type="button" class="bg-app-brand text-app-bg font-semibold px-4 py-1.5 rounded text-sm hover:opacity-90 inline-flex items-center">
+          <i class="w-3.5 h-3.5 mr-1.5" data-lucide="save"></i> Save
+        </button>
         <span id="save-status" class="text-xs text-app-textSecondary"></span>
       </div>
     </div>`;
 }
 
-function wireSettings(body: HTMLElement) {
-  body.querySelector<HTMLButtonElement>("#add-model")?.addEventListener("click", () => {
-    const tr = document.createElement("tr");
-    tr.className = "border-b border-app-border";
-    tr.innerHTML = `
-      <td class="py-2 pr-3"><input class="w-full bg-transparent border border-app-border rounded px-2 py-1 text-sm font-mono" data-mk="key" value="newmodel" /></td>
-      <td class="py-2 pr-3"><input class="w-full bg-transparent border border-app-border rounded px-2 py-1 text-sm font-mono" data-mk="provider" value="openai_compatible" /></td>
-      <td class="py-2 pr-3"><input class="w-full bg-transparent border border-app-border rounded px-2 py-1 text-sm font-mono" data-mk="url" value="https://api.openai.com/v1" /></td>
-      <td class="py-2 pr-3"><input class="w-full bg-transparent border border-app-border rounded px-2 py-1 text-sm font-mono" data-mk="model" value="gpt-4o-mini" /></td>
-      <td class="py-2 pr-3"><input class="w-full bg-transparent border border-app-border rounded px-2 py-1 text-sm font-mono" data-mk="env" value="OPENAI_API_KEY" /></td>
-      <td class="py-2"><button class="text-app-error hover:text-app-error/70" data-mk="del">×</button></td>`;
-    tr.querySelector("[data-mk=del]")!.addEventListener("click", () => tr.remove());
-    body.querySelector("#models-body")!.appendChild(tr);
+function readSlot(body: HTMLElement, slot: 1 | 2 | 3): SlotState {
+  const sfx = String(slot);
+  const get = (f: string): string =>
+    body.querySelector<HTMLInputElement>(`input[data-slot="${sfx}"][data-field="${f}"]`)?.value.trim() ?? "";
+  return { model_id: get("model_id"), provider: get("provider"), base_url: get("base_url"), api_key: get("api_key") };
+}
+
+function validateSlots(slots: { m1: SlotState; m2: SlotState; m3: SlotState }): { ok: boolean; errors: Record<number, string> } {
+  const errors: Record<number, string> = {};
+
+  // Model 1 — required, every field must be present.
+  const missing1: string[] = [];
+  if (!slots.m1.model_id)  missing1.push("Model ID");
+  if (!slots.m1.provider)  missing1.push("Provider");
+  if (!slots.m1.base_url)  missing1.push("Base URL");
+  if (!slots.m1.api_key)   missing1.push("API Key");
+  if (missing1.length > 0) errors[1] = `Model 1 (Big Executor) is required. Missing: ${missing1.join(", ")}`;
+
+  // Model 2 — empty is OK; partial is INVALID.
+  const m2keys = ["model_id", "provider", "base_url", "api_key"] as const;
+  const m2nonEmpty = m2keys.filter((k) => slots.m2[k].length > 0).length;
+  if (m2nonEmpty > 0 && m2nonEmpty < m2keys.length) {
+    const missing2 = m2keys.filter((k) => !slots.m2[k]);
+    errors[2] = `Model 2 (Controller) is partially configured. Either fill all fields or leave it empty. Missing: ${missing2.join(", ")}`;
+  }
+
+  // Model 3 — empty is OK; partial is INVALID.
+  const m3nonEmpty = m2keys.filter((k) => slots.m3[k].length > 0).length;
+  if (m3nonEmpty > 0 && m3nonEmpty < m2keys.length) {
+    const missing3 = m2keys.filter((k) => !slots.m3[k]);
+    errors[3] = `Model 3 (Visual Reviewer) is partially configured. Either fill all fields or leave it empty. Missing: ${missing3.join(", ")}`;
+  }
+
+  return { ok: Object.keys(errors).length === 0, errors };
+}
+
+function showSlotErrors(body: HTMLElement, errors: Record<number, string>): void {
+  for (let slot = 1; slot <= 3; slot++) {
+    const el = body.querySelector<HTMLDivElement>(`[data-slot-err="${slot}"]`);
+    if (!el) continue;
+    const msg = errors[slot];
+    if (msg) {
+      el.textContent = msg;
+      el.style.display = "block";
+    } else {
+      el.textContent = "";
+      el.style.display = "none";
+    }
+  }
+}
+
+function collectProviders(body: HTMLElement): Record<string, ModelBlock> {
+  const out: Record<string, ModelBlock> = {};
+  body.querySelectorAll<HTMLDivElement>("#providers-body [data-prov-row]").forEach((row) => {
+    const get = (f: string): string =>
+      row.querySelector<HTMLInputElement>(`input[data-prov="${f}"]`)?.value.trim() ?? "";
+    const key = get("key");
+    if (!key) return;
+    out[key] = {
+      provider: get("provider"),
+      base_url: get("url"),
+      model: get("model"),
+      api_key_env: get("env") || "OPENAI_API_KEY",
+    };
+  });
+  return out;
+}
+
+function collectAppearance(body: HTMLElement, current: AppearanceConfig): AppearanceConfig {
+  const enabled = body.querySelector<HTMLDivElement>("#bg-toggle")?.classList.contains("on") ?? current.background_enabled;
+  const opacity = parseInt(body.querySelector<HTMLInputElement>("#bg-opacity")?.value ?? String(current.background_opacity), 10);
+  return {
+    background_enabled: enabled,
+    background_opacity: isNaN(opacity) ? current.background_opacity : Math.max(0, Math.min(100, opacity)),
+    background_image: current.background_image,
+  };
+}
+
+function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
+  // ----- Provider add/remove -----
+  body.querySelector<HTMLButtonElement>("#add-provider")?.addEventListener("click", () => {
+    const unique = `provider${Object.keys(originalCfg.models).length + 1}`;
+    const wrap = document.createElement("div");
+    wrap.innerHTML = renderProviderRow(unique, null);
+    const row = wrap.firstElementChild as HTMLDivElement;
+    row.querySelector<HTMLButtonElement>("[data-prov-del]")?.addEventListener("click", () => row.remove());
+    body.querySelector("#providers-body")!.appendChild(row);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const lucide = (window as any).lucide;
+    if (lucide?.createIcons) lucide.createIcons();
+  });
+  body.querySelectorAll<HTMLButtonElement>("#providers-body [data-prov-del]").forEach((b) =>
+    b.addEventListener("click", () => b.closest("[data-prov-row]")?.remove()));
+
+  // ----- Live opacity preview -----
+  const opacitySlider = body.querySelector<HTMLInputElement>("#bg-opacity");
+  const opacityLabel = body.querySelector<HTMLSpanElement>("#bg-opacity-label");
+  opacitySlider?.addEventListener("input", () => {
+    if (opacityLabel) opacityLabel.textContent = `${opacitySlider.value}%`;
+    applyBackgroundFromSettings(body);
   });
 
-  body.querySelectorAll<HTMLButtonElement>("[data-mk=del]").forEach((b) =>
-    b.addEventListener("click", () => b.closest("tr")?.remove()));
+  // ----- Background enable toggle (live) -----
+  body.querySelector<HTMLDivElement>("#bg-toggle")?.addEventListener("click", () => {
+    const t = body.querySelector<HTMLDivElement>("#bg-toggle")!;
+    t.classList.toggle("on");
+    const label = t.querySelector(".label");
+    if (label) label.textContent = t.classList.contains("on") ? "Background Image ON" : "Background Image OFF";
+    applyBackgroundFromSettings(body);
+  });
 
+  // ----- Background upload -----
+  const fileInput = body.querySelector<HTMLInputElement>("#bg-upload-input");
+  body.querySelector<HTMLButtonElement>("#bg-upload")?.addEventListener("click", () => fileInput?.click());
+  fileInput?.addEventListener("change", async () => {
+    const f = fileInput.files?.[0];
+    if (!f) return;
+    const arr = new Uint8Array(await f.arrayBuffer());
+    const validation = body.querySelector<HTMLDivElement>("#bg-validation")!;
+    try {
+      const result = await api.setBackgroundImage(Array.from(arr));
+      validation.classList.remove("validation-err");
+      validation.classList.add("validation-ok");
+      validation.style.display = "block";
+      validation.textContent = result.message;
+      // Refresh on-disk setting then re-render preview.
+      originalCfg.appearance.background_image = result.saved_path ?? null;
+      await refreshBackgroundPreview(body);
+    } catch (e) {
+      validation.classList.remove("validation-ok");
+      validation.classList.add("validation-err");
+      validation.style.display = "block";
+      validation.textContent = String(e);
+    }
+  });
+
+  // ----- Reset to default -----
+  body.querySelector<HTMLButtonElement>("#bg-reset")?.addEventListener("click", async () => {
+    originalCfg.appearance.background_image = null;
+    const validation = body.querySelector<HTMLDivElement>("#bg-validation")!;
+    validation.style.display = "none";
+    validation.textContent = "";
+    await refreshBackgroundPreview(body);
+  });
+
+  // ----- Save -----
   body.querySelector<HTMLButtonElement>("#save-btn")?.addEventListener("click", async () => {
     const status = body.querySelector<HTMLSpanElement>("#save-status")!;
     status.textContent = "Saving…";
-    const models: Record<string, import("./api").ModelBlock> = {};
-    body.querySelectorAll<HTMLTableRowElement>("#models-body tr").forEach((tr) => {
-      const k = (tr.querySelector<HTMLInputElement>("[data-mk=key]")!.value || "").trim();
-      if (!k) return;
-      models[k] = {
-        provider: tr.querySelector<HTMLInputElement>("[data-mk=provider]")!.value.trim(),
-        base_url: tr.querySelector<HTMLInputElement>("[data-mk=url]")!.value.trim(),
-        model: tr.querySelector<HTMLInputElement>("[data-mk=model]")!.value.trim(),
-        api_key_env: tr.querySelector<HTMLInputElement>("[data-mk=env]")!.value.trim() || "OPENAI_API_KEY",
-        extra_body: null,
-      };
-    });
+
+    const slots = { m1: readSlot(body, 1), m2: readSlot(body, 2), m3: readSlot(body, 3) };
+    const validation = validateSlots(slots);
+    showSlotErrors(body, validation.errors);
+    if (!validation.ok) {
+      status.textContent = "Fix the errors above before saving.";
+      return;
+    }
+
+    const providers = collectProviders(body);
+    // Make sure every slot's referenced provider exists in the map.
+    for (const s of [slots.m1, slots.m2, slots.m3]) {
+      if (s.model_id && !providers[s.model_id]) {
+        // Promote the inline slot into a provider entry so the runtime can resolve it.
+        providers[s.model_id] = {
+          provider: s.provider,
+          base_url: s.base_url,
+          model: s.model_id,
+          api_key_env: s.api_key || "OPENAI_API_KEY",
+        };
+      }
+    }
+
+    const appearance = collectAppearance(body, originalCfg.appearance);
+
     try {
       const path = await api.writeConfig({
         agent: {
-          controller_model: body.querySelector<HTMLInputElement>("#ctrl")!.value.trim() || "controller",
-          executor_model: body.querySelector<HTMLInputElement>("#exec")!.value.trim() || "executor",
-          reviewer_model: body.querySelector<HTMLInputElement>("#rev")!.value.trim() || null,
+          model1: slots.m1.model_id,
+          model2: slots.m2.model_id,
+          model3: slots.m3.model_id || null,
+          // Legacy mirrors so older aether CLI builds keep working.
+          executor_model: slots.m1.model_id,
+          controller_model: slots.m2.model_id || "controller",
+          reviewer_model: slots.m3.model_id || null,
         },
-        models,
-        frontend: { capture_command: null, preview_command: null, max_visual_iterations: 5, force: false },
+        models: providers,
+        frontend: originalCfg.frontend,
+        appearance,
       });
       status.textContent = `Saved to ${path}`;
+      // Apply background live (no reload).
+      await refreshBackgroundPreview(body);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const lucide = (window as any).lucide;
+      if (lucide?.createIcons) lucide.createIcons();
     } catch (e) {
       status.textContent = `Save failed: ${String(e)}`;
     }
   });
+}
+
+// ----- Background application (spec §16-§17) -----
+
+let cachedBackground: { data: string; contentType: string } | null = null;
+
+async function refreshBackgroundPreview(body: HTMLElement): Promise<void> {
+  const img = body.querySelector<HTMLImageElement>("#bg-preview-img");
+  try {
+    const payload = await api.getBackground();
+    if (payload.data_base64) {
+      const url = `data:${payload.content_type};base64,${payload.data_base64}`;
+      if (img) img.src = url;
+      cachedBackground = { data: payload.data_base64, contentType: payload.content_type };
+    } else {
+      if (img) img.src = "";
+      cachedBackground = null;
+    }
+  } catch {
+    if (img) img.src = "";
+    cachedBackground = null;
+  }
+}
+
+function applyBackgroundFromSettings(body: HTMLElement): void {
+  const enabled = body.querySelector<HTMLDivElement>("#bg-toggle")?.classList.contains("on") ?? true;
+  const opacity = parseInt(body.querySelector<HTMLInputElement>("#bg-opacity")?.value ?? "60", 10);
+  applyBackgroundLayer(enabled, isNaN(opacity) ? 60 : opacity);
+}
+
+function applyBackgroundLayer(enabled: boolean, opacityPct: number): void {
+  const img = document.querySelector<HTMLImageElement>("#bg-img");
+  const fade = document.querySelector<HTMLDivElement>("#bg-fade");
+  if (!img || !fade) return;
+  if (!enabled || !cachedBackground) {
+    img.style.display = "none";
+    fade.style.opacity = "1";
+    return;
+  }
+  if (!img.src) img.src = `data:${cachedBackground.contentType};base64,${cachedBackground.data}`;
+  img.style.display = "block";
+  img.style.opacity = String(opacityPct / 100);
+  // The fade layer keeps the UI readable when the image is bright.
+  fade.style.opacity = String(1 - opacityPct / 100 * 0.6);
 }
 
 function renderHistory(rows: import("./api").SessionRow[]): string {
@@ -459,6 +820,25 @@ async function boot() {
   app.tabs.push(createSession("Welcome"));
   renderAll();
 
+  // Apply background on launch (spec §16): we don't wait for the Settings modal.
+  try {
+    const r = await api.readConfig();
+    const appearance = r.config.appearance ?? {
+      background_enabled: true,
+      background_opacity: 60,
+      background_image: null,
+    };
+    try {
+      const payload = await api.getBackground();
+      if (payload.data_base64) {
+        cachedBackground = { data: payload.data_base64, contentType: payload.content_type };
+      }
+    } catch { /* keep null; layer renders solid */ }
+    applyBackgroundLayer(appearance.background_enabled, appearance.background_opacity);
+  } catch {
+    /* ignore */
+  }
+
   // Top-bar buttons (stable <button> wrappers with ids).
   document.querySelector("#new-tab-btn")!.addEventListener("click", newTab);
   document.querySelector("#open-settings-btn")!.addEventListener("click", () => openModal("settings"));
@@ -492,7 +872,6 @@ async function boot() {
 
   // Input.
   const input = document.querySelector<HTMLTextAreaElement>("#prompt-input")!;
-  const send = () => void sendPrompt();
   const sendPrompt = () => void send();
   document.querySelector("#send-btn")!.addEventListener("click", sendPrompt);
   input.addEventListener("keydown", (e) => {
@@ -512,16 +891,18 @@ async function boot() {
     renderHeader();
   });
 
-  // Model picker (reads from config).
+  // Model picker (reads from config; surfaces the three model slots).
   try {
     const r = await api.readConfig();
-    const keys = Object.keys(r.config.models);
-    if (keys.length > 0) app.modelKey = keys[0];
+    const slots = [r.config.agent.model1, r.config.agent.model2, r.config.agent.model3].filter(
+      (k): k is string => !!k,
+    );
+    if (slots.length > 0) app.modelKey = slots[0];
     const modelBtn = document.querySelector("#model-btn")!;
     modelBtn.addEventListener("click", () => {
-      if (keys.length === 0) return;
-      const i = keys.indexOf(app.modelKey);
-      app.modelKey = keys[(i + 1) % keys.length];
+      if (slots.length === 0) return;
+      const i = slots.indexOf(app.modelKey);
+      app.modelKey = slots[(i + 1) % slots.length];
       renderHeader();
     });
   } catch {

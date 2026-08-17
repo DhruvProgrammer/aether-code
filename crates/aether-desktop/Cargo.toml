@@ -24,6 +24,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["process", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 which = "7"
+aether-config = { path = "../aether-config" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
 
 [features]
 default = []

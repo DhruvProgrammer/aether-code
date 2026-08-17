@@ -1,7 +1,7 @@
 //! Configuration loading for `aether` (spec §25).
 //! No API keys are stored here — only the env var name to read.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -27,14 +27,72 @@ pub struct Config {
     /// optional LLM 3 screenshot/review loop and its acceptance policy.
     #[serde(default)]
     pub frontend: FrontendConfig,
+    /// Appearance settings (background image, opacity, on/off).
+    #[serde(default)]
+    pub appearance: AppearanceConfig,
+}
+
+/// Canonical AETHER background image resolution.
+///
+/// Centralised so the desktop binary, the renderer and any future tooling all
+/// validate against the same dimensions. Change this single constant to change
+/// the requirement globally.
+pub const BACKGROUND_WIDTH: u32 = 1920;
+pub const BACKGROUND_HEIGHT: u32 = 1080;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppearanceConfig {
+    /// Master switch for the desktop background image.
+    #[serde(default = "dft_bg_enabled")]
+    pub background_enabled: bool,
+    /// Background image opacity, 0..=100. Default tuned for a dark coding env.
+    #[serde(default = "dft_bg_opacity")]
+    pub background_opacity: u8,
+    /// Resolved path to the background image file. When `None`, the desktop app
+    /// falls back to the bundled default background shipped under `resources/`.
+    #[serde(default)]
+    pub background_image: Option<String>,
+}
+fn dft_bg_enabled() -> bool { true }
+fn dft_bg_opacity() -> u8 { 60 }
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        AppearanceConfig {
+            background_enabled: dft_bg_enabled(),
+            background_opacity: dft_bg_opacity(),
+            background_image: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
-    #[serde(default = "dft_controller")]
-    pub controller_model: String,
+    /// Model 1 — Big Executor (spec §3). Primary key into the `[models]` map. Required.
+    /// Responsible for code execution, implementation, tool usage, coding, testing,
+    /// debugging and the actual engineering work.
     #[serde(default = "dft_executor")]
     pub executor_model: String,
+    /// Model 2 — Small Controller (spec §3). Optional key into `[models]`. When `None`
+    /// or absent the existing/default orchestration system continues functioning.
+    /// Responsible for planning, task decomposition, routing, design planning, correction
+    /// planning, and deciding what happens next.
+    #[serde(default = "dft_controller")]
+    pub controller_model: String,
+    /// Model 3 — Visual Frontend Reviewer (spec §3). Optional multimodal model key. When
+    /// `None` the visual-review loop is disabled and the system degrades gracefully to
+    /// normal frontend development. Activated only at visual-review checkpoints.
+    #[serde(default)]
+    pub reviewer_model: Option<String>,
+    /// Legacy alias preserved for backward compatibility; mirrors `executor_model`.
+    #[serde(default, skip_serializing)]
+    pub model1: Option<String>,
+    /// Legacy alias preserved for backward compatibility; mirrors `controller_model`.
+    #[serde(default, skip_serializing)]
+    pub model2: Option<String>,
+    /// Legacy alias preserved for backward compatibility; mirrors `reviewer_model`.
+    #[serde(default, skip_serializing)]
+    pub model3: Option<String>,
     #[serde(default = "dft_max_iter")]
     pub max_iterations: u32,
     /// Outer closed-loop budget: how many plan→execute→verify→replan cycles the
@@ -49,11 +107,6 @@ pub struct AgentConfig {
     /// Endpoint used when running in local mode (`--local`), e.g. a local OpenAI-compatible server.
     #[serde(default = "dft_local_endpoint")]
     pub local_endpoint: String,
-    /// LLM 3 — VISUAL FRONTEND REVIEWER (spec: 3-LLM visual engineering). Optional multimodal
-    /// model key from `models`. When `None`, the visual-review loop is disabled and the system
-    /// degrades gracefully to normal frontend development.
-    #[serde(default)]
-    pub reviewer_model: Option<String>,
 }
 fn dft_controller() -> String { "controller".into() }
 fn dft_executor() -> String { "executor".into() }
@@ -64,15 +117,20 @@ fn dft_local_endpoint() -> String { "http://127.0.0.1:11434/v1".into() }
 
 impl Default for AgentConfig {
     fn default() -> Self {
+        let exec = dft_executor();
+        let ctrl = dft_controller();
         AgentConfig {
-            controller_model: dft_controller(),
-            executor_model: dft_executor(),
+            executor_model: exec.clone(),
+            controller_model: ctrl.clone(),
+            reviewer_model: None,
+            model1: Some(exec),
+            model2: Some(ctrl),
+            model3: None,
             max_iterations: dft_max_iter(),
             loop_budget: dft_loop_budget(),
             routing_policy: dft_policy(),
             cheap_model: None,
             local_endpoint: dft_local_endpoint(),
-            reviewer_model: None,
         }
     }
 }
@@ -328,5 +386,132 @@ impl Config {
 
     pub fn model(&self, key: &str) -> Option<&ModelConfig> {
         self.models.get(key)
+    }
+
+    /// Resolve Model 1 (Big Executor) — required.
+    pub fn model1(&self) -> Option<&ModelConfig> {
+        let key = self.agent.model1.as_deref().unwrap_or(&self.agent.executor_model);
+        self.models.get(key)
+    }
+
+    /// Resolve Model 2 (Small Controller) — optional.
+    pub fn model2(&self) -> Option<&ModelConfig> {
+        match self.agent.model2.as_deref() {
+            Some(k) if !k.is_empty() => self.models.get(k),
+            _ => {
+                let k = &self.agent.controller_model;
+                if k.is_empty() { None } else { self.models.get(k) }
+            }
+        }
+    }
+
+    /// Resolve Model 3 (Visual Reviewer) — optional.
+    pub fn model3(&self) -> Option<&ModelConfig> {
+        match self.agent.model3.as_deref() {
+            Some(k) if !k.is_empty() => self.models.get(k),
+            _ => self.agent.reviewer_model.as_deref().and_then(|k| self.models.get(k)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Config {
+        let toml = r#"
+            [agent]
+            executor_model = "executor"
+            controller_model = "controller"
+            reviewer_model = "reviewer"
+            model1 = "executor"
+            model2 = "controller"
+            model3 = "reviewer"
+
+            [models.executor]
+            provider = "openai_compatible"
+            base_url = "https://api.example.com/v1"
+            model = "big-coder"
+            api_key_env = "BIG_KEY"
+
+            [models.controller]
+            provider = "openai_compatible"
+            base_url = "https://controller.example.com/v1"
+            model = "small-ctrl"
+            api_key_env = "CTRL_KEY"
+
+            [models.reviewer]
+            provider = "openai_compatible"
+            base_url = "https://reviewer.example.com/v1"
+            model = "vision-pro"
+            api_key_env = "REV_KEY"
+
+            [appearance]
+            background_enabled = true
+            background_opacity = 42
+        "#;
+        toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn appearance_defaults_are_tasteful() {
+        let cfg = Config::default();
+        assert!(cfg.appearance.background_enabled);
+        assert_eq!(cfg.appearance.background_opacity, 60);
+        assert_eq!(cfg.appearance.background_image, None);
+    }
+
+    #[test]
+    fn background_resolution_is_canonical() {
+        assert_eq!(BACKGROUND_WIDTH, 1920);
+        assert_eq!(BACKGROUND_HEIGHT, 1080);
+    }
+
+    #[test]
+    fn model1_resolves_to_required_executor() {
+        let cfg = sample();
+        let m1 = cfg.model1().expect("model1 must resolve");
+        assert_eq!(m1.model, "big-coder");
+        assert_eq!(m1.api_key_env, "BIG_KEY");
+    }
+
+    #[test]
+    fn model2_resolves_to_optional_controller() {
+        let cfg = sample();
+        let m2 = cfg.model2().expect("model2 must resolve when configured");
+        assert_eq!(m2.model, "small-ctrl");
+    }
+
+    #[test]
+    fn model3_resolves_to_optional_reviewer() {
+        let cfg = sample();
+        let m3 = cfg.model3().expect("model3 must resolve when configured");
+        assert_eq!(m3.model, "vision-pro");
+    }
+
+    #[test]
+    fn model2_missing_is_none_not_error() {
+        let mut cfg = sample();
+        cfg.agent.model2 = None;
+        cfg.agent.controller_model = "missing-key".into();
+        // Either way: returns None (Model 2 is optional).
+        assert!(cfg.model2().is_none());
+    }
+
+    #[test]
+    fn model3_missing_is_none_not_error() {
+        let mut cfg = sample();
+        cfg.agent.model3 = None;
+        cfg.agent.reviewer_model = None;
+        assert!(cfg.model3().is_none());
+    }
+
+    #[test]
+    fn appearance_roundtrip() {
+        let cfg = sample();
+        let s = toml::to_string(&cfg.appearance).unwrap();
+        let back: AppearanceConfig = toml::from_str(&s).unwrap();
+        assert!(back.background_enabled);
+        assert_eq!(back.background_opacity, 42);
     }
 }

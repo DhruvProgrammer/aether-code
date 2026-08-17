@@ -47,14 +47,53 @@
       .thinking-dot:nth-child(2) { animation-delay: 0.15s; }
       .thinking-dot:nth-child(3) { animation-delay: 0.30s; }
       @keyframes pulse { 0%, 60%, 100% { opacity: 0.25; } 30% { opacity: 1; } }
+
+      /* ---- Background layer (spec §16): image sits behind an opacity layer
+              which sits behind the entire UI. UI elements are NOT faded. ---- */
+      #bg-layer { position: fixed; inset: 0; z-index: -10; overflow: hidden; pointer-events: none; }
+      #bg-img   { width: 100%; height: 100%; object-fit: cover; display: none; }
+      #bg-fade  { position: absolute; inset: 0; background: #0f1115; transition: opacity 0.18s linear; }
+
+      /* ---- Settings modal compact styling ---- */
+      .settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+      @media (max-width: 880px) { .settings-grid { grid-template-columns: 1fr; } }
+      .model-card   { background: #1d2230; border: 1px solid #2a2f3d; border-radius: 10px; padding: 14px; }
+      .model-card .field { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+      .model-card input  { width: 100%; background: #0f1115; border: 1px solid #2a2f3d; border-radius: 6px; padding: 6px 8px; color: #e8e8e8; font-size: 12px; font-family: 'JetBrains Mono', ui-monospace, monospace; }
+      .model-card input:focus { outline: none; border-color: #7ca6b4; }
+      .model-card .field label { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #8c9296; }
+      .role-pill { display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #2a2f3d; color: #7ca6b4; letter-spacing: 0.05em; }
+      .role-pill.opt { color: #8c9296; }
+      .slot-title { font-size: 11px; font-weight: 600; letter-spacing: 0.1em; color: #e8e8e8; }
+      .role-desc  { font-size: 11px; color: #8c9296; }
+
+      .provider-row { display: grid; grid-template-columns: 1.2fr 2fr 2fr 1.4fr 1.4fr auto; gap: 8px; align-items: center; }
+      .provider-row.header { color: #8c9296; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; }
+      .provider-row input { background: #0f1115; border: 1px solid #2a2f3d; border-radius: 6px; padding: 5px 8px; color: #e8e8e8; font-size: 12px; font-family: 'JetBrains Mono', ui-monospace, monospace; min-width: 0; }
+      .provider-row input:focus { outline: none; border-color: #7ca6b4; }
+      .settings-section { padding-top: 16px; padding-bottom: 16px; border-top: 1px solid #2a2f3d; }
+      .settings-section:first-of-type { border-top: none; }
+      .settings-section h3 { font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: #7ca6b4; margin-bottom: 10px; }
+      .toggle { display: inline-flex; align-items: center; cursor: pointer; user-select: none; }
+      .toggle .knob { width: 28px; height: 16px; background: #2a2f3d; border-radius: 8px; position: relative; transition: background 0.15s; }
+      .toggle .knob::after { content: ''; position: absolute; left: 2px; top: 2px; width: 12px; height: 12px; background: #8c9296; border-radius: 50%; transition: transform 0.15s, background 0.15s; }
+      .toggle.on .knob { background: #7ca6b4; }
+      .toggle.on .knob::after { transform: translateX(12px); background: #0f1115; }
+      .toggle .label { margin-left: 8px; font-size: 12px; color: #e8e8e8; }
+      input[type=range].opacity-slider { width: 100%; accent-color: #7ca6b4; }
+      .bg-preview { width: 100%; aspect-ratio: 16/9; background: #0f1115; border: 1px solid #2a2f3d; border-radius: 6px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+      .bg-preview img { width: 100%; height: 100%; object-fit: cover; }
+      .validation-err { color: #bc484a; font-size: 11px; font-family: 'JetBrains Mono', monospace; white-space: pre-wrap; margin-top: 6px; }
+      .validation-ok  { color: #7ca6b4; font-size: 11px; margin-top: 6px; }
     </style>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
   </head>
   <body class="font-sans h-screen flex flex-col overflow-hidden antialiased">
-    <div class="fixed inset-0 -z-10 overflow-hidden">
-      <div class="absolute inset-0 bg-app-bg/40 z-10"></div>
-      <img alt="" class="w-full h-full object-cover bg-cover-blur" src="" id="bg-img" style="display:none" />
+    <!-- Background layer (spec §16). Always rendered; fades to solid bg when off. -->
+    <div id="bg-layer">
+      <img alt="" id="bg-img" />
+      <div id="bg-fade"></div>
     </div>
 
     <!-- BEGIN: Top Window Controls -->
@@ -138,7 +177,7 @@
 
     <!-- BEGIN: Modals (settings / history / help) -->
     <div id="modal" class="hidden fixed inset-0 z-50 bg-black/60 backdrop-blur-sm items-center justify-center p-8">
-      <div class="bg-app-surface border border-app-border rounded-xl w-full max-w-3xl max-h-[80vh] overflow-hidden flex flex-col">
+      <div class="bg-app-surface border border-app-border rounded-xl w-full max-w-5xl max-h-[85vh] overflow-hidden flex flex-col">
         <div class="flex items-center justify-between px-5 py-3 border-b border-app-border">
           <h2 id="modal-title" class="text-base font-semibold text-app-brand">Settings</h2>
           <button id="modal-close" class="text-app-textSecondary hover:text-app-textPrimary">
