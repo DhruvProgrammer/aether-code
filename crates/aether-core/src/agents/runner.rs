@@ -58,7 +58,8 @@ pub async fn run_agent(
         session_id.to_string(),
         def.system_prompt.clone(),
         Some(effective),
-    );
+    )
+    .with_agent_id(def.id.clone());
 
     let text = exec.run(task).await?;
 

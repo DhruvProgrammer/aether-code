@@ -531,6 +531,51 @@ async function renderSettings(cfg: DesktopConfig, path: string): Promise<string>
         <div class="validation-err" id="bg-validation" style="display:none"></div>
       </section>
 
+      <!-- ───── SUBSYSTEMS (v0.12) ───── -->
+      <section class="settings-section">
+        <h3>Subsystems</h3>
+        <p class="text-xs text-app-textSecondary mb-3">Five first-class systems ship with the runtime. Each is independently auditable.</p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div class="model-card">
+            <div class="slot-title">CONTEXT MANAGER</div>
+            <div class="role-desc">Automatic compaction + per-agent segmentation</div>
+            <div class="validation-ok mt-2">Active — segments: 17 kinds · thresholds: 70/82/94%</div>
+          </div>
+          <div class="model-card">
+            <div class="slot-title">PERMISSION ENGINE</div>
+            <div class="role-desc">Hierarchical: Global → Project → Role → Agent → Tool</div>
+            <div class="validation-ok mt-2">Active — decision log + approval channel wired</div>
+          </div>
+          <div class="model-card">
+            <div class="slot-title">SKILL REGISTRY</div>
+            <div class="role-desc">On-demand capability packages</div>
+            <div id="skill-list" class="text-xs text-app-textSecondary mt-2">Loading…</div>
+          </div>
+          <div class="model-card">
+            <div class="slot-title">PROVIDER / MODEL CATALOG</div>
+            <div class="role-desc">Health-check before activation</div>
+            <div class="mt-2 flex flex-col space-y-2">
+              <input id="hc-url" class="bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" placeholder="https://api.example.com/v1" />
+              <input id="hc-env" class="bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" placeholder="API_KEY_ENV" />
+              <input id="hc-model" class="bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" placeholder="model-id" />
+              <button id="hc-run" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary">Check Provider</button>
+              <div id="hc-out" class="text-xs font-mono whitespace-pre-wrap text-app-textSecondary"></div>
+            </div>
+          </div>
+          <div class="model-card col-span-full">
+            <div class="slot-title">SNAPSHOTS / UNDO / REDO</div>
+            <div class="role-desc">State-aware recovery · Undo understands multi-agent changes</div>
+            <div class="mt-2 flex items-center space-x-2">
+              <input id="snap-session" class="flex-1 bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" placeholder="session-id" />
+              <button id="snap-list" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary">List</button>
+              <button id="snap-undo" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary">Undo</button>
+              <button id="snap-redo" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary">Redo</button>
+            </div>
+            <div id="snap-list-out" class="text-xs font-mono mt-2 max-h-40 overflow-y-auto"></div>
+          </div>
+        </div>
+      </section>
+
       <!-- ───── Save bar ───── -->
       <div class="flex items-center space-x-3 pt-4 border-t border-app-border">
         <button id="save-btn" type="button" class="bg-app-brand text-app-bg font-semibold px-4 py-1.5 rounded text-sm hover:opacity-90 inline-flex items-center">
@@ -620,6 +665,87 @@ function collectAppearance(body: HTMLElement, current: AppearanceConfig): Appear
 }
 
 function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
+  // ----- Skills list -----
+  void api.listSkills().then((skills) => {
+    const out = body.querySelector("#skill-list");
+    if (!out) return;
+    if (skills.length === 0) {
+      out.textContent = "No skills found. Drop SKILL.md into ~/.aether/skills/ or your repo.";
+    } else {
+      out.innerHTML = skills
+        .slice(0, 8)
+        .map((s) => `<div>• <code class="font-mono">${escapeHtml(s.id)}</code> — ${escapeHtml(s.description.slice(0, 80))}</div>`)
+        .join("");
+      if (skills.length > 8) out.innerHTML += `<div class="mt-1">+${skills.length - 8} more</div>`;
+    }
+  }).catch(() => { /* ignore */ });
+
+  // ----- Provider health check -----
+  body.querySelector<HTMLButtonElement>("#hc-run")?.addEventListener("click", async () => {
+    const url = body.querySelector<HTMLInputElement>("#hc-url")?.value.trim() ?? "";
+    const env = body.querySelector<HTMLInputElement>("#hc-env")?.value.trim() ?? "OPENAI_API_KEY";
+    const model = body.querySelector<HTMLInputElement>("#hc-model")?.value.trim() ?? "";
+    const out = body.querySelector("#hc-out");
+    if (!out || !url) { if (out) out.textContent = "URL is required."; return; }
+    out.textContent = "Checking…";
+    try {
+      const r = await api.checkProvider(url, env, model ? [model] : []);
+      const lines = r.checks.map((c) => `${c.passed ? "✓" : "✗"} ${c.label}: ${c.detail}`).join("\n");
+      out.textContent = `${r.message}\n\n${lines}\n\nStatus: ${r.status} · Latency: ${r.total_latency_ms}ms · Can save: ${r.can_save}`;
+    } catch (e) {
+      out.textContent = `Check failed: ${String(e)}`;
+    }
+  });
+
+  // ----- Snapshots -----
+  async function refreshSnapshotList() {
+    const sid = body.querySelector<HTMLInputElement>("#snap-session")?.value.trim() ?? "";
+    const out = body.querySelector("#snap-list-out");
+    if (!out) return;
+    if (!sid) { out.textContent = "Enter a session id."; return; }
+    try {
+      const list = await api.listSnapshots(sid);
+      if (list.length === 0) { out.textContent = "(no snapshots for this session yet)"; return; }
+      out.innerHTML = list.map((s) => {
+        const files = s.files.length ? `${s.files.length} files` : "0 files";
+        return `<div class="border-b border-app-border/50 py-1 cursor-pointer hover:bg-app-hover px-1" data-snap-id="${escapeAttr(s.id)}">
+          <div class="text-app-textPrimary">${escapeHtml(s.id)} <span class="text-app-textSecondary">${escapeHtml(s.trigger)} · ${files}</span></div>
+          <div class="text-app-textSecondary">${escapeHtml(s.timestamp)} · ${escapeHtml(s.agent_id ?? "")}</div>
+        </div>`;
+      }).join("");
+      out.querySelectorAll<HTMLDivElement>("[data-snap-id]").forEach((d) =>
+        d.addEventListener("click", async () => {
+          const id = d.dataset.snapId!;
+          const r = await api.restoreSnapshot(sid, id);
+          out.innerHTML = `<div class="validation-${r.success ? "ok" : "err"}">${escapeHtml(r.message)} (${r.files_restored} files)</div>` + out.innerHTML;
+        }),
+      );
+    } catch (e) {
+      out.textContent = `Failed: ${String(e)}`;
+    }
+  }
+  body.querySelector<HTMLButtonElement>("#snap-list")?.addEventListener("click", () => void refreshSnapshotList());
+  body.querySelector<HTMLButtonElement>("#snap-undo")?.addEventListener("click", async () => {
+    const sid = body.querySelector<HTMLInputElement>("#snap-session")?.value.trim() ?? "";
+    const out = body.querySelector("#snap-list-out");
+    if (!out || !sid) return;
+    try {
+      const r = await api.snapshotUndo(sid);
+      out.innerHTML = `<div class="validation-${r.success ? "ok" : "err"}">${escapeHtml(r.message)} (${r.files_restored} files)</div>` + (out.innerHTML ?? "");
+      await refreshSnapshotList();
+    } catch (e) { out.textContent = String(e); }
+  });
+  body.querySelector<HTMLButtonElement>("#snap-redo")?.addEventListener("click", async () => {
+    const sid = body.querySelector<HTMLInputElement>("#snap-session")?.value.trim() ?? "";
+    const out = body.querySelector("#snap-list-out");
+    if (!out || !sid) return;
+    try {
+      const r = await api.snapshotRedo(sid);
+      out.innerHTML = `<div class="validation-${r.success ? "ok" : "err"}">${escapeHtml(r.message)} (${r.files_restored} files)</div>` + (out.innerHTML ?? "");
+      await refreshSnapshotList();
+    } catch (e) { out.textContent = String(e); }
+  });
+
   // ----- Provider add/remove -----
   body.querySelector<HTMLButtonElement>("#add-provider")?.addEventListener("click", () => {
     const unique = `provider${Object.keys(originalCfg.models).length + 1}`;

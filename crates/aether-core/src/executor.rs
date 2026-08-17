@@ -26,6 +26,11 @@ pub struct Executor {
     session_id: String,
     system_prompt: String,
     allowed_tools: Option<Vec<String>>,
+    // ---- v0.12 optional subsystems ----
+    /// Agent id used for per-agent permission scoping.
+    pub(crate) agent_id: Option<String>,
+    pub(crate) permission_engine: Option<Arc<aether_permissions::PermissionEngine>>,
+    pub(crate) context_manager: Option<Arc<aether_context::ContextManager>>,
 }
 
 impl Executor {
@@ -55,8 +60,15 @@ impl Executor {
             session_id,
             system_prompt,
             allowed_tools,
+            agent_id: None,
+            permission_engine: None,
+            context_manager: None,
         }
     }
+
+    pub fn with_agent_id(mut self, id: impl Into<String>) -> Self { self.agent_id = Some(id.into()); self }
+    pub fn with_permission_engine(mut self, e: Arc<aether_permissions::PermissionEngine>) -> Self { self.permission_engine = Some(e); self }
+    pub fn with_context_manager(mut self, c: Arc<aether_context::ContextManager>) -> Self { self.context_manager = Some(c); self }
 
     pub async fn run(&self, task: &str) -> Result<String> {
         let mut messages = vec![
@@ -173,9 +185,38 @@ impl Executor {
         let category = tool.category();
         let policy_perm = if category == "bash" {
             let cmd = tc.arguments.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            self.policy.check_bash(cmd)
+            // v0.12: route bash through the new hierarchical engine when present;
+            // otherwise fall back to the v0.11 hard-coded classify_bash + policy table.
+            if let Some(eng) = &self.permission_engine {
+                eng.decide_bash(self.agent_id.as_deref(), cmd).verdict
+            } else {
+                match aether_permissions::classify_bash(cmd) {
+                    aether_permissions::BashLevel::Hard => Permission::Deny,
+                    aether_permissions::BashLevel::Soft => Permission::Ask,
+                    aether_permissions::BashLevel::Safe => self.policy.value_for("bash"),
+                }
+            }
         } else {
-            self.policy.value_for(category)
+            // Non-bash tools: prefer the hierarchical engine when configured.
+            if let Some(eng) = &self.permission_engine {
+                let op = match category {
+                    "read" => aether_permissions::Operation::Read,
+                    "edit" => aether_permissions::Operation::Write,
+                    "delete" => aether_permissions::Operation::Delete,
+                    "git_commit" => aether_permissions::Operation::Admin,
+                    "network" => aether_permissions::Operation::Network,
+                    _ => aether_permissions::Operation::Execute,
+                };
+                eng.decide(op, &aether_permissions::ResourceScope::Tool { value: tc.name.clone() },
+                    aether_permissions::engine::DecisionContext {
+                        agent_id: self.agent_id.as_deref(),
+                        tool: Some(&tc.name),
+                        role: None,
+                        reason: None,
+                    }).verdict
+            } else {
+                self.policy.value_for(category)
+            }
         };
         let effective = match (policy_perm, tool.required_permission()) {
             (Permission::Deny, _) | (_, Permission::Deny) => Permission::Deny,

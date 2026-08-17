@@ -11,6 +11,7 @@ aether-config = { path = "../aether-config" }
 aether-permissions = { path = "../aether-permissions" }
 aether-sessions = { path = "../aether-sessions" }
 aether-mind = { path = "../aether-mind" }
+aether-context = { path = "../aether-context" }
 async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"

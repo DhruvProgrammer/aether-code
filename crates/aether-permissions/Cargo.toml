@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 aether-config = { path = "../aether-config" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

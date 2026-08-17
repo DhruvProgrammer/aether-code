@@ -506,6 +506,158 @@ fn version() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// v0.12 subsystems — Provider health / Snapshot / Skills
+// ---------------------------------------------------------------------------
+
+/// Run a one-shot health check against a candidate provider descriptor.
+/// Fields mirror `aether_registry::ProviderDescriptor`; the frontend builds
+/// the descriptor from the settings form.
+#[tauri::command]
+async fn check_provider(
+    base_url: String,
+    api_key_env: String,
+    models: Vec<String>,
+) -> aether_registry::HealthOutcome {
+    let p = aether_registry::ProviderDescriptor::new_openai_compatible("probe", base_url, api_key_env);
+    let mut p = p;
+    for m in models { p = p.with_model(m); }
+    aether_registry::HealthChecker::new().check(&p).await
+}
+
+#[derive(Serialize)]
+struct SkillSummaryDto {
+    id: String,
+    name: String,
+    description: String,
+    version: String,
+    tags: Vec<String>,
+    source_path: String,
+}
+
+/// List skills discovered from the user's home + workspace + bundled resources.
+#[tauri::command]
+async fn list_skills(app: AppHandle) -> Vec<SkillSummaryDto> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() { roots.push(home.join(".aether/skills")); }
+    roots.push(std::path::PathBuf::from("."));
+    if let Ok(p) = app.path().resolve("skills", tauri::path::BaseDirectory::Resource) {
+        roots.push(p);
+    }
+    let mut reg = aether_mind::skills::SkillRegistry::new();
+    for r in roots {
+        let _ = reg.scan_more(&r, 5);
+    }
+    reg.summaries().into_iter().map(|s| SkillSummaryDto {
+        id: s.id, name: s.name, description: s.description, version: s.version, tags: s.tags, source_path: s.source_path.display().to_string(),
+    }).collect()
+}
+
+#[derive(Serialize)]
+struct SnapshotDto {
+    id: String,
+    parent_id: Option<String>,
+    timestamp: String,
+    trigger: String,
+    agent_id: Option<String>,
+    task: Option<String>,
+    files: Vec<String>,
+    metadata: std::collections::HashMap<String, String>,
+}
+
+#[tauri::command]
+fn list_snapshots(session_id: String) -> Vec<SnapshotDto> {
+    let root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
+    let mgr = match aether_sessions::SnapshotManager::open(root) { Ok(m) => m, Err(_) => return vec![] };
+    mgr.list(&session_id).into_iter().map(|s| SnapshotDto {
+        id: s.id.clone(),
+        parent_id: s.parent_id.clone(),
+        timestamp: s.timestamp.to_rfc3339(),
+        trigger: s.trigger.label().into(),
+        agent_id: s.agent_id.clone(),
+        task: s.task.clone(),
+        files: s.files.iter().map(|f| f.path.display().to_string()).collect(),
+        metadata: s.metadata.clone(),
+    }).collect()
+}
+
+#[derive(Serialize)]
+struct SnapshotResultDto {
+    snapshot_id: String,
+    files_restored: usize,
+    success: bool,
+    message: String,
+}
+
+#[tauri::command]
+fn restore_snapshot(session_id: String, snapshot_id: String) -> SnapshotResultDto {
+    let root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
+    let mut mgr = match aether_sessions::SnapshotManager::open(root) {
+        Ok(m) => m,
+        Err(e) => return SnapshotResultDto { snapshot_id, files_restored: 0, success: false, message: e.to_string() },
+    };
+    match mgr.restore(&snapshot_id) {
+        Ok(s) => SnapshotResultDto {
+            snapshot_id: s.id,
+            files_restored: s.files.len(),
+            success: true,
+            message: "restored".into(),
+        },
+        Err(e) => SnapshotResultDto {
+            snapshot_id,
+            files_restored: 0,
+            success: false,
+            message: e.to_string(),
+        },
+    }
+}
+
+#[tauri::command]
+fn snapshot_undo(session_id: String) -> SnapshotResultDto {
+    let root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
+    let mut mgr = match aether_sessions::SnapshotManager::open(root) {
+        Ok(m) => m,
+        Err(e) => return SnapshotResultDto { snapshot_id: String::new(), files_restored: 0, success: false, message: e.to_string() },
+    };
+    match mgr.undo(&session_id) {
+        Ok(s) => SnapshotResultDto {
+            snapshot_id: s.id,
+            files_restored: s.files.len(),
+            success: true,
+            message: "undone".into(),
+        },
+        Err(e) => SnapshotResultDto {
+            snapshot_id: String::new(),
+            files_restored: 0,
+            success: false,
+            message: e.to_string(),
+        },
+    }
+}
+
+#[tauri::command]
+fn snapshot_redo(session_id: String) -> SnapshotResultDto {
+    let root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
+    let mut mgr = match aether_sessions::SnapshotManager::open(root) {
+        Ok(m) => m,
+        Err(e) => return SnapshotResultDto { snapshot_id: String::new(), files_restored: 0, success: false, message: e.to_string() },
+    };
+    match mgr.redo(&session_id) {
+        Ok(s) => SnapshotResultDto {
+            snapshot_id: s.id,
+            files_restored: s.files.len(),
+            success: true,
+            message: "redone".into(),
+        },
+        Err(e) => SnapshotResultDto {
+            snapshot_id: String::new(),
+            files_restored: 0,
+            success: false,
+            message: e.to_string(),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Background image (spec §11-§18)
 // ---------------------------------------------------------------------------
 
@@ -647,6 +799,12 @@ fn main() {
             get_background,
             set_background_image,
             required_background_resolution,
+            check_provider,
+            list_skills,
+            list_snapshots,
+            restore_snapshot,
+            snapshot_undo,
+            snapshot_redo,
         ])
         .run(tauri::generate_context!())
         .expect("error while running aether-desktop");

@@ -5,6 +5,8 @@ members = [
     "crates/aether-permissions",
     "crates/aether-models",
     "crates/aether-tools",
+    "crates/aether-context",
+    "crates/aether-registry",
     "crates/aether-core",
     "crates/aether-cli",
     "crates/aether-sessions",
@@ -13,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-  version = "0.11.0"
+  version = "0.12.0"
 edition = "2021"
 license = "MIT"
 authors = ["aether contributors"]

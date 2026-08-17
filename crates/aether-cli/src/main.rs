@@ -307,6 +307,35 @@ async fn run() -> anyhow::Result<()> {
     ui::banner("aether");
     ui::note(&format!("session: {session_id}"));
 
+    // ---- v0.12 subsystems ----
+    let permission_engine = {
+        let pe = aether_permissions::PermissionEngine::from_policy(&policy);
+        // Add a sensible default deny on .env secrets.
+        pe.add_global(
+            aether_permissions::Rule::new(
+                aether_permissions::Operation::Read,
+                aether_permissions::ResourceScope::Glob { value: "**/.env".into() },
+                aether_permissions::Permission::Deny,
+            ).with_reason("secrets are not readable by default")
+        );
+        Arc::new(pe)
+    };
+    let context_manager = Arc::new(aether_context::ContextManager::new(
+        aether_context::ContextManagerConfig::new(
+            "main",
+            cfg.agent.executor_model.clone(),
+            cfg.context.max_tokens,
+        ),
+    ));
+    let snapshots_root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
+    let snapshots = Arc::new(std::sync::Mutex::new(
+        aether_sessions::SnapshotManager::open(snapshots_root).unwrap_or_else(|_| {
+            // Fallback: open in a temp dir if the default can't be created.
+            let tmp = std::env::temp_dir().join(format!("aether-snap-{session_id}"));
+            aether_sessions::SnapshotManager::open(tmp).expect("snapshots dir")
+        }),
+    ));
+
     let agent = Agent::new(
         controller,
         cfg.agent.controller_model.clone(),
@@ -329,7 +358,10 @@ async fn run() -> anyhow::Result<()> {
         reviewer,
         cfg.agent.reviewer_model.clone(),
         cfg.frontend.clone(),
-    );
+    )
+    .with_permission_engine(permission_engine)
+    .with_context_manager(context_manager)
+    .with_snapshots(snapshots);
 
     let format = |task: &str| -> String {
         if cli.plan {

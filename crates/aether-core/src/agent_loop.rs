@@ -55,6 +55,14 @@ pub struct Agent {
     reviewer_model: Option<String>,
     /// Frontend visual-engineering configuration (spec: 3-LLM visual review).
     frontend: FrontendConfig,
+    // ---- v0.12 subsystems (all optional; default None) ----
+    /// Hierarchical permission engine (v0.12).
+    permission_engine: Option<Arc<aether_permissions::PermissionEngine>>,
+    /// Per-agent context manager (v0.12). When absent the legacy
+    /// `compact_messages` heuristic inside the Executor is used.
+    context_manager: Option<Arc<aether_context::ContextManager>>,
+    /// Snapshot manager (v0.12).
+    snapshots: Option<Arc<std::sync::Mutex<aether_sessions::SnapshotManager>>>,
 }
 
 impl Agent {
@@ -104,7 +112,36 @@ impl Agent {
             reviewer,
             reviewer_model,
             frontend,
+            permission_engine: None,
+            context_manager: None,
+            snapshots: None,
         }
+    }
+
+    /// Builder-style injection for the v0.12 subsystems. All optional.
+    pub fn with_permission_engine(mut self, e: Arc<aether_permissions::PermissionEngine>) -> Self {
+        self.permission_engine = Some(e);
+        self
+    }
+    pub fn with_context_manager(mut self, c: Arc<aether_context::ContextManager>) -> Self {
+        self.context_manager = Some(c);
+        self
+    }
+    pub fn with_snapshots(mut self, s: Arc<std::sync::Mutex<aether_sessions::SnapshotManager>>) -> Self {
+        self.snapshots = Some(s);
+        self
+    }
+
+    /// Accessor used by the Executor when integrating with the permission
+    /// engine.
+    pub fn permission_engine(&self) -> Option<&Arc<aether_permissions::PermissionEngine>> {
+        self.permission_engine.as_ref()
+    }
+    pub fn context_manager(&self) -> Option<&Arc<aether_context::ContextManager>> {
+        self.context_manager.as_ref()
+    }
+    pub fn snapshots(&self) -> Option<&Arc<std::sync::Mutex<aether_sessions::SnapshotManager>>> {
+        self.snapshots.as_ref()
     }
 
     /// Resolve an agent's `model` key ("controller" = SMALL LLM, "executor" = BIG LLM) to a
@@ -292,7 +329,7 @@ impl Agent {
                 &self.executor_model,
                 &self.controller_model,
             );
-            let coder = Executor::new(
+            let mut coder = Executor::new(
                 self.provider_for(&coder_model),
                 coder_model,
                 self.tools.clone(),
@@ -304,7 +341,10 @@ impl Agent {
                 sid.to_string(),
                 format!("{CODER_SYSTEM}\n{}", crate::mode::KARPATHY_POLICY),
                 None,
-            );
+            )
+            .with_agent_id("coder");
+            if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
+            if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
             let result = coder.run(&cycle_task).await?;
             eng.record_action(&format!("execute plan (iter {})", iter + 1));
             eng.observe("executor", &summarize(&result), None, None);
@@ -585,7 +625,7 @@ fn summarize(s: &str) -> String {
 #[async_trait::async_trait(?Send)]
 impl CorrectionExecutor for Agent {
     async fn implement_correction(&self, plan: &str) -> anyhow::Result<String> {
-        let coder = Executor::new(
+        let mut coder = Executor::new(
             self.provider_for(&self.executor_model),
             self.executor_model.clone(),
             self.tools.clone(),
@@ -597,7 +637,10 @@ impl CorrectionExecutor for Agent {
             self.session_id.clone(),
             format!("{CODER_SYSTEM}\n{}", crate::mode::KARPATHY_POLICY),
             None,
-        );
+        )
+        .with_agent_id("correction-coder");
+        if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
+        if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
         coder.run(plan).await
     }
 }

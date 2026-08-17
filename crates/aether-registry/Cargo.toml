@@ -1,0 +1,21 @@
+[package]
+name = "aether-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Provider registry, model catalog and health-checker for AETHER"
+
+[dependencies]
+aether-config = { path = "../aether-config" }
+aether-models = { path = "../aether-models" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

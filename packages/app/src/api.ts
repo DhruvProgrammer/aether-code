@@ -107,6 +107,48 @@ export interface BackgroundValidation {
   saved_path: string | null;
 }
 
+export interface HealthOutcome {
+  provider_id: string;
+  status: string;
+  total_latency_ms: number;
+  can_save: boolean;
+  message: string;
+  checks: HealthCheck[];
+  models_discovered: string[];
+}
+export interface HealthCheck {
+  label: string;
+  passed: boolean;
+  detail: string;
+  latency_ms: number;
+}
+
+export interface SkillSummary {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  tags: string[];
+  source_path: string;
+}
+
+export interface SnapshotRow {
+  id: string;
+  parent_id: string | null;
+  timestamp: string;
+  trigger: string;
+  agent_id: string | null;
+  task: string | null;
+  files: string[];
+  metadata: Record<string, string>;
+}
+export interface SnapshotResult {
+  snapshot_id: string;
+  files_restored: number;
+  success: boolean;
+  message: string;
+}
+
 export const api = {
   readConfig: () => invoke<ConfigResponse>("read_config"),
   writeConfig: (config: DesktopConfig) => invoke<string>("write_config", { config }),
@@ -124,6 +166,17 @@ export const api = {
     invoke<BackgroundValidation>("set_background_image", { bytes }),
   requiredBackgroundResolution: () =>
     invoke<string>("required_background_resolution"),
+  checkProvider: (baseUrl: string, apiKeyEnv: string, models: string[]) =>
+    invoke<HealthOutcome>("check_provider", { baseUrl, apiKeyEnv, models }),
+  listSkills: () => invoke<SkillSummary[]>("list_skills"),
+  listSnapshots: (sessionId: string) =>
+    invoke<SnapshotRow[]>("list_snapshots", { sessionId }),
+  restoreSnapshot: (sessionId: string, snapshotId: string) =>
+    invoke<SnapshotResult>("restore_snapshot", { sessionId, snapshotId }),
+  snapshotUndo: (sessionId: string) =>
+    invoke<SnapshotResult>("snapshot_undo", { sessionId }),
+  snapshotRedo: (sessionId: string) =>
+    invoke<SnapshotResult>("snapshot_redo", { sessionId }),
 };
 
 export const events = {

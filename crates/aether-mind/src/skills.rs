@@ -1,51 +1,182 @@
-//! Skills discovery (spec §10). Lazily indexes `SKILL.md` files by name + description
-//! only — never loads skill bodies into context unless queried.
+//! Skills System — on-demand capability/instruction packages for AETHER.
+//!
+//! Replaces the v0.11 "name + description + path" stub with a real skill
+//! registry. Each skill is a self-describing Markdown file (SKILL.md or
+//! skill.toml) that declares:
+//!   * metadata (id, name, version, author, tags)
+//!   * required permissions (forwarded to the PermissionEngine when loaded)
+//!   * required tools (forwarded to the tool allowlist when loaded)
+//!   * supported agents
+//!   * the actual instructions / examples / dependencies / templates
+//!
+//! Skills are NOT auto-loaded. Agents `discover → evaluate → request/load`
+//! skills explicitly. The loader emits an activation event the runtime can
+//! use to surface it in the UI and feed it into the agent's context.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
+    pub id: String,
     pub name: String,
     pub description: String,
-    pub path: String,
+    pub version: String,
+    pub author: String,
+    pub tags: Vec<String>,
+    /// Permissions the skill requires to run (forwarded to PermissionEngine).
+    pub required_permissions: Vec<String>,
+    /// Tool names the skill relies on.
+    pub required_tools: Vec<String>,
+    /// Agent ids allowed to load this skill.
+    pub supported_agents: Vec<String>,
+    /// Optional structured sections.
+    pub instructions: String,
+    pub examples: Vec<String>,
+    pub workflows: Vec<SkillWorkflow>,
+    pub templates: Vec<SkillTemplate>,
+    pub validation_rules: Vec<String>,
+    pub dependencies: Vec<String>,
+    /// On-disk source.
+    pub source_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillWorkflow {
+    pub name: String,
+    pub steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillTemplate {
+    pub name: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub tags: Vec<String>,
+    pub source_path: PathBuf,
+}
+
+impl From<&Skill> for SkillSummary {
+    fn from(s: &Skill) -> Self {
+        Self {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+            version: s.version.clone(),
+            tags: s.tags.clone(),
+            source_path: s.source_path.clone(),
+        }
+    }
+}
+
+/// Discovers and indexes skills, plus a method to load full bodies.
 #[derive(Debug, Default)]
-pub struct SkillIndex {
+pub struct SkillRegistry {
     skills: Vec<Skill>,
 }
 
-impl SkillIndex {
-    /// Discover SKILL.md files under `root`, bounded by depth (spec §10: lazy, cheap).
+impl SkillRegistry {
+    pub fn new() -> Self { Self::default() }
+
+    /// Walk a root directory up to `max_depth` and index any `SKILL.md` /
+    /// `skill.md` / `skill.toml` files found.
     pub fn discover(root: &Path) -> Arc<Self> {
-        let mut skills = Vec::new();
-        walk(root, 0, 5, &mut skills);
-        Arc::new(Self { skills })
+        let mut r = Self::default();
+        let _ = r.scan_more(root, 5);
+        Arc::new(r)
     }
 
-    pub fn all(&self) -> &[Skill] {
-        &self.skills
+    /// Walk a root directory up to `max_depth` and index any `SKILL.md` /
+    /// `skill.md` / `skill.toml` files found. Public so the desktop app can
+    /// scan additional roots (e.g. `~/.aether/skills` and the bundled
+    /// resources directory).
+    pub fn scan_more(&mut self, root: &Path, max_depth: usize) -> std::io::Result<()> {
+        walk(root, 0, max_depth, &mut self.skills);
+        Ok(())
     }
 
-    /// Case-insensitive substring match over name + description.
+    /// Add a skill manually (used by plugins).
+    pub fn register(&mut self, skill: Skill) {
+        self.skills.push(skill);
+    }
+
+    pub fn all(&self) -> &[Skill] { &self.skills }
+    pub fn summaries(&self) -> Vec<SkillSummary> { self.skills.iter().map(SkillSummary::from).collect() }
+
+    pub fn get(&self, id: &str) -> Option<&Skill> {
+        self.skills.iter().find(|s| s.id == id)
+    }
+
     pub fn search(&self, query: &str) -> Vec<&Skill> {
         let q = query.to_ascii_lowercase();
         self.skills
             .iter()
             .filter(|s| {
                 s.name.to_ascii_lowercase().contains(&q)
+                    || s.id.to_ascii_lowercase().contains(&q)
                     || s.description.to_ascii_lowercase().contains(&q)
+                    || s.tags.iter().any(|t| t.to_ascii_lowercase().contains(&q))
             })
             .collect()
     }
+
+    /// Skills that match every requested tag (intersection).
+    pub fn filter_by_tags(&self, tags: &[String]) -> Vec<&Skill> {
+        let want: HashSet<&str> = tags.iter().map(|t| t.as_str()).collect();
+        self.skills
+            .iter()
+            .filter(|s| want.iter().all(|t| s.tags.iter().any(|x| x == t)))
+            .collect()
+    }
+
+    /// Skills a given agent id is allowed to load.
+    pub fn for_agent(&self, agent_id: &str) -> Vec<&Skill> {
+        self.skills
+            .iter()
+            .filter(|s| s.supported_agents.is_empty() || s.supported_agents.iter().any(|a| a == agent_id))
+            .collect()
+    }
+
+    /// Load a skill by id. Returns the full skill body (for context injection).
+    pub fn load(&self, id: &str) -> Option<&Skill> { self.get(id) }
+
+    /// Compose multiple skills into a single "skill bundle" body for
+    /// injection. Returns the merged instructions + a list of contributing
+    /// skill ids.
+    pub fn compose(&self, ids: &[String]) -> Option<SkillBundle> {
+        let mut bundle = SkillBundle { ids: Vec::new(), instructions: String::new(), examples: Vec::new() };
+        for id in ids {
+            if let Some(s) = self.get(id) {
+                bundle.ids.push(s.id.clone());
+                bundle.instructions.push_str("\n\n## Skill: ");
+                bundle.instructions.push_str(&s.name);
+                bundle.instructions.push_str("\n\n");
+                bundle.instructions.push_str(&s.instructions);
+                bundle.examples.extend(s.examples.iter().cloned());
+            }
+        }
+        if bundle.ids.is_empty() { None } else { Some(bundle) }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillBundle {
+    pub ids: Vec<String>,
+    pub instructions: String,
+    pub examples: Vec<String>,
 }
 
 fn walk(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<Skill>) {
-    if depth > max_depth {
-        return;
-    }
+    if depth > max_depth { return; }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -53,45 +184,139 @@ fn walk(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<Skill>) {
     for entry in entries.flatten() {
         let p = entry.path();
         if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            if matches!(name, ".git" | "node_modules" | "target") {
-                continue;
-            }
+            if matches!(name, ".git" | "node_modules" | "target") { continue; }
         }
         if p.is_dir() {
             walk(&p, depth + 1, max_depth, out);
-        } else if p.file_name().and_then(|n| n.to_str()) == Some("SKILL.md")
-            || p.file_name().and_then(|n| n.to_str()) == Some("skill.md")
-        {
-            out.push(parse_skill(&p));
+        } else if let Some(fname) = p.file_name().and_then(|n| n.to_str()) {
+            if matches!(fname, "SKILL.md" | "skill.md") {
+                if let Some(s) = parse_markdown_skill(&p) { out.push(s); }
+            } else if fname == "skill.toml" {
+                if let Some(s) = parse_toml_skill(&p) { out.push(s); }
+            }
         }
     }
 }
 
-fn parse_skill(path: &Path) -> Skill {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+fn parse_markdown_skill(path: &Path) -> Option<Skill> {
+    let text = std::fs::read_to_string(path).ok()?;
     let mut name = String::new();
     let mut description = String::new();
+    let mut version = "0.0.0".into();
+    let mut author = String::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut required_permissions: Vec<String> = Vec::new();
+    let mut required_tools: Vec<String> = Vec::new();
+    let mut supported_agents: Vec<String> = Vec::new();
+
     for line in text.lines() {
         let l = line.trim();
-        if let Some(rest) = l.strip_prefix("name:") {
-            name = rest.trim().to_string();
-        } else if let Some(rest) = l.strip_prefix("description:") {
-            description = rest.trim().to_string();
-        }
-        if !name.is_empty() && !description.is_empty() {
-            break;
-        }
+        if let Some(rest) = l.strip_prefix("name:")        { name = rest.trim().into(); }
+        else if let Some(rest) = l.strip_prefix("description:") { description = rest.trim().into(); }
+        else if let Some(rest) = l.strip_prefix("version:")     { version = rest.trim().into(); }
+        else if let Some(rest) = l.strip_prefix("author:")      { author = rest.trim().into(); }
+        else if let Some(rest) = l.strip_prefix("tags:")        { tags = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
+        else if let Some(rest) = l.strip_prefix("required_permissions:") { required_permissions = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
+        else if let Some(rest) = l.strip_prefix("required_tools:")       { required_tools = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
+        else if let Some(rest) = l.strip_prefix("supported_agents:")     { supported_agents = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
     }
-    Skill {
-        name: if name.is_empty() {
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("skill").to_string()
-        } else {
-            name
-        },
+    let id = path
+        .parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+        .unwrap_or("skill").to_string();
+    if name.is_empty() { name = id.clone(); }
+    Some(Skill {
+        id,
+        name,
         description,
-        path: path.to_string_lossy().to_string(),
-    }
+        version,
+        author,
+        tags,
+        required_permissions,
+        required_tools,
+        supported_agents,
+        instructions: text,
+        examples: Vec::new(),
+        workflows: Vec::new(),
+        templates: Vec::new(),
+        validation_rules: Vec::new(),
+        dependencies: Vec::new(),
+        source_path: path.to_path_buf(),
+    })
 }
 
-/// Re-export for convenience.
-pub type SkillPath = PathBuf;
+fn parse_toml_skill(path: &Path) -> Option<Skill> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut s: Skill = toml::from_str(&text).ok()?;
+    s.source_path = path.to_path_buf();
+    Some(s)
+}
+
+/// Backward-compat alias kept so existing `SkillIndex` callers compile.
+pub use SkillRegistry as SkillIndex;
+pub use SkillSummary as SkillPathSummary;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn make_temp_skill(dir: &Path, id: &str, name: &str, desc: &str, tags: &[&str]) {
+        let sub = dir.join(id);
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut f = std::fs::File::create(sub.join("SKILL.md")).unwrap();
+        writeln!(f, "name: {}", name).unwrap();
+        writeln!(f, "description: {}", desc).unwrap();
+        writeln!(f, "tags: {}", tags.join(",")).unwrap();
+        writeln!(f, "\n# Body\n\nDo the thing.").unwrap();
+    }
+
+    #[test]
+    fn discover_indexes_markdown() {
+        let tmp = tempdir();
+        make_temp_skill(&tmp, "git", "Git Workflows", "git-related guidance", &["git", "vcs"]);
+        make_temp_skill(&tmp, "frontend", "Frontend Patterns", "react + ts", &["frontend"]);
+        let r = SkillRegistry::discover(&tmp);
+        assert_eq!(r.all().len(), 2);
+        assert!(r.get("git").is_some());
+        assert!(r.get("frontend").is_some());
+    }
+
+    #[test]
+    fn search_finds_by_tag() {
+        let tmp = tempdir();
+        make_temp_skill(&tmp, "git", "Git", "git stuff", &["git"]);
+        make_temp_skill(&tmp, "frontend", "FE", "fe stuff", &["frontend"]);
+        let r = SkillRegistry::discover(&tmp);
+        let hits = r.search("git");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "git");
+    }
+
+    #[test]
+    fn filter_by_tags_intersects() {
+        let tmp = tempdir();
+        make_temp_skill(&tmp, "git", "Git", "d", &["git", "vcs"]);
+        let r = SkillRegistry::discover(&tmp);
+        let hits = r.filter_by_tags(&vec!["git".into(), "vcs".into()]);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn compose_merges_bodies() {
+        let tmp = tempdir();
+        make_temp_skill(&tmp, "a", "A", "d", &["x"]);
+        make_temp_skill(&tmp, "b", "B", "d", &["y"]);
+        let r = SkillRegistry::discover(&tmp);
+        let bundle = r.compose(&vec!["a".into(), "b".into()]).unwrap();
+        assert_eq!(bundle.ids.len(), 2);
+        assert!(bundle.instructions.contains("Skill: A"));
+        assert!(bundle.instructions.contains("Skill: B"));
+    }
+
+    fn tempdir() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("aether-skills-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+}

@@ -7,6 +7,12 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Arc;
 
+pub mod snapshot;
+
+pub use snapshot::{
+    Cursor, FileSnapshot, Snapshot, SnapshotDiff, SnapshotError, SnapshotManager, Trigger,
+};
+
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
     pub id: String,

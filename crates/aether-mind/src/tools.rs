@@ -204,7 +204,7 @@ impl Tool for SkillSearchTool {
             "no matching skills".to_string()
         } else {
             hits.iter()
-                .map(|s| format!("- {}: {} ({})", s.name, s.description, s.path))
+                .map(|s| format!("- {} [{}]: {} ({})", s.name, s.id, s.description, s.source_path.display()))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
