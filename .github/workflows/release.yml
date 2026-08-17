@@ -36,7 +36,12 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Build release (MSVC)
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        # Build only the CLI package. The aether-desktop Tauri binary is built and packaged
+        # by the separate Desktop (Windows) workflow, which has its own resource-staging
+        # step. Building it here would fail because the bundled CLI binary (resources/
+        # aether-cli.exe) is not present in the source tree — it is copied in by the
+        # desktop workflow before `cargo tauri build`.
+        run: cargo build --release --target x86_64-pc-windows-msvc -p aether-cli --bins
 
       - name: Decode code-signing certificate
         if: ${{ env.WINDOWS_CODESIGN_PFX != '' }}

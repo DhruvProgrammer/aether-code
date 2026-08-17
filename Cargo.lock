@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aether-cli"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aether-config",
  "aether-core",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "aether-config"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "aether-core"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aether-config",
  "aether-mind",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "aether-desktop"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aether-config",
  "base64 0.22.1",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "aether-mind"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aether-models",
  "aether-permissions",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "aether-models"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aether-config",
  "async-trait",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "aether-permissions"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aether-config",
  "serde",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "aether-sessions"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "aether-tools"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "aether-permissions",
  "anyhow",
