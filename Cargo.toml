@@ -12,10 +12,12 @@ members = [
     "crates/aether-sessions",
     "crates/aether-mind",
     "crates/aether-desktop",
+    "crates/aether-plugin",
+    "crates/aether-evidence",
 ]
 
 [workspace.package]
-  version = "0.12.0"
+  version = "0.13.0"
 edition = "2021"
 license = "MIT"
 authors = ["aether contributors"]

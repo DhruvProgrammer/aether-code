@@ -8,5 +8,6 @@ pub mod eng;
 pub mod executor;
 pub mod mode;
 pub mod router;
+pub mod routing;
 pub mod subagents;
 pub mod visual;

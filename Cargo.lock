@@ -10,14 +10,16 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aether-cli"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "aether-config",
  "aether-context",
  "aether-core",
+ "aether-evidence",
  "aether-mind",
  "aether-models",
  "aether-permissions",
+ "aether-plugin",
  "aether-sessions",
  "aether-tools",
  "anyhow",
@@ -36,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "aether-config"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -47,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "aether-context"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "aether-models",
  "async-trait",
@@ -64,19 +66,22 @@ dependencies = [
 
 [[package]]
 name = "aether-core"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "aether-config",
  "aether-context",
+ "aether-evidence",
  "aether-mind",
  "aether-models",
  "aether-permissions",
+ "aether-plugin",
  "aether-sessions",
  "aether-tools",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",
@@ -85,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "aether-desktop"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "aether-config",
  "aether-context",
@@ -110,8 +115,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aether-evidence"
+version = "0.13.0"
+dependencies = [
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aether-mind"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "aether-models",
  "aether-permissions",
@@ -128,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "aether-models"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "aether-config",
  "async-trait",
@@ -141,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "aether-permissions"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "aether-config",
  "chrono",
@@ -152,8 +171,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aether-plugin"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aether-registry"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "aether-config",
  "aether-models",
@@ -169,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "aether-sessions"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -182,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "aether-tools"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "aether-permissions",
  "anyhow",

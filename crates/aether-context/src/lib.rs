@@ -28,6 +28,7 @@ pub mod compaction;
 pub mod events;
 pub mod summarizer;
 pub mod thresholds;
+pub mod workspace;
 
 pub use state::{
     ContextSegment, ContextSegmentKind, ContextState, SegmentMeta, TokenUsage,
@@ -37,3 +38,4 @@ pub use compaction::{CompactionEngine, CompactionStrategy, CompactionTrigger};
 pub use events::{CompactionEvent, ContextEventSink, NullSink};
 pub use summarizer::{ExtractiveSummarizer, NoopSummarizer, Summarizer};
 pub use thresholds::{ContextThresholds, ThresholdAction};
+pub use workspace::{AgentContextStatus, ContextWorkspace, SharedSegment};

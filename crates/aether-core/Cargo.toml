@@ -12,6 +12,8 @@ aether-permissions = { path = "../aether-permissions" }
 aether-sessions = { path = "../aether-sessions" }
 aether-mind = { path = "../aether-mind" }
 aether-context = { path = "../aether-context" }
+aether-evidence = { path = "../aether-evidence" }
+aether-plugin = { path = "../aether-plugin" }
 async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"
@@ -20,3 +22,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"

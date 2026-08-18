@@ -21,6 +21,8 @@ aether-permissions = { path = "../aether-permissions" }
 aether-sessions = { path = "../aether-sessions" }
 aether-mind = { path = "../aether-mind" }
 aether-context = { path = "../aether-context" }
+aether-plugin = { path = "../aether-plugin" }
+aether-evidence = { path = "../aether-evidence" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }

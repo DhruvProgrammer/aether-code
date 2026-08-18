@@ -336,6 +336,11 @@ async fn run() -> anyhow::Result<()> {
         }),
     ));
 
+    // ---- v0.13 subsystems ----
+    let plugins = Arc::new(aether_plugin::Registry::new());
+    let evidence = Arc::new(aether_evidence::EvidenceBag::new());
+    let context_workspace = Arc::new(aether_context::ContextWorkspace::new());
+
     let agent = Agent::new(
         controller,
         cfg.agent.controller_model.clone(),
@@ -361,7 +366,10 @@ async fn run() -> anyhow::Result<()> {
     )
     .with_permission_engine(permission_engine)
     .with_context_manager(context_manager)
-    .with_snapshots(snapshots);
+    .with_snapshots(snapshots)
+    .with_plugins(plugins)
+    .with_evidence(evidence)
+    .with_context_workspace(context_workspace);
 
     let format = |task: &str| -> String {
         if cli.plan {

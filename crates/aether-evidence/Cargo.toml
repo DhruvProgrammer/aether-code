@@ -1,0 +1,18 @@
+[package]
+name = "aether-evidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Structured evidence engine for AETHER — claims, files, confidence, verification, contradictions"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

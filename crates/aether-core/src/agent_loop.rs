@@ -63,6 +63,15 @@ pub struct Agent {
     context_manager: Option<Arc<aether_context::ContextManager>>,
     /// Snapshot manager (v0.12).
     snapshots: Option<Arc<std::sync::Mutex<aether_sessions::SnapshotManager>>>,
+    // ---- v0.13 subsystems (all optional; default None) ----
+    /// Plugin registry + hook bus (v0.13).
+    plugins: Option<Arc<aether_plugin::Registry>>,
+    /// Evidence bag collected from specialist agents (v0.13). The controller
+    /// aggregates evidence before accepting verification.
+    evidence: Option<Arc<aether_evidence::EvidenceBag>>,
+    /// Agent-aware context workspace (v0.13): per-agent contexts + shared
+    /// global segments.
+    context_workspace: Option<Arc<aether_context::ContextWorkspace>>,
 }
 
 impl Agent {
@@ -115,6 +124,9 @@ impl Agent {
             permission_engine: None,
             context_manager: None,
             snapshots: None,
+            plugins: None,
+            evidence: None,
+            context_workspace: None,
         }
     }
 
@@ -132,6 +144,20 @@ impl Agent {
         self
     }
 
+    /// Builder-style injection for the v0.13 subsystems. All optional.
+    pub fn with_plugins(mut self, p: Arc<aether_plugin::Registry>) -> Self {
+        self.plugins = Some(p);
+        self
+    }
+    pub fn with_evidence(mut self, e: Arc<aether_evidence::EvidenceBag>) -> Self {
+        self.evidence = Some(e);
+        self
+    }
+    pub fn with_context_workspace(mut self, w: Arc<aether_context::ContextWorkspace>) -> Self {
+        self.context_workspace = Some(w);
+        self
+    }
+
     /// Accessor used by the Executor when integrating with the permission
     /// engine.
     pub fn permission_engine(&self) -> Option<&Arc<aether_permissions::PermissionEngine>> {
@@ -142,6 +168,17 @@ impl Agent {
     }
     pub fn snapshots(&self) -> Option<&Arc<std::sync::Mutex<aether_sessions::SnapshotManager>>> {
         self.snapshots.as_ref()
+    }
+
+    /// v0.13 accessors.
+    pub fn plugins(&self) -> Option<&Arc<aether_plugin::Registry>> {
+        self.plugins.as_ref()
+    }
+    pub fn evidence(&self) -> Option<&Arc<aether_evidence::EvidenceBag>> {
+        self.evidence.as_ref()
+    }
+    pub fn context_workspace(&self) -> Option<&Arc<aether_context::ContextWorkspace>> {
+        self.context_workspace.as_ref()
     }
 
     /// Resolve an agent's `model` key ("controller" = SMALL LLM, "executor" = BIG LLM) to a
@@ -176,11 +213,27 @@ impl Agent {
     ) -> anyhow::Result<AgentOutcome> {
         // When resuming, all persistence (messages / kv / traces / run record) targets the
         // resumed session so the continuation is recorded under the same id.
-        let sid = resume_session.unwrap_or(&self.session_id);
+        let sid: &str = resume_session.unwrap_or(&self.session_id);
         if let Some(store) = &self.session {
             if let Err(e) = store.add_message(sid, "user", task) {
                 eprintln!("aether: session persist failed (user message): {e}");
             }
+        }
+
+        // v0.13: plugin session-start hook.
+        if let Some(plugins) = &self.plugins {
+            let mut out = aether_plugin::SessionStartOutput::default();
+            let _ = plugins
+                .on_session_start(
+                    &aether_plugin::SessionStartInput {
+                        session_id: sid.to_string(),
+                        cwd: self.cwd.clone(),
+                        resumed: resume_session.is_some(),
+                        model: self.controller_model.clone(),
+                    },
+                    &mut out,
+                )
+                .await;
         }
 
         // Agent subsystem: registry (TOML + builtins) and lifecycle tracker (depth/child limits).
@@ -359,6 +412,25 @@ impl Agent {
                     let mut run = lifecycle.start(aid, None, sid, None, None);
                     let (prov, model) = self.resolve(&def.model);
                     let ctx = format!("Original task:\n{task}\n\nImplementation result:\n{result}");
+
+                    // v0.13: plugin agent-spawn hook (observability + audit).
+                    if let Some(plugins) = &self.plugins {
+                        let mut out = aether_plugin::AgentSpawnHookOutput::default();
+                        let _ = plugins
+                            .on_agent_spawn(
+                                &aether_plugin::AgentSpawnHookInput {
+                                    agent_id: def.id.clone(),
+                                    role: def.role.clone(),
+                                    parent: Some("controller".into()),
+                                    depth: 1,
+                                    task: ctx.clone(),
+                                    model: model.clone(),
+                                },
+                                &mut out,
+                            )
+                            .await;
+                    }
+
                     match run_agent(
                         def,
                         prov,
@@ -382,6 +454,54 @@ impl Agent {
                                 &aid,
                                 &format!("{}: {}", r.status, r.summary.chars().take(240).collect::<String>()),
                             );
+
+                            // v0.13: evidence engine — structured verdicts instead of prose.
+                            if let Some(bag) = &self.evidence {
+                                let kind = match aid.as_str() {
+                                    "tester" => aether_evidence::EvidenceKind::Test,
+                                    "security-reviewer" => aether_evidence::EvidenceKind::Security,
+                                    _ => aether_evidence::EvidenceKind::Review,
+                                };
+                                let rec = if r.status == "ok" {
+                                    aether_evidence::Recommendation::Pass
+                                } else {
+                                    aether_evidence::Recommendation::Replan
+                                };
+                                let mut ev = aether_evidence::Evidence::new(
+                                    aid.clone(),
+                                    def.role.clone(),
+                                    kind,
+                                    r.summary.clone(),
+                                )
+                                .with_recommendation(rec)
+                                .with_confidence(aether_evidence::Confidence(if r.status == "ok" { 0.85 } else { 0.4 }));
+                                for f in &r.files {
+                                    ev = ev.with_file(std::path::PathBuf::from(f));
+                                }
+                                bag.add(ev);
+                            }
+
+                            // v0.13: plugin agent-complete hook.
+                            if let Some(plugins) = &self.plugins {
+                                let mut out = aether_plugin::AgentCompleteOutput::default();
+                                let _ = plugins
+                                    .on_agent_complete(
+                                        &aether_plugin::AgentCompleteInput {
+                                            agent_id: def.id.clone(),
+                                            role: def.role.clone(),
+                                            status: r.status.clone(),
+                                            summary: r.summary.clone(),
+                                            findings: r.findings.clone(),
+                                            files: r.files.clone(),
+                                            latency_ms: 0,
+                                            tokens_in: 0,
+                                            tokens_out: 0,
+                                        },
+                                        &mut out,
+                                    )
+                                    .await;
+                            }
+
                             match aid.as_str() {
                                 "tester" => test = Some(r.clone()),
                                 "reviewer" => review = Some(r.clone()),
@@ -429,6 +549,31 @@ impl Agent {
                     } else {
                         eng.note_failure(&format!("security: {}", s.summary));
                     }
+                }
+            }
+
+            // v0.13: evidence-driven decision. Aggregate structured evidence
+            // from all specialist agents; surface the verdict + reasoning to
+            // the engineering model and (optionally) to plugins.
+            if let Some(bag) = &self.evidence {
+                let decision = aether_evidence::decide(bag);
+                eng.add_decision(
+                    &format!("evidence verdict: {:?}", decision.verdict),
+                    &decision.reasoning.summary,
+                    decision.aggregate_confidence,
+                );
+                println!("[EVIDENCE] {}", decision.reasoning.summary);
+                if let Some(plugins) = &self.plugins {
+                    let _ = plugins
+                        .publish(
+                            aether_plugin::EventKind::Custom("evidence_decision".into()),
+                            serde_json::json!({
+                                "verdict": format!("{:?}", decision.verdict),
+                                "confidence": decision.aggregate_confidence,
+                                "agents": decision.contributing_agents,
+                            }),
+                        )
+                        .await;
                 }
             }
 
@@ -536,6 +681,23 @@ impl Agent {
         if let Some(esc) = &escalation {
             outcome.result.push_str(esc);
         }
+
+        // v0.13: plugin session-end hook.
+        if let Some(plugins) = &self.plugins {
+            let mut out = aether_plugin::SessionEndOutput::default();
+            let _ = plugins
+                .on_session_end(
+                    &aether_plugin::SessionEndInput {
+                        session_id: sid.to_string(),
+                        exit_reason: if escalation.is_some() { "escalated".into() } else { "completed".into() },
+                        duration_secs: 0,
+                        success: escalation.is_none(),
+                    },
+                    &mut out,
+                )
+                .await;
+        }
+
         Ok(outcome)
     }
 
