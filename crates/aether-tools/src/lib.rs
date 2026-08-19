@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub mod analysis;
 pub struct ToolContext {
     pub cwd: PathBuf,
 }

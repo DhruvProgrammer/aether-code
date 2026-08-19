@@ -573,6 +573,23 @@ async function renderSettings(cfg: DesktopConfig, path: string): Promise<string>
             </div>
             <div id="snap-list-out" class="text-xs font-mono mt-2 max-h-40 overflow-y-auto"></div>
           </div>
+          <div class="model-card col-span-full">
+            <div class="slot-title">CODE ANALYSIS — SONARQUBE</div>
+            <div class="role-desc">Deterministic static analysis capability. Findings inform the controller; the controller decides fixes. Tokens stay in environment variables.</div>
+            <div class="mt-2 grid grid-cols-1 md:grid-cols-3 gap-2">
+              <input id="sa-root" class="md:col-span-2 bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" placeholder="Project root (absolute path)" />
+              <div class="flex items-center space-x-2">
+                <button id="sa-run" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary inline-flex items-center"><i class="w-3.5 h-3.5 mr-1" data-lucide="scan"></i> Run</button>
+                <button id="sa-mode" type="button" class="text-xs px-2 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary" title="Toggle scan mode: run (fetch current results) / scanner (launch sonar-scanner first)">run</button>
+              </div>
+            </div>
+            <div class="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+              <input id="sa-url" class="bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" placeholder="SonarQube URL (default: SONAR_HOST_URL / http://localhost:9000)" />
+              <input id="sa-token-env" class="bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" placeholder="Token env var name (default: SONAR_TOKEN)" />
+            </div>
+            <div id="sa-status" class="text-xs font-mono mt-2 text-app-textSecondary whitespace-pre-wrap"></div>
+            <div id="sa-report" class="mt-2"></div>
+          </div>
         </div>
       </section>
 
@@ -746,6 +763,9 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
     } catch (e) { out.textContent = String(e); }
   });
 
+  // ----- SonarQube code-analysis (v0.14) -----
+  wireAnalysisPanel(body);
+
   // ----- Provider add/remove -----
   body.querySelector<HTMLButtonElement>("#add-provider")?.addEventListener("click", () => {
     const unique = `provider${Object.keys(originalCfg.models).length + 1}`;
@@ -864,6 +884,133 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
       if (lucide?.createIcons) lucide.createIcons();
     } catch (e) {
       status.textContent = `Save failed: ${String(e)}`;
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Code-analysis panel — SonarQube capability (v0.14)
+// ---------------------------------------------------------------------------
+//
+// The panel keeps a single run-state machine: idle → probing → analyzing →
+// done | error. Progress arrives via the `analysis-progress` event the backend
+// emits around `analysis_run`. Results render as a severity histogram +
+// affected file list + top findings; nothing is editable here because findings
+// are advisory input for the controller, not user-managed configuration.
+
+const sevColor: Record<string, string> = {
+  blocker: "text-red-400",
+  high: "text-orange-400",
+  medium: "text-yellow-400",
+  low: "text-blue-400",
+  info: "text-app-textSecondary",
+};
+
+let analysisMode: "run" | "scanner" = "run";
+
+function renderSeverityDist(r: import("./api").AnalysisReport): string {
+  const total = r.finding_count;
+  const bar = (label: string, n: number, cls: string): string =>
+    n > 0 ? `<span class="${cls} font-mono">${label} ${n}</span>` : "";
+  return `<div class="flex items-center space-x-3 text-xs flex-wrap">
+    <span class="text-app-textPrimary font-semibold">${total} findings</span>
+    ${bar("blocker", r.blocker, sevColor.blocker)}
+    ${bar("high", r.high, sevColor.high)}
+    ${bar("medium", r.medium, sevColor.medium)}
+    ${bar("low", r.low, sevColor.low)}
+    ${bar("info", r.info, sevColor.info)}
+  </div>`;
+}
+
+function renderFindingsTable(findings: import("./api").AnalysisFinding[], max: number): string {
+  const rows = findings.slice(0, max).map((f) => {
+    const loc = f.path ? `${f.path}:${f.start_line}` : "(project)";
+    return `<tr class="border-b border-app-border/40">
+      <td class="py-1 pr-2 whitespace-nowrap ${sevColor[f.severity] ?? ""}">${escapeHtml(f.severity)}</td>
+      <td class="py-1 pr-2 font-mono text-xs">${escapeHtml(f.rule)}</td>
+      <td class="py-1 pr-2 text-xs">${escapeHtml(f.message)}</td>
+      <td class="py-1 font-mono text-xs whitespace-nowrap">${escapeHtml(loc)}</td>
+    </tr>`;
+  }).join("");
+  const note = findings.length > max
+    ? `<div class="text-xs text-app-textSecondary mt-1">…and ${findings.length - max} more (see full report)</div>`
+    : "";
+  return `<table class="w-full text-left">${rows}</table>${note}`;
+}
+
+function renderReportCard(r: import("./api").AnalysisReport): string {
+  const files = r.affected_files.slice(0, 8).join(", ") + (r.affected_files.length > 8 ? " …" : "");
+  return `<div class="border border-app-border rounded p-2 bg-app-bg mt-2">
+    <div class="flex items-center justify-between flex-wrap">
+      ${renderSeverityDist(r)}
+      <span class="text-xs text-app-textSecondary font-mono">${escapeHtml(r.at)}</span>
+    </div>
+    <div class="text-xs text-app-textSecondary mt-1">
+      project <code class="font-mono">${escapeHtml(r.project)}</code>
+      ${r.label ? ` · <span class="text-app-textPrimary">${escapeHtml(r.label)}</span>` : ""}
+    </div>
+    ${files ? `<div class="text-xs text-app-textSecondary mt-1">${escapeHtml(files)}</div>` : ""}
+    <div class="mt-2 max-h-48 overflow-y-auto">${renderFindingsTable(r.findings, 10)}</div>
+  </div>`;
+}
+
+function wireAnalysisPanel(body: HTMLElement): void {
+  const statusEl = body.querySelector<HTMLDivElement>("#sa-status")!;
+  const reportEl = body.querySelector<HTMLDivElement>("#sa-report")!;
+  const modeBtn = body.querySelector<HTMLButtonElement>("#sa-mode")!;
+  let progressUnlisten: (() => void) | null = null;
+
+  void events.onAnalysisProgress((p) => {
+    if (p.stage === "probing") statusEl.textContent = "Probing SonarQube server…";
+    else if (p.stage === "analyzing") statusEl.textContent = "Analyzing project…";
+    else if (p.stage === "done") {
+      statusEl.textContent = `Done — ${p.findings ?? 0} findings`;
+      if (progressUnlisten) { progressUnlisten(); progressUnlisten = null; }
+    } else if (p.stage === "error") {
+      statusEl.textContent = `Error: ${p.message ?? "unknown"}`;
+      if (progressUnlisten) { progressUnlisten(); progressUnlisten = null; }
+    }
+  }).then((u) => { progressUnlisten = u; });
+
+  modeBtn.addEventListener("click", () => {
+    analysisMode = analysisMode === "run" ? "scanner" : "run";
+    modeBtn.textContent = analysisMode;
+    modeBtn.title = "Toggle scan mode: run (fetch current results) / scanner (launch sonar-scanner first)";
+  });
+
+  body.querySelector<HTMLButtonElement>("#sa-run")?.addEventListener("click", async () => {
+    const root = body.querySelector<HTMLInputElement>("#sa-root")?.value.trim() ?? "";
+    const baseUrl = body.querySelector<HTMLInputElement>("#sa-url")?.value.trim() ?? "";
+    const tokenEnv = body.querySelector<HTMLInputElement>("#sa-token-env")?.value.trim() ?? "";
+    if (!root) { statusEl.textContent = "Enter a project root first."; return; }
+
+    statusEl.textContent = "Checking availability…";
+    try {
+      const avail = await api.analysisCheck(baseUrl || undefined, tokenEnv || undefined);
+      if (!avail.available) {
+        statusEl.textContent = `Unavailable: ${avail.detail}`;
+        return;
+      }
+      statusEl.textContent = "Running analysis…";
+      const r = await api.analysisRun(root, {
+        mode: analysisMode,
+        baseUrl: baseUrl || undefined,
+        tokenEnv: tokenEnv || undefined,
+        label: "manual-run",
+      });
+      if (r.success && r.report) {
+        statusEl.textContent = `${r.message}`;
+        reportEl.innerHTML = renderReportCard(r.report);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const lucide = (window as any).lucide;
+        if (lucide?.createIcons) lucide.createIcons();
+      } else {
+        statusEl.textContent = r.message;
+        reportEl.innerHTML = "";
+      }
+    } catch (e) {
+      statusEl.textContent = `Analysis failed: ${String(e)}`;
+      reportEl.innerHTML = "";
     }
   });
 }

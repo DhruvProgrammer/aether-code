@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 aether-permissions = { path = "../aether-permissions" }
+aether-analysis = { path = "../aether-analysis" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"

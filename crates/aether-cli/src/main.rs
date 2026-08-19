@@ -242,11 +242,16 @@ async fn run() -> anyhow::Result<()> {
     } else {
         (None, None)
     };
-    let skills = SkillIndex::discover(&std::env::current_dir()?);
+    let skills = SkillIndex::discover_with_bundled(&std::env::current_dir()?);
 
     let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
     for tool in aether_tools::default_tools() {
         tools.insert(tool.name().to_string(), tool);
+    }
+    // v0.14 code-analysis capability (SonarQube) — deterministic analyzer behind
+    // the analyze_code / analysis_status tools; findings are advisory input.
+    for t in aether_tools::analysis::analysis_tools() {
+        tools.insert(t.name().to_string(), t);
     }
     if let Some(m) = &mind {
         for t in aether_mind::tools::memory_tools(m.clone(), embedder.clone()) {

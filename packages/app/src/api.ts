@@ -149,6 +149,62 @@ export interface SnapshotResult {
   message: string;
 }
 
+// -- Code analysis (SonarQube capability, v0.14) -----------------------------
+
+export interface AnalysisAvailability {
+  available: boolean;
+  detail: string;
+}
+
+export interface AnalysisFinding {
+  id: string;
+  rule: string;
+  severity: string; // blocker | high | medium | low | info
+  kind: string; // bug | vulnerability | security_hotspot | code_smell
+  message: string;
+  path: string;
+  start_line: number;
+  status: string;
+  remediation: string | null;
+}
+
+export interface AnalysisReport {
+  id: string;
+  provider: string;
+  project: string;
+  at: string;
+  label: string | null;
+  finding_count: number;
+  info: number;
+  low: number;
+  medium: number;
+  high: number;
+  blocker: number;
+  affected_files: string[];
+  findings: AnalysisFinding[];
+}
+
+export interface AnalysisRunResult {
+  success: boolean;
+  message: string;
+  report: AnalysisReport | null;
+}
+
+export interface AnalysisDiff {
+  resolved: string[];
+  remaining: string[];
+  introduced: string[];
+  regressions: { fingerprint: string; old_severity: string; new_severity: string }[];
+  baseline_count: number;
+  current_count: number;
+}
+
+export interface AnalysisProgress {
+  stage: string; // probing | analyzing | done | error
+  findings?: number;
+  message?: string;
+}
+
 export const api = {
   readConfig: () => invoke<ConfigResponse>("read_config"),
   writeConfig: (config: DesktopConfig) => invoke<string>("write_config", { config }),
@@ -177,6 +233,30 @@ export const api = {
     invoke<SnapshotResult>("snapshot_undo", { sessionId }),
   snapshotRedo: (sessionId: string) =>
     invoke<SnapshotResult>("snapshot_redo", { sessionId }),
+  // Code-analysis capability (v0.14)
+  analysisCheck: (baseUrl?: string, tokenEnv?: string) =>
+    invoke<AnalysisAvailability>("analysis_check", { baseUrl: baseUrl ?? null, tokenEnv: tokenEnv ?? null }),
+  analysisRun: (
+    projectRoot: string,
+    opts?: { mode?: string; baseUrl?: string; tokenEnv?: string; scope?: string[]; label?: string },
+  ) =>
+    invoke<AnalysisRunResult>("analysis_run", {
+      projectRoot,
+      mode: opts?.mode ?? null,
+      baseUrl: opts?.baseUrl ?? null,
+      tokenEnv: opts?.tokenEnv ?? null,
+      scope: opts?.scope ?? null,
+      label: opts?.label ?? null,
+    }),
+  analysisLatest: (project: string) =>
+    invoke<AnalysisReport | null>("analysis_latest", { project }),
+  analysisProjects: () => invoke<string[]>("analysis_projects"),
+  analysisDiff: (project: string, baselineReport: string, currentReport?: string) =>
+    invoke<AnalysisDiff>("analysis_diff", {
+      project,
+      baselineReport,
+      currentReport: currentReport ?? null,
+    }),
 };
 
 export const events = {
@@ -184,4 +264,6 @@ export const events = {
     listen<TaskOutput>("task-output", (e) => cb(e.payload)),
   onTaskExit: (cb: (e: TaskExit) => void): Promise<UnlistenFn> =>
     listen<TaskExit>("task-exit", (e) => cb(e.payload)),
+  onAnalysisProgress: (cb: (e: AnalysisProgress) => void): Promise<UnlistenFn> =>
+    listen<AnalysisProgress>("analysis-progress", (e) => cb(e.payload)),
 };

@@ -17,7 +17,7 @@
 
 ## What is aether?
 
-**aether** is a free, open-source AI coding agent built in Rust that turns any OpenAI-compatible API endpoint (OpenAI, Azure, OpenRouter, NVIDIA NIM, MiniMax, GLM, DeepSeek, Ollama, LM Studio, vLLM, llama.cpp) into a full coding assistant. It plans, edits files, runs shell commands, runs tests, reviews its own work, and **remembers everything across sessions**.
+**aether** is a free, open-source AI coding agent built in Rust that turns any OpenAI-compatible API endpoint (OpenAI, Azure, OpenRouter, NVIDIA NIM, MiniMax, GLM, DeepSeek, Ollama, LM Studio, vLLM, llama.cpp) into a full coding assistant. It plans, edits files, runs shell commands, runs tests, reviews its own work, runs **static code analysis (SonarQube)** over your project, and **remembers everything across sessions**.
 
 It runs as a single static `.exe` you download once and forget about, or as a windowed **desktop app** you install in two clicks. No subscription, no telemetry, no cloud lock-in, no per-token upcharge — point it at the API you already pay for and go.
 
@@ -36,6 +36,7 @@ If you've used Cursor, Windsurf, Cline, GitHub Copilot, Continue.dev, Cody, or T
   - [Build from source](#build-from-source)
 - [Quick start](#quick-start)
 - [Key features](#key-features)
+- [Code analysis (SonarQube)](#code-analysis-sonarqube)
 - [How aether works](#how-aether-works)
   - [Two-LLM architecture](#two-llm-architecture)
   - [Multi-agent pipeline](#multi-agent-pipeline)
@@ -306,6 +307,58 @@ No Electron, no Chromium, no Node, no Python.
 
 ---
 
+## Code analysis (SonarQube)
+
+AETHER integrates [SonarQube](https://github.com/SonarSource/sonarqube) as a **code-analysis capability** — deterministic static analysis that the AI controller reasons over. SonarQube finds issues mechanically; the LLMs decide what matters, group root causes, and generate fix tasks. Findings can never execute anything and never authorize anything.
+
+### How the analysis pipeline works
+
+```
+User task
+  ↓
+Model 2 (Controller) — decides IF analysis is useful
+  ↓
+analyze_code tool → SonarQube server / sonar-scanner
+  ↓
+Normalised findings (rule, severity, file:line, remediation)
+  ↓
+Controller groups, dedupes, prioritises → creates tasks
+  ↓
+Model 1 (Executor) fixes the code
+  ↓
+Re-analysis + diff (resolved / new / regressions)
+  ↓
+Controller decides: done, or another cycle — with hard stop conditions
+```
+
+### Three ways to run it
+
+1. **From the desktop app** — Settings → Subsystems → *Code Analysis — SonarQube* panel: enter the project root, click **Run**, get live progress, severity distribution, affected files, and top findings.
+2. **Via the agent tools** — the controller has `analyze_code` and `analysis_status` (report diffs, e.g. before/after a fix cycle) in its toolset.
+3. **On demand in chat** — ask the agent *"run a SonarQube analysis on this repo and fix the blockers"*; it loads the bundled `sonarqube-analysis` skill and follows the loop above.
+
+### Configuration
+
+```bash
+export SONAR_HOST_URL="http://localhost:9000"   # your SonarQube server
+export SONAR_TOKEN="squ_..."                    # user/project token
+# optional: put sonar-scanner on PATH for fresh scans (mode = "scanner")
+```
+
+Tokens live in environment variables only — never in config files, reports, logs, screenshots, or LLM context (secrets are actively redacted from all analyzer output).
+
+### Architecture (why it matters)
+
+- **Pluggable providers** — a provider-neutral `AnalysisProvider` trait (`aether-analysis` crate) with `SonarQubeProvider` as the first implementation. ESLint, Semgrep, or any analyzer plugs in later without touching the controller.
+- **Finding normalisation** — native SonarQube severities/types map into one canonical schema (`blocking / high / medium / low / info`, `bug / vulnerability / security_hotspot / code_smell`) so comparisons and diffs are stable across scans.
+- **Resumable** — every analysis report is persisted to `~/.aether/analysis/<project>/`, so the verify loop survives restarts and context compaction.
+- **Bounded context** — reports are never dumped raw into the LLM context; only a severity histogram and the top findings (capped) are surfaced.
+- **Plugin-friendly** — providers, skills, and finding processors are all extension points; nothing is hard-coded to SonarQube.
+
+SonarQube informs the agent — it does not control it. The authority chain stays **User → Controller → Tools/Analysis → Executor → Codebase → Verification → Controller**.
+
+---
+
 ## How aether works
 
 ### Two-LLM architecture
@@ -565,7 +618,7 @@ models  tools         sessions       mind
 compat)  git, MCP)     traces)      + kv + skills)
 ```
 
-All crates are MIT-licensed, Rust edition 2021. Total Rust LOC: ~18k.
+All crates are MIT-licensed, Rust edition 2021. 14 workspace crates, ~20k Rust LOC, 170+ unit tests.
 
 ---
 
@@ -672,7 +725,7 @@ Bug reports, feature requests, and PRs welcome. Open an issue first for non-triv
 ```bash
 git clone https://github.com/DhruvProgrammer/aether-code
 cd aether-code
-cargo test --workspace            # 70+ unit tests, all green
+cargo test --workspace            # 170+ unit tests, all green
 cargo build -p aether-cli --release
 cargo install tauri-cli --version "^2.0" --locked
 cargo tauri dev --config crates/aether-desktop/tauri.conf.json   # dev mode for the desktop app

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
+use aether_analysis::AnalysisProvider as _;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -547,6 +548,7 @@ async fn list_skills(app: AppHandle) -> Vec<SkillSummaryDto> {
     for r in roots {
         let _ = reg.scan_more(&r, 5);
     }
+    reg.register_bundled();
     reg.summaries().into_iter().map(|s| SkillSummaryDto {
         id: s.id, name: s.name, description: s.description, version: s.version, tags: s.tags, source_path: s.source_path.display().to_string(),
     }).collect()
@@ -777,6 +779,233 @@ fn required_background_resolution() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// v0.14 code-analysis capability — SonarQube integration
+// ---------------------------------------------------------------------------
+//
+// Deterministic static analysis exposed as a capability, not an LLM.
+// `analysis_check` → availability probe; `analysis_run` → fetch/run scan and
+// persist the report; `analysis_latest` / `analysis_diff` → stored results.
+// Findings are advisory input for the controller; the UI shows status,
+// severity distribution, affected files and top findings only.
+
+#[derive(Serialize)]
+struct AnalysisAvailabilityDto {
+    available: bool,
+    detail: String,
+}
+
+fn sonar_provider(base_url: Option<String>, token_env: Option<String>, mode: Option<String>) -> aether_analysis::SonarQubeProvider {
+    let m = match mode.as_deref() {
+        Some("scanner") => aether_analysis::SonarQubeMode::ScannerApi,
+        _ => aether_analysis::SonarQubeMode::Api,
+    };
+    let cfg = aether_analysis::SonarQubeConfig {
+        base_url: base_url
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("SONAR_HOST_URL").ok())
+            .unwrap_or_else(|| "http://localhost:9000".into()),
+        token_env: token_env
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "SONAR_TOKEN".into()),
+        mode: m,
+        ..Default::default()
+    };
+    aether_analysis::SonarQubeProvider::new(cfg)
+}
+
+#[tauri::command]
+async fn analysis_check(base_url: Option<String>, token_env: Option<String>) -> AnalysisAvailabilityDto {
+    let prov = sonar_provider(base_url, token_env, None);
+    let av = prov.availability().await;
+    AnalysisAvailabilityDto { available: av.available, detail: av.detail }
+}
+
+#[derive(Serialize)]
+struct FindingDto {
+    id: String,
+    rule: String,
+    severity: String,
+    kind: String,
+    message: String,
+    path: String,
+    start_line: u32,
+    status: String,
+    remediation: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AnalysisReportDto {
+    id: String,
+    provider: String,
+    project: String,
+    at: String,
+    label: Option<String>,
+    finding_count: usize,
+    info: usize,
+    low: usize,
+    medium: usize,
+    high: usize,
+    blocker: usize,
+    affected_files: Vec<String>,
+    findings: Vec<FindingDto>,
+}
+
+fn sev_rank(s: &str) -> u8 {
+    match s { "blocker" => 4, "high" => 3, "medium" => 2, "low" => 1, _ => 0 }
+}
+
+fn report_to_dto(r: &aether_analysis::AnalysisReport) -> AnalysisReportDto {
+    let mut findings: Vec<FindingDto> = r.findings.iter().map(|f| FindingDto {
+        id: f.id.clone(),
+        rule: f.rule.clone(),
+        severity: f.severity.to_string(),
+        kind: f.kind.to_string(),
+        message: f.message.clone(),
+        path: f.location.path.clone(),
+        start_line: f.location.start_line,
+        status: f.status.clone(),
+        remediation: f.remediation.clone(),
+    }).collect();
+    findings.sort_by(|a, b| sev_rank(&b.severity).cmp(&sev_rank(&a.severity)).then_with(|| a.path.cmp(&b.path)));
+    AnalysisReportDto {
+        id: r.id.clone(),
+        provider: r.provider.clone(),
+        project: r.project.clone(),
+        at: r.at.clone(),
+        label: r.label.clone(),
+        finding_count: r.findings.len(),
+        info: r.distribution.info,
+        low: r.distribution.low,
+        medium: r.distribution.medium,
+        high: r.distribution.high,
+        blocker: r.distribution.blocker,
+        affected_files: r.affected_files.clone(),
+        findings,
+    }
+}
+
+#[derive(Serialize)]
+struct AnalysisRunResult {
+    success: bool,
+    message: String,
+    report: Option<AnalysisReportDto>,
+}
+
+/// Run (or fetch latest) SonarQube analysis for a project directory.
+/// `scope` restricts included paths when supported. Emits progress events.
+#[tauri::command]
+async fn analysis_run(
+    app: AppHandle,
+    project_root: String,
+    mode: Option<String>,
+    base_url: Option<String>,
+    token_env: Option<String>,
+    scope: Option<Vec<String>>,
+    label: Option<String>,
+) -> Result<AnalysisRunResult, String> {
+    let _ = app.emit("analysis-progress", serde_json::json!({ "stage": "probing" }));
+    let prov = sonar_provider(base_url, token_env, mode.clone());
+    let av = prov.availability().await;
+    if !av.available {
+        return Ok(AnalysisRunResult { success: false, message: av.detail, report: None });
+    }
+    let _ = app.emit("analysis-progress", serde_json::json!({ "stage": "analyzing" }));
+    let mut req = aether_analysis::AnalysisRequest::new(&project_root);
+    req.scope = scope.unwrap_or_default();
+    req.label = label;
+    let result = if mode.as_deref() == Some("scanner") {
+        prov.analyze(&req).await
+    } else {
+        match prov.latest_findings(&req).await {
+            Ok(Some(f)) => {
+                let mut rep = aether_analysis::AnalysisReport::new(
+                    prov.id(),
+                    &aether_analysis::project_key(&req.project_root),
+                    &req.project_root,
+                    f,
+                );
+                rep.label = req.label.clone();
+                Ok(rep)
+            }
+            Ok(None) => prov.analyze(&req).await,
+            Err(e) => Err(e),
+        }
+    };
+    match result {
+        Ok(report) => {
+            if let Ok(store) = aether_analysis::AnalysisStore::default_dir() {
+                let _ = store.save(&report);
+            }
+            let _ = app.emit("analysis-progress", serde_json::json!({ "stage": "done", "findings": report.findings.len() }));
+            Ok(AnalysisRunResult { success: true, message: format!("{} findings", report.findings.len()), report: Some(report_to_dto(&report)) })
+        }
+        Err(e) => {
+            let _ = app.emit("analysis-progress", serde_json::json!({ "stage": "error", "message": e.to_string() }));
+            Ok(AnalysisRunResult { success: false, message: e.to_string(), report: None })
+        }
+    }
+}
+
+#[tauri::command]
+async fn analysis_latest(project: String) -> Result<Option<AnalysisReportDto>, String> {
+    let store = aether_analysis::AnalysisStore::default_dir().map_err(|e| e.to_string())?;
+    Ok(store.latest(&project).map_err(|e| e.to_string())?.as_ref().map(report_to_dto))
+}
+
+#[tauri::command]
+async fn analysis_projects() -> Vec<String> {
+    aether_analysis::AnalysisStore::default_dir()
+        .map(|s| s.projects())
+        .unwrap_or_default()
+}
+
+#[derive(Serialize)]
+struct RegressionDto {
+    fingerprint: String,
+    old_severity: String,
+    new_severity: String,
+}
+
+#[derive(Serialize)]
+struct AnalysisDiffDto {
+    resolved: Vec<String>,
+    remaining: Vec<String>,
+    introduced: Vec<String>,
+    regressions: Vec<RegressionDto>,
+    baseline_count: usize,
+    current_count: usize,
+}
+
+/// Diff a stored baseline report against the latest (or a given current) report.
+#[tauri::command]
+async fn analysis_diff(
+    project: String,
+    baseline_report: String,
+    current_report: Option<String>,
+) -> Result<AnalysisDiffDto, String> {
+    let store = aether_analysis::AnalysisStore::default_dir().map_err(|e| e.to_string())?;
+    let baseline = store.load(&project, &baseline_report).map_err(|e| e.to_string())?;
+    let current = match current_report {
+        Some(id) => store.load(&project, &id).map_err(|e| e.to_string())?,
+        None => store.latest(&project).map_err(|e| e.to_string())?
+            .ok_or_else(|| "no current report".to_string())?,
+    };
+    let d = aether_analysis::diff(&baseline.findings, &current.findings, &baseline.id, &current.id);
+    Ok(AnalysisDiffDto {
+        resolved: d.resolved,
+        remaining: d.remaining,
+        introduced: d.introduced,
+        regressions: d.regressions.into_iter().map(|(f, o, n)| RegressionDto {
+            fingerprint: f,
+            old_severity: o.to_string(),
+            new_severity: n.to_string(),
+        }).collect(),
+        baseline_count: d.baseline_count,
+        current_count: d.current_count,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -805,6 +1034,11 @@ fn main() {
             restore_snapshot,
             snapshot_undo,
             snapshot_redo,
+            analysis_check,
+            analysis_run,
+            analysis_latest,
+            analysis_projects,
+            analysis_diff,
         ])
         .run(tauri::generate_context!())
         .expect("error while running aether-desktop");

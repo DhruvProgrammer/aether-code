@@ -24,12 +24,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["process", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 which = "7"
-aether-config = { path = "../aether-config" }
-aether-permissions = { path = "../aether-permissions" }
-aether-context = { path = "../aether-context" }
-aether-registry = { path = "../aether-registry" }
-aether-mind = { path = "../aether-mind" }
-aether-sessions = { path = "../aether-sessions" }
+  aether-config = { path = "../aether-config" }
+  aether-permissions = { path = "../aether-permissions" }
+  aether-context = { path = "../aether-context" }
+  aether-registry = { path = "../aether-registry" }
+  aether-mind = { path = "../aether-mind" }
+  aether-sessions = { path = "../aether-sessions" }
+  aether-analysis = { path = "../aether-analysis" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
 dirs = "5"

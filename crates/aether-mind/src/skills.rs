@@ -95,6 +95,16 @@ impl SkillRegistry {
         Arc::new(r)
     }
 
+    /// Like [`discover`] but also registers the compile-time bundled skills
+    /// (e.g. `sonarqube-analysis`) so they work even in projects without a
+    /// local skills directory.
+    pub fn discover_with_bundled(root: &Path) -> Arc<Self> {
+        let mut r = Self::default();
+        let _ = r.scan_more(root, 5);
+        r.register_bundled();
+        Arc::new(r)
+    }
+
     /// Walk a root directory up to `max_depth` and index any `SKILL.md` /
     /// `skill.md` / `skill.toml` files found. Public so the desktop app can
     /// scan additional roots (e.g. `~/.aether/skills` and the bundled
@@ -106,7 +116,16 @@ impl SkillRegistry {
 
     /// Add a skill manually (used by plugins).
     pub fn register(&mut self, skill: Skill) {
-        self.skills.push(skill);
+        if !self.skills.iter().any(|s| s.id == skill.id) {
+            self.skills.push(skill);
+        }
+    }
+
+    /// Register all bundled (compile-time embedded) skills. Idempotent.
+    pub fn register_bundled(&mut self) {
+        for s in bundled_skills() {
+            self.register(s);
+        }
     }
 
     pub fn all(&self) -> &[Skill] { &self.skills }
@@ -255,6 +274,63 @@ fn parse_toml_skill(path: &Path) -> Option<Skill> {
 pub use SkillRegistry as SkillIndex;
 pub use SkillSummary as SkillPathSummary;
 
+/// Skills embedded at compile time so they are available even when the user's
+/// workspace has no `.aether/skills`. They still obey the on-demand loading
+/// philosophy — registration just makes them discoverable.
+pub fn bundled_skills() -> Vec<Skill> {
+    let mut out = Vec::new();
+    if let Some(s) = parse_markdown_skill_text(
+        "sonarqube-analysis",
+        include_str!("../skills/sonarqube-analysis/SKILL.md"),
+    ) {
+        out.push(s);
+    }
+    out
+}
+
+/// Parse a SKILL.md body from a string with an explicit skill id.
+fn parse_markdown_skill_text(id: &str, text: &str) -> Option<Skill> {
+    let mut name = String::new();
+    let mut description = String::new();
+    let mut version = "0.0.0".into();
+    let mut author = String::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut required_permissions: Vec<String> = Vec::new();
+    let mut required_tools: Vec<String> = Vec::new();
+    let mut supported_agents: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("name:")        { name = rest.trim().into(); }
+        else if let Some(rest) = l.strip_prefix("description:") { description = rest.trim().into(); }
+        else if let Some(rest) = l.strip_prefix("version:")     { version = rest.trim().into(); }
+        else if let Some(rest) = l.strip_prefix("author:")      { author = rest.trim().into(); }
+        else if let Some(rest) = l.strip_prefix("tags:")        { tags = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
+        else if let Some(rest) = l.strip_prefix("required_permissions:") { required_permissions = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
+        else if let Some(rest) = l.strip_prefix("required_tools:")       { required_tools = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
+        else if let Some(rest) = l.strip_prefix("supported_agents:")     { supported_agents = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
+    }
+    if name.is_empty() { name = id.to_string(); }
+    Some(Skill {
+        id: id.to_string(),
+        name,
+        description,
+        version,
+        author,
+        tags,
+        required_permissions,
+        required_tools,
+        supported_agents,
+        instructions: text.to_string(),
+        examples: Vec::new(),
+        workflows: Vec::new(),
+        templates: Vec::new(),
+        validation_rules: Vec::new(),
+        dependencies: Vec::new(),
+        source_path: PathBuf::from(format!("bundled:{id}")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +387,29 @@ mod tests {
         assert_eq!(bundle.ids.len(), 2);
         assert!(bundle.instructions.contains("Skill: A"));
         assert!(bundle.instructions.contains("Skill: B"));
+    }
+
+    #[test]
+    fn bundled_sonarqube_skill_is_registered() {
+        let tmp = tempdir();
+        let r = SkillRegistry::discover_with_bundled(&tmp);
+        let s = r.get("sonarqube-analysis").expect("bundled sonarqube skill");
+        assert!(s.required_tools.contains(&"analyze_code".to_string()));
+        assert!(s.required_tools.contains(&"analysis_status".to_string()));
+        assert!(s.tags.contains(&"sonarqube".to_string()));
+        assert!(s.instructions.contains("Authority chain"));
+        // controller may load it; a random agent not listed may not.
+        assert!(r.for_agent("controller").iter().any(|x| x.id == "sonarqube-analysis"));
+        assert!(!r.for_agent("nonexistent-agent").iter().any(|x| x.id == "sonarqube-analysis"));
+    }
+
+    #[test]
+    fn bundled_registration_is_idempotent() {
+        let mut r = SkillRegistry::new();
+        r.register_bundled();
+        r.register_bundled();
+        let count = r.all().iter().filter(|s| s.id == "sonarqube-analysis").count();
+        assert_eq!(count, 1);
     }
 
     fn tempdir() -> PathBuf {
