@@ -60,6 +60,9 @@ pub enum ProviderError {
     Json(#[from] serde_json::Error),
     #[error("provider api error: {0}")]
     Api(String),
+    /// Non-2xx response with status preserved so callers can classify failures.
+    #[error("provider api error: status {status}: {body}")]
+    ApiStatus { status: u16, body: String },
     #[error("missing environment variable: {0}")]
     MissingEnv(String),
 }

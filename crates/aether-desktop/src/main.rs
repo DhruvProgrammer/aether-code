@@ -510,6 +510,133 @@ fn version() -> String {
 // v0.12 subsystems — Provider health / Snapshot / Skills
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// v0.15 Model Gateway — per-role live validation + fingerprint-gated save
+// ---------------------------------------------------------------------------
+
+/// Map the desktop's role ids to gateway roles.
+fn parse_role(role: &str) -> Option<aether_gateway::Role> {
+    match role {
+        "executor" | "model1" => Some(aether_gateway::Role::Executor),
+        "controller" | "model2" => Some(aether_gateway::Role::Controller),
+        "reviewer" | "model3" => Some(aether_gateway::Role::Reviewer),
+        _ => None,
+    }
+}
+
+/// Validation outcome surfaced to the settings UI.
+#[derive(Serialize)]
+struct RoleValidationDto {
+    role: String,
+    ok: bool,
+    class: Option<String>,
+    detail: String,
+    latency_ms: u64,
+    fingerprint: Option<String>,
+    validated_at: Option<String>,
+}
+
+/// Run a live API validation for one role's configured provider/model.
+/// On success, records a fingerprint snapshot so Save/Activate can be gated.
+#[tauri::command]
+async fn gateway_validate_role(role: String, config: DesktopConfig) -> Result<RoleValidationDto, String> {
+    let r = parse_role(&role).ok_or_else(|| format!("unknown role: {role}"))?;
+    let key = role_key_for(&config, r)
+        .ok_or_else(|| format!("no model key bound to role {role}"))?;
+    let mb = config
+        .models
+        .get(&key)
+        .ok_or_else(|| format!("model key '{key}' not found in [models]"))?;
+    let target = aether_gateway::ValidateTarget {
+        role: r,
+        model_key: key,
+        provider_id: mb.provider.clone(),
+        base_url: mb.base_url.clone(),
+        model_id: mb.model.clone(),
+        api_key_env: mb.api_key_env.clone(),
+        extra_body: mb.extra_body.clone(),
+    };
+    let out = aether_gateway::validate_binding(&target).await;
+    if let Some(snapshot) = &out.snapshot {
+        if let Ok(store) = aether_gateway::ValidationStore::default_path() {
+            let mut store = store;
+            let _ = store.record(snapshot.clone());
+        }
+    }
+    Ok(RoleValidationDto {
+        role: role.clone(),
+        ok: out.ok,
+        class: out.class.map(|c| c.as_str().to_string()),
+        detail: out.detail,
+        latency_ms: out.latency_ms,
+        fingerprint: out.fingerprint,
+        validated_at: out.snapshot.map(|s| s.validated_at),
+    })
+}
+
+/// Validation state for Save/Activate gating, given the *current* form values.
+/// If the stored snapshot fingerprint no longer matches the current config,
+/// validation is considered stale (spec §11).
+#[derive(Serialize)]
+struct RoleStatusDto {
+    role: String,
+    model_key: String,
+    valid: bool,
+    reason: Option<String>,
+    validated_at: Option<String>,
+}
+
+#[tauri::command]
+async fn gateway_validation_status(role: String, config: DesktopConfig) -> Result<RoleStatusDto, String> {
+    let r = parse_role(&role).ok_or_else(|| format!("unknown role: {role}"))?;
+    let key = role_key_for(&config, r).unwrap_or_default();
+    let current_fp = match config.models.get(&key) {
+        Some(mb) => aether_gateway::fingerprint_binding(
+            r,
+            &mb.provider,
+            &mb.base_url,
+            &mb.model,
+            &mb.api_key_env,
+            mb.extra_body.as_ref(),
+        ),
+        None => String::new(),
+    };
+    let store = aether_gateway::ValidationStore::default_path()
+        .map_err(|e| format!("cannot open validation store: {e}"))?;
+    let st = store.status_for(r, &current_fp);
+    Ok(RoleStatusDto {
+        role: role.clone(),
+        model_key: key,
+        valid: st.valid,
+        reason: st.reason,
+        validated_at: st.snapshot.map(|s| s.validated_at),
+    })
+}
+
+/// Which `[models]` key a role is bound to, honouring model1/model2/model3
+/// with the legacy names as fallback (mirrors `GatewayBundle::resolve`).
+fn role_key_for(config: &DesktopConfig, role: aether_gateway::Role) -> Option<String> {
+    match role {
+        aether_gateway::Role::Executor => config
+            .agent
+            .model1
+            .clone()
+            .or_else(|| Some(config.agent.executor_model.clone()))
+            .filter(|k| !k.is_empty()),
+        aether_gateway::Role::Controller => config
+            .agent
+            .model2
+            .clone()
+            .or_else(|| Some(config.agent.controller_model.clone()))
+            .filter(|k| !k.is_empty()),
+        aether_gateway::Role::Reviewer => config
+            .agent
+            .model3
+            .clone()
+            .or_else(|| config.agent.reviewer_model.clone()),
+    }
+}
+
 /// Run a one-shot health check against a candidate provider descriptor.
 /// Fields mirror `aether_registry::ProviderDescriptor`; the frontend builds
 /// the descriptor from the settings form.
@@ -1029,6 +1156,8 @@ fn main() {
             set_background_image,
             required_background_resolution,
             check_provider,
+            gateway_validate_role,
+            gateway_validation_status,
             list_skills,
             list_snapshots,
             restore_snapshot,

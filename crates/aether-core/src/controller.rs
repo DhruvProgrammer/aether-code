@@ -18,14 +18,15 @@ pub async fn plan(
         ("BUILD MODE", BUILD_MODE_PROMPT)
     };
     let system = format!(
-        "You are the Controller. {mode_prompt}\n{mode_label}\n{KARPATHY_POLICY}\n\
+        "{core}\n\n---\n\nYou are the Controller. {mode_prompt}\n{mode_label}\n{KARPATHY_POLICY}\n\
          Given a user task, produce a concise, actionable response. \
          In BUILD MODE output a numbered implementation plan for the Executor. \
          In PLAN MODE output the structured PLAN document with these sections: Goal, Current \
          Understanding, Relevant Files, Existing Architecture, Facts, Assumptions, Unknowns, \
          Hypotheses (with confidence + evidence), Recommended Approach, Implementation Steps, \
          Verification, Risks, Files Expected to Change, Questions/Decisions Required. \
-         Output only the plan, no preamble."
+         Output only the plan, no preamble.",
+        core = crate::prompt::AETHER_CORE_SYSTEM_PROMPT,
     );
     let mut msgs = vec![Message {
         role: "system".into(),

@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aether-analysis"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -26,12 +26,14 @@ dependencies = [
 
 [[package]]
 name = "aether-cli"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
+ "aether-analysis",
  "aether-config",
  "aether-context",
  "aether-core",
  "aether-evidence",
+ "aether-gateway",
  "aether-mind",
  "aether-models",
  "aether-permissions",
@@ -54,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "aether-config"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -65,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "aether-context"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "aether-models",
  "async-trait",
@@ -82,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "aether-core"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "aether-config",
  "aether-context",
@@ -106,11 +108,12 @@ dependencies = [
 
 [[package]]
 name = "aether-desktop"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "aether-analysis",
  "aether-config",
  "aether-context",
+ "aether-gateway",
  "aether-mind",
  "aether-permissions",
  "aether-registry",
@@ -133,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "aether-evidence"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "parking_lot",
@@ -146,8 +149,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "aether-gateway"
+version = "0.15.0"
+dependencies = [
+ "aether-config",
+ "aether-models",
+ "async-trait",
+ "dirs 5.0.1",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aether-mind"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "aether-models",
  "aether-permissions",
@@ -164,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "aether-models"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "aether-config",
  "async-trait",
@@ -177,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "aether-permissions"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "aether-config",
  "chrono",
@@ -189,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "aether-plugin"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -203,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "aether-registry"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "aether-config",
  "aether-models",
@@ -219,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "aether-sessions"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -232,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "aether-tools"
-version = "0.13.0"
+version = "0.15.0"
 dependencies = [
  "aether-analysis",
  "aether-permissions",

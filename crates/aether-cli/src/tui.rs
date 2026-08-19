@@ -308,7 +308,6 @@ impl App {
                     },
                     tools,
                     true,
-                    None,
                     30,
                     128000,
                     3,

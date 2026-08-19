@@ -46,7 +46,6 @@ pub struct Agent {
     policy: Policy,
     tools: HashMap<String, Arc<dyn Tool>>,
     subagents_enabled: bool,
-    cheap_model: Option<String>,
     max_iterations: u32,
     context_max_tokens: u32,
     loop_budget: u32,
@@ -91,7 +90,6 @@ impl Agent {
         policy: Policy,
         tools: HashMap<String, Arc<dyn Tool>>,
         subagents_enabled: bool,
-        cheap_model: Option<String>,
         max_iterations: u32,
         context_max_tokens: u32,
         loop_budget: u32,
@@ -114,7 +112,6 @@ impl Agent {
             policy,
             tools,
             subagents_enabled,
-            cheap_model,
             max_iterations,
             context_max_tokens,
             loop_budget,
@@ -375,13 +372,9 @@ impl Agent {
             eng.add_decision(&format!("plan iteration {}", iter + 1), "controller produced plan", 0.6);
             persist_trace(&self.session, sid, "plan", "controller", &plan.chars().take(240).collect::<String>());
 
-            // Cost routing (§8): pick Coder model by task intent.
-            let coder_model = crate::router::select_model(
-                &cycle_task,
-                self.cheap_model.as_deref(),
-                &self.executor_model,
-                &self.controller_model,
-            );
+            // Model 1 always runs on the explicitly configured executor provider.
+            // No cost routing, no dynamic selection (v0.15 gateway spec §1, §23).
+            let coder_model = self.executor_model.clone();
             let mut coder = Executor::new(
                 self.provider_for(&coder_model),
                 coder_model,

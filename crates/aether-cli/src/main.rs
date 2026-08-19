@@ -195,7 +195,6 @@ async fn run() -> anyhow::Result<()> {
         setup_help(&cfg_path, cfg_missing);
         std::process::exit(2);
     }
-    let controller_cfg = cfg.model(&cfg.agent.controller_model).unwrap();
 
     let mut policy = aether_permissions::Policy::from_config(&cfg.permissions);
     if cli.plan {
@@ -207,32 +206,27 @@ async fn run() -> anyhow::Result<()> {
         ui::warn("PLANNING MODE — read-only, no file changes will be made.");
     }
 
-    // Build a provider per configured model (spec §8 routing).
-    let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
-    for (key, mcfg) in &cfg.models {
-        if let Ok(p) = aether_models::build_provider(mcfg) {
-            providers.insert(key.clone(), Arc::from(p));
+    // ---- v0.15 Model Gateway ----
+    // Single assembly point: explicit per-role provider bindings, no routing,
+    // no fallback. Provider failures are isolated per role and reported.
+    let gateway_bundle = match aether_gateway::GatewayBundle::from_config(&cfg, aether_gateway::GatewayConfig::default()) {
+        Ok(b) => b,
+        Err(e) => {
+            ui::error(&format!("gateway assembly failed: {e}"));
+            std::process::exit(2);
         }
-    }
-    let controller: Arc<dyn ModelProvider> = Arc::from(aether_models::build_provider(controller_cfg)?);
-
-    // LLM 3 — VISUAL FRONTEND REVIEWER (optional, multimodal). Degrades gracefully when unset.
-    let reviewer: Option<Arc<dyn ModelProvider>> = match &cfg.agent.reviewer_model {
-        Some(key) => match cfg.model(key) {
-            Some(mc) => match aether_models::build_provider(mc) {
-                Ok(p) => Some(Arc::from(p)),
-                Err(e) => {
-                    ui::warn(&format!("reviewer model '{key}' unavailable: {e}"));
-                    None
-                }
-            },
-            None => {
-                ui::warn(&format!("reviewer model '{key}' not found in [models]; visual review disabled"));
-                None
-            }
-        },
-        None => None,
     };
+    let providers = gateway_bundle.providers.clone();
+    let controller: Arc<dyn ModelProvider> = gateway_bundle.controller.clone();
+    ui::note("model gateway: explicit per-role bindings (no routing, no fallback)");
+
+    // LLM 3 — VISUAL FRONTEND REVIEWER (optional, multimodal). Comes from the
+    // gateway's explicit reviewer binding; degrades gracefully when unset.
+    let reviewer: Option<Arc<dyn ModelProvider>> = gateway_bundle
+        .gateway
+        .provider_for(aether_gateway::Role::Reviewer)
+        .ok()
+        .map(|rp| rp.provider);
 
     // Memory engine (spec §9). Embeddings reuse the controller provider.
     let (mind, embedder): (Option<Arc<Mind>>, Option<Arc<dyn ModelProvider>>) = if cfg.memory.enabled {
@@ -361,7 +355,6 @@ async fn run() -> anyhow::Result<()> {
         policy,
         subagent_tools,
         cfg.subagents.enabled,
-        cfg.agent.cheap_model.clone(),
         cfg.agent.max_iterations,
         cfg.context.max_tokens,
         cfg.agent.loop_budget,

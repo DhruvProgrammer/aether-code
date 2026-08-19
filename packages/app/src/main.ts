@@ -192,6 +192,42 @@ function newTab() {
 
 let activeUnlistens: (() => void)[] = [];
 
+/** Live-validation fingerprints per role. Filled by "Check API Response". */
+let gatewayValidated: Record<string, { fingerprint: string; class: string | null; detail: string } | null> = {
+  executor: null,
+  controller: null,
+  reviewer: null,
+};
+
+/** Build the config object the gateway validation command expects, from the form. */
+function buildDraftConfig(body: HTMLElement, original: DesktopConfig): DesktopConfig {
+  const slots = { m1: readSlot(body, 1), m2: readSlot(body, 2), m3: readSlot(body, 3) };
+  const providers = collectProviders(body);
+  for (const s of [slots.m1, slots.m2, slots.m3]) {
+    if (s.model_id && !providers[s.model_id]) {
+      providers[s.model_id] = {
+        provider: s.provider,
+        base_url: s.base_url,
+        model: s.model_id,
+        api_key_env: s.api_key || "OPENAI_API_KEY",
+      };
+    }
+  }
+  return {
+    agent: {
+      model1: slots.m1.model_id,
+      model2: slots.m2.model_id,
+      model3: slots.m3.model_id || null,
+      controller_model: slots.m2.model_id || "controller",
+      executor_model: slots.m1.model_id,
+      reviewer_model: slots.m3.model_id || null,
+    },
+    models: providers,
+    frontend: original.frontend,
+    appearance: original.appearance,
+  };
+}
+
 async function send() {
   const input = document.querySelector<HTMLTextAreaElement>("#prompt-input")!;
   const text = input.value.trim();
@@ -435,6 +471,13 @@ function renderSlotCard(opts: {
         <label>API Key</label>
         <input data-slot="${sfx}" data-field="api_key" value="${escapeAttr(state.api_key)}" placeholder="OPENAI_API_KEY" />
       </div>
+      <div class="mt-2 flex items-center space-x-2">
+        <button type="button" data-gw-check="${sfx}" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary inline-flex items-center">
+          <i class="w-3.5 h-3.5 mr-1" data-lucide="plug"></i> Check API Response
+        </button>
+        <span class="text-xs text-app-textSecondary" data-gw-state="${sfx}">not validated</span>
+      </div>
+      <div class="text-xs font-mono whitespace-pre-wrap text-app-textSecondary mt-1" data-gw-out="${sfx}"></div>
       <div class="validation-err" data-slot-err="${sfx}" style="display:none"></div>
     </div>`;
 }
@@ -697,6 +740,70 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
     }
   }).catch(() => { /* ignore */ });
 
+  // Editing a slot invalidates any cached validation fingerprint for that role.
+  body.querySelector<HTMLDivElement>("#slots-grid")?.addEventListener("input", (ev) => {
+    const target = ev.target as HTMLElement | null;
+    const slot = target?.getAttribute("data-slot");
+    if (!slot) return;
+    const role = roleFor[slot];
+    if (role && gatewayValidated[role] !== null) {
+      gatewayValidated[role] = null;
+      const pill = body.querySelector<HTMLSpanElement>(`[data-gw-state="${slot}"]`);
+      if (pill) {
+        pill.textContent = "config changed — re-check";
+        pill.className = "text-xs text-app-textSecondary";
+      }
+    }
+  });
+
+  // ----- Per-slot gateway live API validation -----
+  const roleFor: Record<string, "executor" | "controller" | "reviewer"> = {
+    "1": "executor",
+    "2": "controller",
+    "3": "reviewer",
+  };
+  for (let slot = 1 as 1 | 2 | 3; slot <= 3; slot++) {
+    const sfx = String(slot);
+    const btn = body.querySelector<HTMLButtonElement>(`[data-gw-check="${sfx}"]`);
+    const out = body.querySelector<HTMLDivElement>(`[data-gw-out="${sfx}"]`);
+    const pill = body.querySelector<HTMLSpanElement>(`[data-gw-state="${sfx}"]`);
+    if (!btn || !out || !pill) continue;
+    btn.addEventListener("click", async () => {
+      const s = readSlot(body, slot);
+      if (!s.model_id || !s.base_url) {
+        out.textContent = "Provide a model id and base URL first.";
+        out.className = "text-xs font-mono whitespace-pre-wrap text-app-validationErr mt-1";
+        return;
+      }
+      pill.textContent = "checking…";
+      pill.className = "text-xs text-app-textSecondary";
+      out.textContent = "";
+      const draft = buildDraftConfig(body, originalCfg);
+      try {
+        const r = await api.gatewayValidateRole(roleFor[sfx], draft);
+        if (r.ok) {
+          pill.textContent = "✓ validated";
+          pill.className = "text-xs text-app-validationOk";
+          out.textContent = `${r.detail}\nlatency ${r.latency_ms}ms\nfp ${r.fingerprint ?? ""}`;
+          out.className = "text-xs font-mono whitespace-pre-wrap text-app-textSecondary mt-1";
+          gatewayValidated[roleFor[sfx]] = { fingerprint: r.fingerprint ?? "", class: r.class, detail: r.detail };
+        } else {
+          pill.textContent = `✗ ${r.class ?? "failed"}`;
+          pill.className = "text-xs text-app-validationErr";
+          out.textContent = `${r.detail}\nclass: ${r.class ?? "unknown"}`;
+          out.className = "text-xs font-mono whitespace-pre-wrap text-app-validationErr mt-1";
+          gatewayValidated[roleFor[sfx]] = null;
+        }
+      } catch (e) {
+        pill.textContent = "error";
+        pill.className = "text-xs text-app-validationErr";
+        out.textContent = `Check failed: ${String(e)}`;
+        out.className = "text-xs font-mono whitespace-pre-wrap text-app-validationErr mt-1";
+        gatewayValidated[roleFor[sfx]] = null;
+      }
+    });
+  }
+
   // ----- Provider health check -----
   body.querySelector<HTMLButtonElement>("#hc-run")?.addEventListener("click", async () => {
     const url = body.querySelector<HTMLInputElement>("#hc-url")?.value.trim() ?? "";
@@ -843,6 +950,33 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
     if (!validation.ok) {
       status.textContent = "Fix the errors above before saving.";
       return;
+    }
+
+    // Gateway gate: at minimum the executor (Model 1) must have passed a live
+    // validation. Model 2/3 only need validation when their fields are filled.
+    const draft = buildDraftConfig(body, originalCfg);
+    const need: Array<"executor" | "controller" | "reviewer"> = ["executor"];
+    if (slots.m2.model_id) need.push("controller");
+    if (slots.m3.model_id) need.push("reviewer");
+    for (const role of need) {
+      if (gatewayValidated[role] === null) {
+        status.textContent = `Run "Check API Response" for ${role} before saving.`;
+        return;
+      }
+    }
+    // Re-check freshness against the server-stored fingerprint (in case the
+    // user edited a field after the last check).
+    for (const role of need) {
+      try {
+        const st = await api.gatewayValidationStatus(role, draft);
+        if (!st.valid) {
+          status.textContent = `Configuration changed since last check (${role}). Re-run "Check API Response".`;
+          return;
+        }
+      } catch (e) {
+        status.textContent = `Validation store unreachable: ${String(e)}`;
+        return;
+      }
     }
 
     const providers = collectProviders(body);

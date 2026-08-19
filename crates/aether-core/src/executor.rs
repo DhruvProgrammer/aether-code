@@ -74,7 +74,7 @@ impl Executor {
         let mut messages = vec![
             Message {
                 role: "system".into(),
-                content: self.system_prompt.clone(),
+                content: crate::prompt::system_for(&self.system_prompt),
                 ..Default::default()
             },
             Message {

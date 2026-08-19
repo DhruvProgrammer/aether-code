@@ -7,7 +7,6 @@ pub mod controller;
 pub mod eng;
 pub mod executor;
 pub mod mode;
-pub mod router;
-pub mod routing;
+pub mod prompt;
 pub mod subagents;
 pub mod visual;

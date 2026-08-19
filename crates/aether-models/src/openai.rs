@@ -110,8 +110,9 @@ impl ModelProvider for OpenAICompatibleProvider {
             .send()
             .await?;
         if !resp.status().is_success() {
+            let status = resp.status().as_u16();
             let txt = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api(txt));
+            return Err(ProviderError::ApiStatus { status, body: txt });
         }
         let v: Value = resp.json().await?;
         Ok(parse_completion(&v))
@@ -128,8 +129,9 @@ impl ModelProvider for OpenAICompatibleProvider {
             .send()
             .await?;
         if !resp.status().is_success() {
+            let status = resp.status().as_u16();
             let txt = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api(txt));
+            return Err(ProviderError::ApiStatus { status, body: txt });
         }
         let bytes = resp.bytes().await?;
         let text = String::from_utf8_lossy(&bytes);
@@ -148,8 +150,9 @@ impl ModelProvider for OpenAICompatibleProvider {
             .send()
             .await?;
         if !resp.status().is_success() {
+            let status = resp.status().as_u16();
             let txt = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api(txt));
+            return Err(ProviderError::ApiStatus { status, body: txt });
         }
         let v: Value = resp.json().await?;
         let mut out = Vec::new();

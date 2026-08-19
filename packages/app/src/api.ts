@@ -123,6 +123,36 @@ export interface HealthCheck {
   latency_ms: number;
 }
 
+/**
+ * Outcome of a per-role live API validation performed by the Model Gateway
+ * (v0.15). Returned by `gateway_validate_role`. The result is persisted to
+ * `~/.aether/validations.json` and gates Save/Activate in the UI.
+ */
+export interface RoleValidationDto {
+  role: string;
+  ok: boolean;
+  /** Stable failure class (e.g. "rate_limited", "invalid_api_key"). */
+  class: string | null;
+  detail: string;
+  latency_ms: number;
+  /** Configuration fingerprint. Present only on success. */
+  fingerprint: string | null;
+  /** RFC3339-style timestamp of the successful validation. */
+  validated_at: string | null;
+}
+
+/**
+ * Validation status for Save/Activate gating. `valid` is true only when the
+ * stored fingerprint matches the current config fingerprint.
+ */
+export interface RoleStatusDto {
+  role: string;
+  model_key: string;
+  valid: boolean;
+  reason: string | null;
+  validated_at: string | null;
+}
+
 export interface SkillSummary {
   id: string;
   name: string;
@@ -224,6 +254,12 @@ export const api = {
     invoke<string>("required_background_resolution"),
   checkProvider: (baseUrl: string, apiKeyEnv: string, models: string[]) =>
     invoke<HealthOutcome>("check_provider", { baseUrl, apiKeyEnv, models }),
+  /** Run a live API validation for one role and persist a fingerprint snapshot. */
+  gatewayValidateRole: (role: string, config: DesktopConfig) =>
+    invoke<RoleValidationDto>("gateway_validate_role", { role, config }),
+  /** Look up current Save/Activate state for one role against the stored snapshot. */
+  gatewayValidationStatus: (role: string, config: DesktopConfig) =>
+    invoke<RoleStatusDto>("gateway_validation_status", { role, config }),
   listSkills: () => invoke<SkillSummary[]>("list_skills"),
   listSnapshots: (sessionId: string) =>
     invoke<SnapshotRow[]>("list_snapshots", { sessionId }),

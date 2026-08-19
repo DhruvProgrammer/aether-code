@@ -678,14 +678,17 @@ impl VisualReviewEngine {
 
     /// Call LLM 3 (vision) with the screenshot and return structured evidence.
     async fn review(&self, ctx: &VisualReviewContext) -> Result<VisualReviewResult> {
-        let system = "You are the Visual Frontend Reviewer (LLM 3 / EYES). You evaluate the ACTUAL \
+        let system = format!(
+            "{core}\n\n---\n\nYou are the Visual Frontend Reviewer (LLM 3 / EYES). You evaluate the ACTUAL \
             rendered website shown in the provided screenshot. Assess visual hierarchy, layout, \
             spacing, typography, colors, component consistency, responsive/mobile behavior, UX, \
             accessibility-related visual issues, and adherence to the user's design direction. \
             You MUST reply with ONLY a single JSON object and no prose: \
-            {\"status\":\"approved\"|\"rejected\",\"score\":<0-100>,\"issues\":\
-            [{\"severity\":\"critical\"|\"major\"|\"minor\",\"category\":string,\"component\":string,\
-            \"description\":string,\"recommendation\":string}]}.";
+            {{\"status\":\"approved\"|\"rejected\",\"score\":<0-100>,\"issues\":\
+            [{{\"severity\":\"critical\"|\"major\"|\"minor\",\"category\":string,\"component\":string,\
+            \"description\":string,\"recommendation\":string}}]}}.",
+            core = crate::prompt::AETHER_CORE_SYSTEM_PROMPT,
+        );
         let user = format!(
             "USER FRONTEND REQUIREMENTS:\n{}\n\nDESIGN REQUIREMENTS:\n{}\n\nVIEWPORT: {}\n\n\
             PREVIOUS REVIEW EVIDENCE:\n{}\n\nEvaluate the screenshot and return the JSON review.",

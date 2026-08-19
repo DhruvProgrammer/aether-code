@@ -37,8 +37,9 @@ If you've used Cursor, Windsurf, Cline, GitHub Copilot, Continue.dev, Cody, or T
 - [Quick start](#quick-start)
 - [Key features](#key-features)
 - [Code analysis (SonarQube)](#code-analysis-sonarqube)
+- [Model Gateway (v0.15)](#model-gateway-v015)
 - [How aether works](#how-aether-works)
-  - [Two-LLM architecture](#two-llm-architecture)
+  - [Three-LLM architecture](#three-llm-architecture)
   - [Multi-agent pipeline](#multi-agent-pipeline)
   - [Loop engineering](#loop-engineering)
   - [Persistent memory (aether-mind)](#persistent-memory-aether-mind)
@@ -62,7 +63,7 @@ Most AI coding tools assume a specific vendor (OpenAI), a specific subscription 
 
 - **Bring your own model.** Use GPT-4o for the heavy lifting and a 4-bit quantized Llama-3 for the planning pass. Mix providers per role. Use DeepSeek for code, Claude for review, MiniMax for cheap sub-tasks. aether routes them by role, not by brand.
 - **Persistent memory that survives sessions.** aether stores a knowledge graph + vector index + key-value facts on your local disk. The agent remembers your codebase conventions, recurring decisions, your preferences, and what you tried last week — without re-feeding it the entire repo every prompt.
-- **Two-LLM design.** A small "controller" model plans the work, a big "executor" model writes the code. You pay less, you wait less, and the small model's mistakes don't pollute the big model's context.
+- **Three-LLM design with explicit role binding.** A small "controller" model plans the work, a big "executor" model writes the code, and an optional visual reviewer joins for UI tasks. Each role is bound to its own provider+model via the Model Gateway — no routing, no fallback, no cost-based switching. The small model's mistakes don't pollute the big model's context.
 - **Multi-agent verification.** Every implementation cycle is followed by automated tests, a peer-review pass, and a security review (for risky changes). Bugs caught by the reviewer are fed back into the loop.
 - **Runs locally, on your terms.** Single-file static binary. No Electron runtime, no Chromium download, no 200 MB footprint. The optional desktop installer is ~5 MB.
 - **Open source, MIT, auditable.** Every line of the agent loop, the memory engine, and the permission system is in this repo. Read it. Fork it. Modify it.
@@ -223,14 +224,15 @@ Every session writes to `~/.aether/mind/` — a hybrid store of:
 
 Memory is **retrieved at the start of every task** via hybrid search (vector similarity + keyword + 1-hop graph traversal), and **extracted from conversation** at the end. The agent never has to re-read the whole repo to know the conventions.
 
-### 🪜 Two-LLM architecture (cost-aware routing)
+### 🪜 Three-LLM architecture (explicit per-role binding)
 
-Every aether task is decomposed into planning and execution:
+Every aether task is decomposed across three explicit roles. Each role points to its own provider + model — there is **no routing, no fallback, no auto-switching**. The Model Gateway (v0.15) is the single access layer.
 
-- The **controller** is a SMALL, fast, cheap model (e.g. `gpt-4o-mini`, `llama-3-8b-instruct`, `qwen2.5-coder:7b`). It owns the prompt decomposition, the planning loop, and the orchestration of subagents. It never writes the final code.
-- The **executor** is a BIG, careful, expensive model (e.g. `gpt-4o`, `claude-sonnet`, `deepseek-coder-v2`, `qwen2.5-coder:32b`). It receives the plan and writes the code, calls tools, and emits diffs.
+- **Model 1 — Big Executor** writes the code, calls tools, and emits diffs. Required.
+- **Model 2 — Small Controller** owns the prompt decomposition, the planning loop, and the orchestration of subagents. It never writes the final code. Required.
+- **Model 3 — Visual Frontend Reviewer** is an optional multimodal reviewer (vision) for UI tasks. Its failure never breaks the primary coding workflow. Optional.
 
-Routing is enforced in exactly one place (`Agent::resolve`). The agent loop literally cannot send an implementation request to the SMALL model.
+Each role is bound in `config.toml` to a provider+model key in `[models]`. The Model Gateway resolves exactly that binding; capability mismatches are reported as errors, not silently switched. See [Model Gateway (v0.15)](#model-gateway-v015) for the full architecture.
 
 ### 🧑‍🤝‍🧑 Multi-agent pipeline
 
@@ -359,33 +361,148 @@ SonarQube informs the agent — it does not control it. The authority chain stay
 
 ---
 
+## Model Gateway (v0.15)
+
+AETHER v0.15 introduces a central **Model Gateway** that owns every LLM call. There is no routing. There is no fallback. There is no cost/latency-based selection. Each role is bound to a specific provider + model in `config.toml`, and that is exactly the model the runtime uses.
+
+### Architecture
+
+```
+AETHER Component  →  Model Gateway  →  Role Binding  →  Provider Adapter  →  Provider API
+                                   (Model 1/2/3)   (OpenAI-compatible)
+```
+
+The gateway is an **abstraction layer**, not a routing engine. It exists to:
+
+* Centralize provider access so components never talk to provider APIs directly.
+* Enforce capability pre-checks (vision, tool calling, streaming) before dispatch.
+* Classify every failure into a typed category — no more bare "API Error" messages.
+* Keep per-role provider failure isolated (Model 3 down must not break Model 1+2).
+* Validate configurations via real API probes; gate Save/Activate on success.
+
+### Explicit role bindings
+
+```toml
+# ~/.aether/config.toml
+
+[agent]
+# Model 1 — Big Executor (required)
+model1 = "nvidia-a"
+# Model 2 — Small Controller (required)
+model2 = "openrouter-b"
+# Model 3 — Visual Frontend Reviewer (optional)
+model3 = "tok-router-c"
+
+[models.nvidia-a]
+provider     = "openai_compatible"
+base_url     = "https://integrate.api.nvidia.com/v1"
+model        = "meta/llama-3.1-70b-instruct"
+api_key_env  = "NVIDIA_API_KEY"
+
+[models.openrouter-b]
+provider     = "openai_compatible"
+base_url     = "https://openrouter.ai/api/v1"
+model        = "anthropic/claude-3.5-sonnet"
+api_key_env  = "OPENROUTER_API_KEY"
+
+[models.tok-router-c]
+provider     = "openai_compatible"
+base_url     = "https://tokenrouter.ai/v1"
+model        = "gemini-2.5-pro"
+api_key_env  = "TOKEN_ROUTER_KEY"
+```
+
+No global provider, no hidden cost-based switching. Model 1+2+3 each have an independent provider and model.
+
+### Provider isolation & failure classification
+
+When a provider call fails, the gateway classifies the failure into a stable category that surfaces a human-readable hint — never a raw API response, never the credential:
+
+| Class | Meaning | UI hint |
+|---|---|---|
+| `invalid_api_key` | 401 / missing env var | Check the API key env var. |
+| `authentication_failed` | 403 / expired token | Key expired or lacks scope. |
+| `invalid_base_url` | DNS / scheme failure | Check the base URL for typos. |
+| `endpoint_unavailable` | Connection refused | Endpoint not reachable right now. |
+| `model_not_found` | 404 on model | Model id not found for this provider. |
+| `rate_limited` | 429 | Provider rate-limited the request. |
+| `request_timeout` | / | Request timed out before the provider answered. |
+| `network_failure` | TLS / reset / proxy | Network failure (TLS error, reset, proxy). |
+| `invalid_request` | 400 | Provider rejected the request body. |
+| `unsupported_capability` | / | Model does not support the requested operation. |
+| `server_error` | 5xx | Provider returned a server error. |
+| `unknown_provider_error` | other | Unknown provider error. |
+
+A failure on one role does not affect another — providers run with independent reqwest clients and timeouts.
+
+### Save/Activate gating (validation)
+
+Every role has a `Check API Response` button in the desktop Settings. The button:
+
+1. Runs a real minimal chat-completion probe against the configured provider/model.
+2. Returns a typed classification and a configuration fingerprint (a deterministic hash of `role + provider + base_url + model + api_key_env + extra_body` — never the raw key).
+3. Persists the fingerprint to `~/.aether/validations.json`.
+
+When you click **Save**, the gateway re-validates the stored fingerprint against the current config:
+
+* If the stored fingerprint matches → the configuration is unchanged since the last successful check, and Save proceeds.
+* If the fingerprint no longer matches → "Configuration changed since last check — re-run Check API Response."
+
+This is the model-side counterpart to the `routing_policy` ban: a model configuration is only "active" after a real API validation, and it deactivates itself the moment the user changes any field.
+
+### Concurrency, timeouts, cancellation
+
+* **Per-provider clients** — each role's adapter owns its own reqwest client pool, so a slow or hung provider on one role never blocks another.
+* **Default request timeout** — 180 seconds; configurable per-request and per-gateway.
+* **Cancellation** — a `CancelHandle` (`Arc<Notify>`) propagates to every in-flight request. Selecting **Cancel** in the TUI aborts running completions cleanly.
+* **No silent retries** — controlled retries are opt-in only. The default is one shot; provider failure is reported, not absorbed.
+
+### What the gateway does NOT do
+
+* No cost-based routing
+* No latency-based routing
+* No benchmark-based routing
+* No automatic fallback
+* No silent model switching
+* No silent provider switching
+
+Every LLM call goes through the gateway; the gateway calls exactly the configured model; failure is reported; the user is in control.
+
+---
+
 ## How aether works
 
-### Two-LLM architecture
+### Three-LLM architecture
 
 ```
 ┌───────────────────────── ONE aether run ──────────────────────────┐
 │                                                                    │
-│  task ─► [Controller · SMALL LLM] ──plan──► [Executor · BIG LLM]    │
-│                │                            │                      │
-│                │ owns the loop               │ owns the tools       │
-│                ▼                            ▼                      │
-│           EngineeringModel            file edits, bash,           │
-│           (loop state)                 git, tests, MCP             │
-│                │                            │                      │
-│                └──── verification ──────────┘                      │
-│                          │                                         │
-│              Tester → Reviewer → Security Reviewer                 │
-│                          │                                         │
-│                          ▼                                         │
-│                  LoopEngine: Continue / Escalate / Stop            │
+│  task ─► [Model 2 · Controller · SMALL LLM] ──plan──► [Model 1 · Executor · BIG LLM]
+│                       │                                     │
+│                       │ owns the loop                        │ owns the tools
+│                       ▼                                     ▼
+│                  EngineeringModel               file edits, bash,
+│                  (loop state)                    git, tests, MCP
+│                       │                                     │
+│                       └──── verification ──────────────────┘
+│                                 │
+│                     Tester → Reviewer → Security Reviewer
+│                                 │
+│                                 ▼
+│                     LoopEngine: Continue / Escalate / Stop
 │                                                                    │
+│  [Model 3 · Visual Reviewer] (optional) — reads screenshot of UI,  │
+│   feeds approve / fix / escalate back to Model 1. Falls back to    │
+│   Model 1+2 cleanly when unset or down.                            │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-**Why two models?**
+Every LLM call in the loop is dispatched through the **Model Gateway** (v0.15). The gateway resolves the role's explicit binding and calls exactly that provider+model — no routing, no fallback. See [Model Gateway (v0.15)](#model-gateway-v015) for the architecture.
+
+**Why three models?**
 - The planning step is high-frequency, low-stakes, and benefits from speed. A 7B model responds 5–10× faster than a 70B model and costs 10× less per token.
 - The coding step is low-frequency, high-stakes, and benefits from depth. You want the big model thinking carefully, not the small model rushing.
+- The visual-review step is rare and benefits from a multimodal-capable model. It only joins the loop for UI tasks and degrades gracefully when the role is unset or unreachable.
 - Context pollution: if the small model goes off the rails, the big model never sees the bad reasoning — it only sees the clean plan.
 
 ### Multi-agent pipeline
@@ -538,7 +655,7 @@ aether exits non-zero if it finds Critical-severity issues. Use it as a merge ga
 | **Bring your own API key** | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | **Works with any OpenAI-compatible API** | ✅ | ❌ (Cursor-only) | ❌ | partial | ❌ | ✅ |
 | **Persistent memory** | ✅ graph + vector + kv | ✅ (paid) | ✅ | partial | partial | ✅ |
-| **Two-LLM routing (cost-aware)** | ✅ built-in | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **Three-LLM explicit role binding (no routing)** | ✅ built-in | ❌ | ❌ | ❌ | ❌ | ✅ |
 | **Multi-agent verification** | ✅ Tester + Reviewer + Security | ❌ | partial | ❌ | ❌ | ✅ |
 | **Loop engineering (no infinite retries)** | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | **Visual screenshot loop** | ✅ optional | partial | ❌ | ❌ | ❌ | ❌ |
@@ -550,7 +667,7 @@ aether exits non-zero if it finds Critical-severity issues. Use it as a merge ga
 | **No telemetry** | ✅ | ❌ | ❌ | partial | ❌ | ✅ |
 | **Fully offline (local model)** | ✅ Ollama/vLLM | ❌ | ❌ | ✅ (with local model) | ❌ | ✅ |
 
-aether's differentiators: **open-source two-LLM design**, **persistent hybrid memory that actually persists across sessions**, **opt-in visual review loop**, and a **single 5 MB binary**.
+aether's differentiators: **open-source three-LLM design with explicit role binding (no routing)**, **persistent hybrid memory that actually persists across sessions**, **opt-in visual review loop**, and a **single 5 MB binary**.
 
 ---
 
@@ -610,6 +727,16 @@ aether --debug                # verbose tracing
 │  └─ visual · 3rd-LLM screenshot  │
 └──────────────┬──────────────────┘
                │
+┌──────────────▼──────────────────┐
+│ crates/aether-gateway (v0.15)    │
+│  ├─ explicit per-role bindings   │
+│  ├─ capability pre-check         │
+│  ├─ failure classification       │
+│  ├─ validation + fingerprint     │
+│  ├─ concurrency / timeouts       │
+│  └─ RoleProvider adapter         │
+└──────────────┬──────────────────┘
+               │
 ┌──────┬───────┴────────┬─────────────┐
 │      │                │             │
 ▼      ▼                ▼             ▼
@@ -618,7 +745,7 @@ models  tools         sessions       mind
 compat)  git, MCP)     traces)      + kv + skills)
 ```
 
-All crates are MIT-licensed, Rust edition 2021. 14 workspace crates, ~20k Rust LOC, 170+ unit tests.
+All crates are MIT-licensed, Rust edition 2021. 15 workspace crates, ~22k Rust LOC, 210+ unit tests.
 
 ---
 
@@ -668,7 +795,7 @@ Yes, with a local model endpoint (Ollama, LM Studio, vLLM, llama.cpp). Set `[per
 Not yet — on the roadmap. aether is editor-agnostic; today you launch it from a terminal, the Start Menu, or via `--background` from any editor.
 
 **How is aether different from opencode?**
-Both are open-source OpenAI-compatible agents. aether adds: a hard-enforced two-LLM split (opencode has this too but it's softer), an explicit loop-engineering state machine with a circuit breaker, an opt-in visual-review loop with screenshot capture, and a Windows NSIS installer shipped by default.
+Both are open-source OpenAI-compatible agents. aether adds: an explicit per-role three-LLM design with a central Model Gateway and zero intelligent routing (opencode has a softer version of this), an explicit loop-engineering state machine with a circuit breaker, an opt-in visual-review loop with screenshot capture, and a Windows NSIS installer shipped by default.
 
 **How is aether different from Cline?**
 Cline is a VS Code extension; aether is a standalone app + CLI + TUI + MCP server. Cline has no persistent memory layer; aether does (graph + vector + kv). Cline uses one LLM for everything; aether uses two by default and optionally three for visual review.
