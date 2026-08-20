@@ -6,19 +6,17 @@
 //! Responsibilities:
 //!   * Read/write `~/.aether/config.toml` from the Settings screen.
 //!   * List past sessions from `~/.aether/sessions.db` for the History sidebar.
-//!   * Run a task by spawning the bundled `aether.exe` child process and
-//!     streaming its stdout/stderr to the frontend via `task-output` events.
+//!   * Run a task by calling the shared `aether-cli::run_task` library
+//!     in-process. No subprocess, no visible CLI window, no PATH dependency.
+//!     Output is streamed to the frontend via `task-output` events.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 
 use aether_analysis::AnalysisProvider as _;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::Mutex;
 
 mod background;
@@ -268,10 +266,22 @@ struct RunHandle {
 
 #[derive(Default)]
 struct RunState {
-    /// Map of session_id -> child PID for cancellation.
-    running: Mutex<HashMap<String, u32>>,
+    /// Map of session_id -> cancel handle. Notify wakes the agent loop,
+    /// which returns at the next iteration boundary. Owned by the spawned
+    /// task; the desktop keeps one entry per active run so the UI can cancel.
+    running: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
+/// Run an AETHER task in-process. The agent loop is shared with the CLI
+/// binary (`aether-cli::run_task`) so there is no subprocess to spawn, no
+/// console window to hide, and no bundled `aether-cli.exe` to locate. The
+/// `task-output` and `task-exit` events keep the existing frontend wire
+/// format, so the UI does not change.
+///
+/// The agent loop holds non-`Send` state (rusqlite Connection, the optional
+/// visual `CorrectionExecutor`), so we run it on a dedicated single-thread
+/// tokio runtime in its own OS thread — mirroring the TUI pattern. Events
+/// are bridged back to the Tauri runtime via an `mpsc::channel`.
 #[tauri::command]
 async fn run_task(
     app: AppHandle,
@@ -280,17 +290,9 @@ async fn run_task(
     plan: Option<bool>,
 ) -> Result<RunHandle, String> {
     if task.trim().is_empty() {
-        return Err("task is empty".into());
+        return Err("Task is empty.".into());
     }
     let plan = plan.unwrap_or(false);
-    let exe = locate_aether_binary(&app).ok_or_else(|| {
-        "could not locate aether-cli.exe. The aether desktop app needs the aether CLI to run tasks. \
-         If you installed aether from the NSIS installer, the CLI should be at \
-         C:\\Program Files\\aether\\aether-cli.exe. If you installed from a portable zip, place \
-         aether.exe in the same directory as aether-desktop.exe, or add aether.exe to your PATH. \
-         You can also set the AETHER_CLI_PATH environment variable to point at the CLI."
-            .to_string()
-    })?;
 
     let session_id = format!(
         "desktop-{}-{}",
@@ -298,83 +300,136 @@ async fn run_task(
         uuid::Uuid::new_v4().simple()
     );
 
-    let mut cmd = Command::new(&exe);
-    cmd.arg(&task)
-        .arg("--session-id")
-        .arg(&session_id)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if plan {
-        cmd.arg("--plan");
-    }
-    #[cfg(windows)]
-    {
-        cmd.creation_flags(0x00000008); // DETACHED_PROCESS
-    }
-    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-    let pid = child.id().unwrap_or(0);
-
-    let stdout = child.stdout.take().ok_or("no stdout")?;
-    let stderr = child.stderr.take().ok_or("no stderr")?;
-
-    // Track this run so the frontend can cancel it.
+    let cancel = Arc::new(tokio::sync::Notify::new());
     {
         let mut runs = state.running.lock().await;
-        runs.insert(session_id.clone(), pid);
+        runs.insert(session_id.clone(), cancel.clone());
     }
 
-    let app_out = app.clone();
-    let sid_out = session_id.clone();
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let _ = app_out.emit(
-                "task-output",
-                TaskOutput {
-                    session_id: sid_out.clone(),
-                    stream: "stdout".into(),
-                    line,
-                },
-            );
-        }
-    });
+    let opts = aether_cli::run_task::RunOptions {
+        task: Some(task),
+        plan,
+        ..Default::default()
+    };
 
-    let app_err = app.clone();
-    let sid_err = session_id.clone();
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let _ = app_err.emit(
-                "task-output",
-                TaskOutput {
-                    session_id: sid_err.clone(),
-                    stream: "stderr".into(),
-                    line,
-                },
-            );
-        }
-    });
-
-    let app_done = app.clone();
-    let sid_done = session_id.clone();
-    let state_done = state.inner().clone();
-    tokio::spawn(async move {
-        let status = child.wait().await;
+    // Bridge: a dedicated thread runs the agent (single-thread tokio runtime
+    // because `Agent::run` holds non-Send state). Events flow through a
+    // tokio mpsc channel; the Tauri side has a `tokio::spawn` that drains
+    // the channel and emits Tauri events on this runtime.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TaskEventBridge>(64);
+    let tx_for_sink = tx.clone();
+    let cancel_for_thread = cancel.clone();
+    let app_for_bridge = app.clone();
+    let sid_for_bridge = session_id.clone();
+    let state_for_bridge = state.inner().clone();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
         {
-            let mut runs = state_done.running.lock().await;
-            runs.remove(&sid_done);
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx_for_sink.blocking_send(TaskEventBridge::Failed(format!(
+                    "backend runtime init failed: {e}"
+                )));
+                return;
+            }
+        };
+        let sink: Arc<dyn Fn(aether_cli::run_task::TaskEvent) + Send + Sync> =
+            Arc::new(move |e| {
+                let _ = tx_for_sink.blocking_send(TaskEventBridge::Agent(e));
+            });
+        let outcome = rt.block_on(async move {
+            aether_cli::run_task::run(opts, cancel_for_thread, sink).await
+        });
+        let exit = match outcome {
+            Ok(()) => TaskEventBridge::Exit { code: 0, success: true },
+            Err(e) => TaskEventBridge::Failed(format!("backend failed: {e}")),
+        };
+        let _ = tx.blocking_send(exit);
+    });
+
+    // Drain events on the Tauri runtime and emit Tauri events.
+    let app_emit = app_for_bridge.clone();
+    let sid_emit = sid_for_bridge.clone();
+    let state_emit = state_for_bridge.clone();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            match event {
+                TaskEventBridge::Agent(aether_cli::run_task::TaskEvent::Line {
+                    stream,
+                    line,
+                }) => {
+                    let _ = app_emit.emit(
+                        "task-output",
+                        TaskOutput {
+                            session_id: sid_emit.clone(),
+                            stream: stream.to_string(),
+                            line,
+                        },
+                    );
+                }
+                TaskEventBridge::Agent(aether_cli::run_task::TaskEvent::Error { message }) => {
+                    let _ = app_emit.emit(
+                        "task-output",
+                        TaskOutput {
+                            session_id: sid_emit.clone(),
+                            stream: "stderr".into(),
+                            line: format!("error: {message}"),
+                        },
+                    );
+                }
+                TaskEventBridge::Agent(aether_cli::run_task::TaskEvent::Exit { .. }) => {}
+                TaskEventBridge::Exit { code, success } => {
+                    {
+                        let mut runs = state_emit.running.lock().await;
+                        runs.remove(&sid_emit);
+                    }
+                    let _ = app_emit.emit(
+                        "task-exit",
+                        TaskExit {
+                            session_id: sid_emit.clone(),
+                            code: Some(code),
+                            success,
+                        },
+                    );
+                    break;
+                }
+                TaskEventBridge::Failed(msg) => {
+                    {
+                        let mut runs = state_emit.running.lock().await;
+                        runs.remove(&sid_emit);
+                    }
+                    let _ = app_emit.emit(
+                        "task-output",
+                        TaskOutput {
+                            session_id: sid_emit.clone(),
+                            stream: "stderr".into(),
+                            line: msg.clone(),
+                        },
+                    );
+                    let _ = app_emit.emit(
+                        "task-exit",
+                        TaskExit {
+                            session_id: sid_emit.clone(),
+                            code: Some(1),
+                            success: false,
+                        },
+                    );
+                    break;
+                }
+            }
         }
-        let _ = app_done.emit(
-            "task-exit",
-            TaskExit {
-                session_id: sid_done,
-                code: status.as_ref().map(|s| s.code()).unwrap_or(None),
-                success: status.as_ref().map(|s| s.success()).unwrap_or(false),
-            },
-        );
     });
 
     Ok(RunHandle { session_id })
+}
+
+/// Internal bridge payload between the agent thread and the Tauri runtime.
+enum TaskEventBridge {
+    Agent(aether_cli::run_task::TaskEvent),
+    Exit { code: i32, success: bool },
+    Failed(String),
 }
 
 #[derive(Serialize, Clone)]
@@ -391,114 +446,46 @@ struct TaskExit {
     success: bool,
 }
 
+/// Cancel a running task. The agent loop checks the cancel handle at every
+/// iteration boundary and returns with a `[cancelled by caller]` result.
 #[tauri::command]
 async fn cancel_task(state: State<'_, Arc<RunState>>, session_id: String) -> Result<bool, String> {
     let mut runs = state.running.lock().await;
-    if let Some(pid) = runs.remove(&session_id) {
-        #[cfg(windows)]
-        {
-            // Best-effort terminate via taskkill.
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/F", "/T"])
-                .output()
-                .await;
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = nix_signal(pid);
-        }
+    if let Some(handle) = runs.remove(&session_id) {
+        handle.notify_waiters();
         Ok(true)
     } else {
         Ok(false)
     }
 }
 
-#[cfg(not(windows))]
-fn nix_signal(_pid: u32) {}
-
-// Locate the bundled `aether-cli.exe` (the CLI). On a Windows NSIS install
-// the Tauri app exe is renamed to `aether.exe`, so the CLI ships under a
-// distinct name (`aether-cli.exe`) to avoid filename collision. We probe every
-// plausible location: parent of the running app exe, the Tauri resource
-// directory, the `resources/` subdir of the install dir, and finally the
-// system PATH. The `.exe`/`.com` suffix is added automatically by Tauri's
-// resource resolver on Windows.
-fn locate_aether_binary(app: &AppHandle) -> Option<PathBuf> {
-    // 0. Explicit override via env var (escape hatch).
-    if let Ok(p) = std::env::var("AETHER_CLI_PATH") {
-        let cand = PathBuf::from(p);
-        if cand.exists() {
-            return Some(cand);
-        }
-    }
-
-    // Order matters: check the install-root CLI name first (v0.9.1+), then the
-    // generic name (in case the user dropped `aether.exe` alongside manually),
-    // then PATH.
-    let names = ["aether-cli", "aether-cli.exe", "aether", "aether.exe"];
-
-    // 1. Next to the running Tauri app exe (typical NSIS install layout).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for name in &names {
-                let cand = dir.join(name);
-                if cand.exists() {
-                    return Some(cand);
-                }
-            }
-            // 2. <install-dir>/resources/ — Tauri 2 alternative resource layout.
-            let res_dir = dir.join("resources");
-            if res_dir.is_dir() {
-                for name in &names {
-                    let cand = res_dir.join(name);
-                    if cand.exists() {
-                        return Some(cand);
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Tauri's resource API (resolves under BaseDirectory::Resource).
-    for name in &names {
-        if let Ok(p) = app.path().resolve(name, tauri::path::BaseDirectory::Resource) {
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-
-    // 4. System PATH (handles dev mode where `aether` is on PATH).
-    which::which("aether").ok()
-}
-
 #[tauri::command]
 fn aether_dir_str() -> String { aether_dir().display().to_string() }
 
+/// Returns the agent's runtime status. Replaces the legacy `/locate` slash
+/// command — the desktop now drives the agent in-process, so there is no
+/// bundled CLI binary to locate.
 #[derive(Serialize)]
-struct LocateResult {
-    found: Option<String>,
-    searched: Vec<String>,
+struct AgentStatus {
+    /// Where the on-disk config is loaded from.
+    config_path: String,
+    /// Whether it exists. If false, the user needs to configure the desktop.
+    config_exists: bool,
+    /// AETHER backend version.
+    version: String,
+    /// Internal architecture marker.
+    backend: &'static str,
 }
 
 #[tauri::command]
-fn locate_cli(app: AppHandle) -> LocateResult {
-    let mut searched = Vec::new();
-    let names = ["aether-cli", "aether-cli.exe", "aether", "aether.exe"];
-
-    if let Ok(p) = std::env::var("AETHER_CLI_PATH") {
-        searched.push(format!("AETHER_CLI_PATH={p}"));
+fn backend_status() -> AgentStatus {
+    let path = config_path();
+    AgentStatus {
+        config_path: path.display().to_string(),
+        config_exists: path.exists(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        backend: "in-process shared library (aether-cli::run_task)",
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for name in &names {
-                searched.push(dir.join(name).display().to_string());
-            }
-            searched.push(dir.join("resources").display().to_string() + "/*");
-        }
-    }
-    let found = locate_aether_binary(&app).map(|p| p.display().to_string());
-    LocateResult { found, searched }
 }
 
 #[tauri::command]
@@ -1139,7 +1126,6 @@ async fn analysis_diff(
 fn main() {
     let state = Arc::new(RunState::default());
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .manage(state)
         .setup(|_app| Ok(()))
         .invoke_handler(tauri::generate_handler![
@@ -1151,7 +1137,7 @@ fn main() {
             cancel_task,
             aether_dir_str,
             version,
-            locate_cli,
+            backend_status,
             get_background,
             set_background_image,
             required_background_resolution,

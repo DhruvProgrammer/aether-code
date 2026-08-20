@@ -71,6 +71,9 @@ pub struct Agent {
     /// Agent-aware context workspace (v0.13): per-agent contexts + shared
     /// global segments.
     context_workspace: Option<Arc<aether_context::ContextWorkspace>>,
+    /// External cancel signal. When notified, the agent loop returns at the
+    /// next iteration boundary. Used by the desktop to abort in-process runs.
+    cancel: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Agent {
@@ -124,6 +127,7 @@ impl Agent {
             plugins: None,
             evidence: None,
             context_workspace: None,
+            cancel: None,
         }
     }
 
@@ -152,6 +156,13 @@ impl Agent {
     }
     pub fn with_context_workspace(mut self, w: Arc<aether_context::ContextWorkspace>) -> Self {
         self.context_workspace = Some(w);
+        self
+    }
+
+    /// Inject an external cancellation handle. The agent loop returns at the
+    /// next iteration boundary once the handle is notified.
+    pub fn with_cancel(mut self, handle: Arc<tokio::sync::Notify>) -> Self {
+        self.cancel = Some(handle);
         self
     }
 
@@ -344,6 +355,12 @@ impl Agent {
 
         // --- Closed loop: plan → execute → verify → (re)plan --------------------
         for iter in 0..loop_budget {
+            if let Some(c) = &self.cancel {
+                if tokio::time::timeout(std::time::Duration::ZERO, c.notified()).await.is_ok() {
+                    final_result = "[cancelled by caller]".into();
+                    break;
+                }
+            }
             eng.model.iteration = iter;
             let cycle_task: String = match &prev_result {
                 None => plan_context.clone(),

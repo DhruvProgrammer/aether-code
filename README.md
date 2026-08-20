@@ -143,10 +143,10 @@ To build the desktop installer:
 
 ```bash
 cargo install tauri-cli --version "^2.0" --locked
-cargo build --release -p aether-cli --bins
-mkdir -p crates/aether-desktop/binaries && cp target/release/aether.exe crates/aether-desktop/binaries/
 cargo tauri build --bundles nsis
 ```
+
+The desktop app embeds the aether engine in-process — no bundled CLI binary, no PATH dependency, no console window.
 
 ---
 

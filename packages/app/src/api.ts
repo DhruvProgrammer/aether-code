@@ -246,7 +246,7 @@ export const api = {
   cancelTask: (session_id: string) => invoke<boolean>("cancel_task", { sessionId: session_id }),
   aetherDir: () => invoke<string>("aether_dir_str"),
   version: () => invoke<string>("version"),
-  locateCli: () => invoke<{ found: string | null; searched: string[] }>("locate_cli"),
+  backendStatus: () => invoke<{ mode: string; ready: boolean }>("backend_status"),
   getBackground: () => invoke<BackgroundPayload>("get_background"),
   setBackgroundImage: (bytes: number[]) =>
     invoke<BackgroundValidation>("set_background_image", { bytes }),

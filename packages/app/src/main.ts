@@ -252,7 +252,7 @@ async function send() {
         "/history      Open the History modal",
         "/cancel       Cancel the running task",
         "/new          Start a new tab",
-        "/locate       Show where the aether CLI was found",
+        "/status       Show internal backend status",
       ].join("\n"),
     });
     renderAll();
@@ -273,13 +273,12 @@ async function send() {
     }
     return;
   }
-  if (text === "/locate") {
+  if (text === "/status") {
     try {
-      const r = await api.locateCli();
-      const found = r.found ? `Found: ${r.found}` : "Not found.";
-      s.blocks.push({ id: newId(s), kind: "info", text: `${found}\nSearched:\n  ${r.searched.join("\n  ")}` });
+      const r = await api.backendStatus();
+      s.blocks.push({ id: newId(s), kind: "info", text: `Backend: ${r.mode} (${r.ready ? "ready" : "not ready"})` });
     } catch (e) {
-      s.blocks.push({ id: newId(s), kind: "error", text: `locate failed: ${String(e)}` });
+      s.blocks.push({ id: newId(s), kind: "error", text: `status failed: ${String(e)}` });
     }
     renderAll();
     return;

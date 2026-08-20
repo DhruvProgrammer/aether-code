@@ -45,19 +45,6 @@ jobs:
         run: npm run build
         working-directory: packages/app
 
-      - name: Build aether CLI (release)
-        run: cargo build -p aether-cli --release --bins
-
-      - name: Copy CLI into Tauri resources
-        shell: bash
-        run: |
-          mkdir -p crates/aether-desktop/binaries
-          # Rename the CLI to aether-cli.exe so it doesn't collide with the
-          # Tauri app exe (which NSIS installs as aether.exe at the install
-          # root).
-          cp target/release/aether.exe crates/aether-desktop/binaries/aether-cli.exe
-          cp target/release/aether-mcp.exe crates/aether-desktop/binaries/aether-mcp.exe
-
       - name: Stage frontend dist for Tauri
         shell: bash
         run: |
