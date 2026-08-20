@@ -96,6 +96,45 @@
       <div id="bg-fade"></div>
     </div>
 
+    <!-- BEGIN: Workspace Home Screen (shown when no workspace is active) -->
+    <div id="workspace-home" class="fixed inset-0 z-40 flex items-center justify-center" style="display:none">
+      <div class="max-w-lg w-full mx-4">
+        <div class="text-center mb-8">
+          <h1 class="text-2xl font-semibold text-app-brand mb-2">AETHER</h1>
+          <p class="text-app-textSecondary text-sm" id="ws-home-subtitle">Select a folder to start working.</p>
+        </div>
+        <div id="ws-recent-list" class="space-y-2 mb-6"></div>
+        <div class="text-center">
+          <button id="ws-select-folder-btn" class="inline-flex items-center space-x-2 bg-app-brand text-app-bg font-semibold px-5 py-2.5 rounded-lg text-sm hover:opacity-90 transition-opacity">
+            <i class="w-4 h-4" data-lucide="folder-open"></i>
+            <span>Select Folder</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- BEGIN: Workspace Sidebar (shown when a workspace is active) -->
+    <div id="workspace-sidebar" class="fixed left-0 top-10 bottom-0 w-64 bg-app-surface border-r border-app-border z-30 flex-col" style="display:none">
+      <div class="p-4 border-b border-app-border">
+        <div class="flex items-center justify-between">
+          <div class="min-w-0">
+            <div id="ws-sidebar-name" class="text-sm font-semibold text-app-textPrimary truncate">Workspace</div>
+            <div id="ws-sidebar-path" class="text-xs text-app-textSecondary truncate font-mono"></div>
+          </div>
+          <button id="ws-switch-btn" class="text-app-textSecondary hover:text-app-brand shrink-0 ml-2" title="Switch folder">
+            <i class="w-4 h-4" data-lucide="folder-open"></i>
+          </button>
+        </div>
+      </div>
+      <div class="p-3">
+        <button id="ws-new-session-btn" class="w-full flex items-center space-x-2 text-xs text-app-textSecondary hover:text-app-brand border border-app-border rounded px-3 py-2 hover:border-app-brand transition-colors">
+          <i class="w-3.5 h-3.5" data-lucide="plus"></i>
+          <span>New Session</span>
+        </button>
+      </div>
+      <div id="ws-session-list" class="flex-1 overflow-y-auto px-3 pb-3 space-y-1"></div>
+    </div>
+
     <!-- BEGIN: Top Window Controls -->
     <div class="h-10 bg-app-topbar border-b border-app-border flex items-center justify-between px-3 shrink-0">
       <div class="flex items-center space-x-4">

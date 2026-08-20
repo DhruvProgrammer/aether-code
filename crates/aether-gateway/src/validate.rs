@@ -220,4 +220,34 @@ mod tests {
         assert!(!o.ok);
         assert!(o.detail.contains("rate-limited"));
     }
+
+    #[tokio::test]
+    async fn validation_classifies_connection_refused_without_hanging() {
+        // Real network attempt to a dead port — must classify quickly, never
+        // hang the settings UI, and never expose the key.
+        std::env::set_var("GW_TEST_CONN_REFUSED_KEY", "sk-test-not-exposed");
+        let t = ValidateTarget {
+            role: Role::Executor,
+            model_key: "m".into(),
+            provider_id: "openai_compatible".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model_id: "gpt".into(),
+            api_key_env: "GW_TEST_CONN_REFUSED_KEY".into(),
+            extra_body: None,
+        };
+        let started = std::time::Instant::now();
+        let out = validate_binding(&t).await;
+        assert!(started.elapsed().as_secs() < 15, "validation must not hang");
+        assert!(!out.ok);
+        assert!(out.snapshot.is_none());
+        assert!(
+            matches!(
+                out.class,
+                Some(FailureClass::InvalidBaseUrl) | Some(FailureClass::EndpointUnavailable) | Some(FailureClass::NetworkFailure)
+            ),
+            "expected a connection failure class, got {:?}",
+            out.class
+        );
+        assert!(!out.detail.contains("sk-test-not-exposed"), "key must never leak into error detail");
+    }
 }

@@ -31,6 +31,8 @@ aether-sessions = { path = "../aether-sessions" }
 aether-analysis = { path = "../aether-analysis" }
 aether-gateway = { path = "../aether-gateway" }
 aether-cli = { path = "../aether-cli" }
+aether-workspace = { path = "../aether-workspace" }
+rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
 dirs = "5"

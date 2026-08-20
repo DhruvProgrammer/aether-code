@@ -70,6 +70,7 @@ impl Cli {
             session_id: self.session_id.clone(),
             config: self.config.clone(),
             tui: self.tui,
+            ..Default::default()
         }
     }
 }
@@ -107,7 +108,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
     let cancel = Arc::new(Notify::new());
     let opts = cli.to_run_options();
-    let sink: Arc<dyn Fn(TaskEvent) + Send + Sync> = Arc::new(|e| match e {
+    let exit_state: Arc<std::sync::Mutex<(i32, bool)>> = Arc::new(std::sync::Mutex::new((0, true)));
+    let sink_state = exit_state.clone();
+    let sink: Arc<dyn Fn(TaskEvent) + Send + Sync> = Arc::new(move |e| match e {
         TaskEvent::Line { stream, line } => {
             if stream == "stderr" {
                 let _ = std::io::stderr().write_all(line.as_bytes());
@@ -117,9 +120,19 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let _ = std::io::stdout().write_all(b"\n");
             }
         }
-        TaskEvent::Exit { .. } | TaskEvent::Error { .. } => {}
+        TaskEvent::Error { message } => {
+            let _ = std::io::stderr().write_all(format!("error: {message}\n").as_bytes());
+        }
+        TaskEvent::Exit { code, success } => {
+            *sink_state.lock().unwrap() = (code, success);
+        }
     });
-    run(opts, cancel, sink).await
+    run(opts, cancel, sink).await?;
+    let (code, success) = *exit_state.lock().unwrap();
+    if !success || code != 0 {
+        std::process::exit(if code == 0 { 1 } else { code });
+    }
+    Ok(())
 }
 
 fn pause_if_terminal() {

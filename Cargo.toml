@@ -16,6 +16,7 @@ members = [
     "crates/aether-evidence",
     "crates/aether-analysis",
     "crates/aether-gateway",
+    "crates/aether-workspace",
 ]
 
 [workspace.package]

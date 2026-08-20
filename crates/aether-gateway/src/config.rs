@@ -1,14 +1,16 @@
-//! Gateway assembly from `config.toml` (spec §3, §17).
+//! Gateway assembly from `config.toml` (spec §3, §17) and from the v0.17
+//! provider registry with per-session role assignments.
 //!
 //! The single place where AETHER's three roles are bound to concrete
 //! providers. Bindings come from the `[agent]` role keys (model1/model2/
-//! model3) pointing into the `[models]` map. Each role gets its own
+//! model3) pointing into the `[models]` map, or from explicit per-session
+//! role assignments referencing the provider registry. Each role gets its own
 //! provider instance — no shared hidden routing.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aether_config::Config;
+use aether_config::{Config, ProviderEntry, RoleAssignments};
 use aether_models::ModelProvider;
 
 use crate::capability::ModelCapabilities;
@@ -131,6 +133,100 @@ impl GatewayBundle {
         Ok(Self { gateway, providers, controller })
     }
 
+    /// Assemble role bindings from the v0.17 provider registry and a
+    /// per-session [`RoleAssignments`]. This is the new architecture: the
+    /// session explicitly chooses which provider/model performs each role.
+    ///
+    /// * Executor and Controller are required — a missing binding is a
+    ///   configuration error that aborts startup.
+    /// * Reviewer is optional and degrades gracefully.
+    ///
+    /// No routing, no fallback, no automatic selection. The user's explicit
+    /// choice is executed.
+    pub fn from_providers(
+        registry: &[ProviderEntry],
+        assignments: &RoleAssignments,
+        gateway_config: GatewayConfig,
+    ) -> Result<Self, GatewayError> {
+        let find = |provider_id: &str, model_id: &str| -> Result<(String, aether_config::ModelConfig), GatewayError> {
+            let prov = registry
+                .iter()
+                .find(|p| p.id == provider_id)
+                .ok_or_else(|| GatewayError::CapabilityDenied {
+                    role: provider_id.into(),
+                    class: FailureClass::UnknownProvider,
+                    detail: format!("provider '{provider_id}' not found in registry"),
+                })?;
+            let mc = prov.to_model_config(model_id).ok_or_else(|| GatewayError::CapabilityDenied {
+                role: model_id.into(),
+                class: FailureClass::UnknownProvider,
+                detail: format!("model '{model_id}' not found in provider '{provider_id}'"),
+            })?;
+            Ok((format!("{provider_id}/{model_id}"), mc))
+        };
+
+        let mut bindings = Vec::new();
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        let mut model_ids: HashMap<String, String> = HashMap::new();
+        let mut provider_ids: HashMap<String, String> = HashMap::new();
+        let mut capabilities: HashMap<String, ModelCapabilities> = HashMap::new();
+
+        let mut install = |role: Role, key: String, mc: aether_config::ModelConfig| -> Result<(), GatewayError> {
+            match aether_models::build_provider(&mc) {
+                Ok(p) => {
+                    providers.insert(key.clone(), Arc::from(p));
+                    model_ids.insert(key.clone(), mc.model.clone());
+                    provider_ids.insert(key.clone(), mc.provider.clone());
+                    capabilities.insert(key.clone(), ModelCapabilities::permissive());
+                    bindings.push(RoleBinding::new(role, key));
+                    Ok(())
+                }
+                Err(e) => Err(crate::gateway::classify_provider_error(e)),
+            }
+        };
+
+        // Executor (required).
+        let exec = assignments.executor.as_ref().ok_or_else(|| GatewayError::CapabilityDenied {
+            role: Role::Executor.as_str().into(),
+            class: FailureClass::UnknownProvider,
+            detail: "no executor model assigned to this session".into(),
+        })?;
+        let (exec_key, exec_mc) = find(&exec.provider_id, &exec.model_id)?;
+        install(Role::Executor, exec_key, exec_mc)?;
+
+        // Controller (required).
+        let ctrl = assignments.controller.as_ref().ok_or_else(|| GatewayError::CapabilityDenied {
+            role: Role::Controller.as_str().into(),
+            class: FailureClass::UnknownProvider,
+            detail: "no controller model assigned to this session".into(),
+        })?;
+        let (ctrl_key, ctrl_mc) = find(&ctrl.provider_id, &ctrl.model_id)?;
+        install(Role::Controller, ctrl_key.clone(), ctrl_mc)?;
+
+        // Reviewer (optional).
+        if let Some(rev) = &assignments.reviewer {
+            if let Ok((rev_key, rev_mc)) = find(&rev.provider_id, &rev.model_id) {
+                let _ = install(Role::Reviewer, rev_key, rev_mc);
+            }
+        }
+
+        let gateway = ModelGateway::new(
+            gateway_config,
+            &bindings,
+            &providers,
+            &model_ids,
+            &provider_ids,
+            &capabilities,
+        );
+
+        let controller = providers
+            .get(&ctrl_key)
+            .cloned()
+            .ok_or_else(|| GatewayError::NotConfigured(Role::Controller.as_str().into()))?;
+
+        Ok(Self { gateway, providers, controller })
+    }
+
     /// Build a [`ValidateTarget`] for live API validation of one role's
     /// configured model. Returns None only if the role has no binding.
     pub fn validate_target(cfg: &Config, role: Role) -> Option<ValidateTarget> {
@@ -238,5 +334,79 @@ mod tests {
         let bundle = GatewayBundle::from_config(&cfg, GatewayConfig::default()).unwrap();
         assert!(!bundle.gateway.is_configured(Role::Reviewer));
         assert!(bundle.gateway.is_configured(Role::Executor));
+    }
+
+    // ---- v0.17 from_providers tests ----
+
+    fn test_registry() -> Vec<aether_config::ProviderEntry> {
+        vec![
+            aether_config::ProviderEntry {
+                id: "nvidia".into(),
+                display_name: "NVIDIA".into(),
+                protocol: "openai_compatible".into(),
+                base_url: "https://nvidia.example/v1".into(),
+                api_key_env: "GW_FP_NVIDIA".into(),
+                headers: None,
+                extra_body: None,
+                models: vec![
+                    aether_config::ModelEntry { id: "model-a".into(), display_name: "Model A".into(), vision: false, tool_calling: true, streaming: true, context_window: None, max_output_tokens: None },
+                    aether_config::ModelEntry { id: "model-b".into(), display_name: "Model B".into(), vision: false, tool_calling: true, streaming: true, context_window: None, max_output_tokens: None },
+                ],
+            },
+            aether_config::ProviderEntry {
+                id: "openrouter".into(),
+                display_name: "OpenRouter".into(),
+                protocol: "openai_compatible".into(),
+                base_url: "https://openrouter.example/v1".into(),
+                api_key_env: "GW_FP_OPENROUTER".into(),
+                headers: None,
+                extra_body: None,
+                models: vec![
+                    aether_config::ModelEntry { id: "model-c".into(), display_name: "Model C".into(), vision: false, tool_calling: true, streaming: true, context_window: None, max_output_tokens: None },
+                    aether_config::ModelEntry { id: "model-d".into(), display_name: "Model D".into(), vision: false, tool_calling: true, streaming: true, context_window: None, max_output_tokens: None },
+                ],
+            },
+        ]
+    }
+
+    #[test]
+    fn from_providers_builds_explicit_session_bindings() {
+        std::env::set_var("GW_FP_NVIDIA", "sk-test");
+        std::env::set_var("GW_FP_OPENROUTER", "sk-test");
+        let registry = test_registry();
+        let assignments = aether_config::RoleAssignments {
+            executor: Some(aether_config::RoleBinding { provider_id: "nvidia".into(), model_id: "model-a".into() }),
+            controller: Some(aether_config::RoleBinding { provider_id: "openrouter".into(), model_id: "model-d".into() }),
+            reviewer: None,
+        };
+        let bundle = GatewayBundle::from_providers(&registry, &assignments, GatewayConfig::default()).unwrap();
+        assert!(bundle.gateway.is_configured(Role::Executor));
+        assert!(bundle.gateway.is_configured(Role::Controller));
+        assert!(!bundle.gateway.is_configured(Role::Reviewer));
+        assert_eq!(bundle.providers.len(), 2);
+    }
+
+    #[test]
+    fn from_providers_missing_executor_fails() {
+        let registry = test_registry();
+        let assignments = aether_config::RoleAssignments {
+            executor: None,
+            controller: Some(aether_config::RoleBinding { provider_id: "openrouter".into(), model_id: "model-c".into() }),
+            reviewer: None,
+        };
+        let err = GatewayBundle::from_providers(&registry, &assignments, GatewayConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("executor"));
+    }
+
+    #[test]
+    fn from_providers_unknown_model_fails() {
+        let registry = test_registry();
+        let assignments = aether_config::RoleAssignments {
+            executor: Some(aether_config::RoleBinding { provider_id: "nvidia".into(), model_id: "does-not-exist".into() }),
+            controller: Some(aether_config::RoleBinding { provider_id: "openrouter".into(), model_id: "model-c".into() }),
+            reviewer: None,
+        };
+        let err = GatewayBundle::from_providers(&registry, &assignments, GatewayConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("does-not-exist"));
     }
 }

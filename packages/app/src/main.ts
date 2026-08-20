@@ -4,8 +4,11 @@ import {
   type TaskExit,
   type TaskOutput,
   type DesktopConfig,
-  type ModelBlock,
   type AppearanceConfig,
+  type WorkspaceDto,
+  type SessionRowDto,
+  type ProviderEntryDto,
+  type RoleAssignmentsDto,
 } from "./api";
 
 // ----- State -----
@@ -32,7 +35,11 @@ const app = {
   tabs: [] as Session[],
   active: 0,
   mode: "build" as "build" | "plan",
-  modelKey: "controller",
+  // v0.17 workspace state
+  workspace: null as WorkspaceDto | null,
+  workspaceSessions: [] as SessionRowDto[],
+  providers: [] as ProviderEntryDto[],
+  roleAssignments: null as RoleAssignmentsDto | null,
 };
 
 function current(): Session {
@@ -156,7 +163,7 @@ function renderHeader() {
     pill.classList.remove("flex");
   }
   document.querySelector("#mode-label")!.textContent = app.mode === "build" ? "Build" : "Plan";
-  document.querySelector("#model-label")!.textContent = app.modelKey;
+  document.querySelector("#model-label")!.textContent = bindingLabel(app.roleAssignments?.executor ?? null);
 }
 
 function renderAll() {
@@ -192,46 +199,23 @@ function newTab() {
 
 let activeUnlistens: (() => void)[] = [];
 
-/** Live-validation fingerprints per role. Filled by "Check API Response". */
-let gatewayValidated: Record<string, { fingerprint: string; class: string | null; detail: string } | null> = {
-  executor: null,
-  controller: null,
-  reviewer: null,
-};
-
-/** Build the config object the gateway validation command expects, from the form. */
-function buildDraftConfig(body: HTMLElement, original: DesktopConfig): DesktopConfig {
-  const slots = { m1: readSlot(body, 1), m2: readSlot(body, 2), m3: readSlot(body, 3) };
-  const providers = collectProviders(body);
-  for (const s of [slots.m1, slots.m2, slots.m3]) {
-    if (s.model_id && !providers[s.model_id]) {
-      providers[s.model_id] = {
-        provider: s.provider,
-        base_url: s.base_url,
-        model: s.model_id,
-        api_key_env: s.api_key || "OPENAI_API_KEY",
-      };
-    }
-  }
-  return {
-    agent: {
-      model1: slots.m1.model_id,
-      model2: slots.m2.model_id,
-      model3: slots.m3.model_id || null,
-      controller_model: slots.m2.model_id || "controller",
-      executor_model: slots.m1.model_id,
-      reviewer_model: slots.m3.model_id || null,
-    },
-    models: providers,
-    frontend: original.frontend,
-    appearance: original.appearance,
-  };
-}
-
 async function send() {
   const input = document.querySelector<HTMLTextAreaElement>("#prompt-input")!;
   const text = input.value.trim();
   if (!text) return;
+
+  // NO_WORKSPACE guard (v0.17): coding tasks require an active workspace.
+  if (!app.workspace) {
+    const s = current();
+    s.blocks.push({
+      id: newId(s),
+      kind: "info",
+      text: "Please select a folder to start working.",
+    });
+    renderAll();
+    void pickFolder();
+    return;
+  }
 
   const s = current();
   s.title = text.slice(0, 40);
@@ -290,7 +274,11 @@ async function send() {
   attachListeners(s);
 
   try {
-    const handle = await api.runTask(text, app.mode === "plan");
+    const handle = await api.runTask(text, app.mode === "plan", {
+      sessionId: s.id,
+      workspacePath: app.workspace?.path,
+      roleAssignmentsJson: app.roleAssignments ? JSON.stringify(app.roleAssignments) : undefined,
+    });
     s.id = handle.session_id;
   } catch (e) {
     s.running = false;
@@ -385,164 +373,76 @@ function closeModal() {
 //                     absent.
 //
 //   APPEARANCE      — native AETHER background image (enabled toggle, live
-//                     preview, opacity slider) and the required-resolution
-//                     gate. The bundled default ships with the application;
-//                     user-supplied images must be exactly 1920x1080 px and
-//                     are validated server-side (spec §13-§14).
+//                     preview, opacity slider, display mode). Any valid image
+//                     is accepted; the renderer adapts to the viewport via
+//                     CSS object-fit (fill/fit/stretch/center).
 //
 // Validation rules (spec §7):
 //   * Model 1 — every field required.
 //   * Model 2/3 — completely empty is VALID; partially configured is INVALID
 //     and the UI shows which field is missing.
 
-interface SlotState {
-  model_id: string;
-  provider: string;
-  base_url: string;
-  api_key: string;
-}
-
-function emptySlot(): SlotState {
-  return { model_id: "", provider: "", base_url: "", api_key: "" };
-}
-
-function buildSlots(cfg: DesktopConfig): { m1: SlotState; m2: SlotState; m3: SlotState } {
-  const m1key = (cfg.agent.model1 || cfg.agent.executor_model || "executor").trim() || "executor";
-  const m2key = (cfg.agent.model2 ?? cfg.agent.controller_model ?? "").trim();
-  const m3key = (cfg.agent.model3 ?? cfg.agent.reviewer_model ?? "").trim();
-
-  const lookup = (key: string): ModelBlock | null => {
-    if (!key) return null;
-    const m = cfg.models[key];
-    if (!m) return null;
-    return m;
-  };
-
-  const fromKey = (key: string): SlotState => {
-    const m = lookup(key);
-    if (!m) return { ...emptySlot(), model_id: key };
-    return {
-      model_id: key,
-      provider: m.provider ?? "",
-      base_url: m.base_url ?? "",
-      api_key: m.api_key_env ?? "",
-    };
-  };
-
-  return {
-    m1: fromKey(m1key),
-    m2: m2key ? fromKey(m2key) : emptySlot(),
-    m3: m3key ? fromKey(m3key) : emptySlot(),
-  };
-}
-
-function renderSlotCard(opts: {
-  slot: 1 | 2 | 3;
-  role: string;
-  required: boolean;
-  state: SlotState;
-}): string {
-  const { slot, role, required, state } = opts;
-  const sfx = String(slot);
-  const pillCls = required ? "role-pill" : "role-pill opt";
-  return `
-    <div class="model-card" data-slot-card="${sfx}">
-      <div class="flex items-center justify-between">
-        <div>
-          <div class="slot-title">MODEL ${sfx}</div>
-          <div class="role-desc">${escapeHtml(role)}</div>
+function renderProviderCatalog(): string {
+  if (app.providers.length === 0) {
+    return `<div class="text-xs text-app-textSecondary italic py-4 text-center">No providers configured yet. Add one below.</div>`;
+  }
+  return app.providers.map((p, idx) => `
+    <div class="model-card" data-provider-card="${idx}">
+      <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center space-x-2">
+          <span class="slot-title">${escapeHtml(p.display_name || p.id)}</span>
+          <span class="role-pill">${escapeHtml(p.protocol)}</span>
         </div>
-        <span class="${pillCls}">${required ? "Required" : "Optional"}</span>
-      </div>
-      <div class="field">
-        <label>Model ID</label>
-        <input data-slot="${sfx}" data-field="model_id" value="${escapeAttr(state.model_id)}" placeholder="e.g. qwen-coder" />
-      </div>
-      <div class="field">
-        <label>Provider</label>
-        <input data-slot="${sfx}" data-field="provider" value="${escapeAttr(state.provider)}" placeholder="openai_compatible" />
-      </div>
-      <div class="field">
-        <label>Base URL</label>
-        <input data-slot="${sfx}" data-field="base_url" value="${escapeAttr(state.base_url)}" placeholder="https://api.example.com/v1" />
-      </div>
-      <div class="field">
-        <label>API Key</label>
-        <input data-slot="${sfx}" data-field="api_key" value="${escapeAttr(state.api_key)}" placeholder="OPENAI_API_KEY" />
-      </div>
-      <div class="mt-2 flex items-center space-x-2">
-        <button type="button" data-gw-check="${sfx}" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary inline-flex items-center">
-          <i class="w-3.5 h-3.5 mr-1" data-lucide="plug"></i> Check API Response
+        <button type="button" data-provider-del="${idx}" class="text-app-textSecondary hover:text-app-error" title="Remove provider">
+          <i class="w-4 h-4" data-lucide="trash-2"></i>
         </button>
-        <span class="text-xs text-app-textSecondary" data-gw-state="${sfx}">not validated</span>
       </div>
-      <div class="text-xs font-mono whitespace-pre-wrap text-app-textSecondary mt-1" data-gw-out="${sfx}"></div>
-      <div class="validation-err" data-slot-err="${sfx}" style="display:none"></div>
-    </div>`;
-}
-
-function renderProviderRow(key: string, m: ModelBlock | null): string {
-  const v = m ?? { provider: "", base_url: "", model: "", api_key_env: "OPENAI_API_KEY" };
-  return `<div class="provider-row" data-prov-row="${escapeAttr(key)}">
-    <input data-prov="key" value="${escapeAttr(key)}" placeholder="provider-id" />
-    <input data-prov="provider" value="${escapeAttr(v.provider)}" placeholder="openai_compatible" />
-    <input data-prov="url" value="${escapeAttr(v.base_url)}" placeholder="https://api.example.com/v1" />
-    <input data-prov="model" value="${escapeAttr(v.model)}" placeholder="model-id" />
-    <input data-prov="env" value="${escapeAttr(v.api_key_env)}" placeholder="OPENAI_API_KEY" />
-    <button type="button" class="text-app-textSecondary hover:text-app-error" data-prov-del title="Remove">
-      <i class="w-4 h-4" data-lucide="trash-2"></i>
-    </button>
-  </div>`;
+      <div class="text-xs text-app-textSecondary font-mono mb-2">${escapeHtml(p.base_url)}</div>
+      <div class="text-xs text-app-textSecondary mb-2">API Key env: <code class="font-mono">${escapeHtml(p.api_key_env)}</code></div>
+      <div class="space-y-1">
+        ${p.models.map((m) => `
+          <div class="flex items-center justify-between text-xs px-2 py-1 bg-app-bg rounded">
+            <span class="text-app-textPrimary font-mono">${escapeHtml(m.display_name || m.id)}</span>
+            <span class="text-app-textSecondary">${m.vision ? "vision" : ""} ${m.tool_calling ? "tools" : ""}</span>
+          </div>
+        `).join("")}
+      </div>
+      <button type="button" data-add-model="${idx}" class="mt-2 text-xs text-app-textSecondary hover:text-app-brand inline-flex items-center">
+        <i class="w-3 h-3 mr-1" data-lucide="plus"></i> Add Model
+      </button>
+    </div>
+  `).join("");
 }
 
 async function renderSettings(cfg: DesktopConfig, path: string): Promise<string> {
-  const slots = buildSlots(cfg);
-  const providerEntries = Object.entries(cfg.models ?? {});
-
-  // Required-resolution label is server-authoritative.
-  let requiredRes = "1920 x 1080 px";
-  try { requiredRes = await api.requiredBackgroundResolution(); } catch { /* default */ }
-
   const appearance: AppearanceConfig = cfg.appearance ?? {
     background_enabled: true,
     background_opacity: 60,
     background_image: null,
+    background_mode: "fill",
   };
+  const bgMode = appearance.background_mode ?? "fill";
 
   return `
     <div class="space-y-1">
       <p class="text-app-textSecondary text-xs">Saved to <code class="font-mono">${escapeHtml(path)}</code></p>
 
-      <!-- ───── AI / MODELS ───── -->
+      <!-- ───── LLM PROVIDERS (v0.17 catalog) ───── -->
       <section class="settings-section">
-        <h3>AI / Models</h3>
-        <p class="text-xs text-app-textSecondary mb-3">Three model slots, provider-independent. Model 1 is required; Model 2 and Model 3 are optional.</p>
-        <div class="settings-grid" id="slots-grid">
-          ${renderSlotCard({ slot: 1, role: "Big Executor", required: true,  state: slots.m1 })}
-          ${renderSlotCard({ slot: 2, role: "Controller",     required: false, state: slots.m2 })}
-          ${renderSlotCard({ slot: 3, role: "Visual Reviewer", required: false, state: slots.m3 })}
+        <h3>LLM Providers</h3>
+        <p class="text-xs text-app-textSecondary mb-3">Add any number of providers. Each provider can have multiple models. Credentials are stored once per provider.</p>
+        <div id="provider-catalog" class="space-y-3">
+          ${renderProviderCatalog()}
         </div>
-      </section>
-
-      <!-- ───── PROVIDERS ───── -->
-      <section class="settings-section">
-        <h3>Providers</h3>
-        <p class="text-xs text-app-textSecondary mb-3">OpenAI-compatible providers. Each contains only the fields AETHER actually uses.</p>
-        <div class="provider-row header">
-          <div>Provider ID</div><div>Type</div><div>Base URL</div><div>Models</div><div>API Key</div><div></div>
-        </div>
-        <div id="providers-body" class="space-y-2 mt-2">
-          ${providerEntries.map(([k, m]) => renderProviderRow(k, m)).join("")}
-        </div>
-        <button id="add-provider" type="button" class="mt-3 text-xs text-app-textSecondary hover:text-app-brand inline-flex items-center">
-          <i class="w-3.5 h-3.5 mr-1" data-lucide="plus"></i> Add provider
+        <button id="add-provider-v2" type="button" class="mt-3 text-xs text-app-textSecondary hover:text-app-brand inline-flex items-center">
+          <i class="w-3.5 h-3.5 mr-1" data-lucide="plus"></i> Add Provider
         </button>
       </section>
 
       <!-- ───── APPEARANCE ───── -->
       <section class="settings-section">
         <h3>Appearance</h3>
-        <p class="text-xs text-app-textSecondary mb-3">Native background image. Ships with a bundled default; user-supplied images must be exactly ${escapeHtml(requiredRes)}.</p>
+        <p class="text-xs text-app-textSecondary mb-3">Upload an image to use as your AETHER background. Any valid image works; it adapts to your window size.</p>
 
         <div class="flex items-center mb-4">
           <div id="bg-toggle" class="toggle ${appearance.background_enabled ? "on" : ""}">
@@ -559,6 +459,16 @@ async function renderSettings(cfg: DesktopConfig, path: string): Promise<string>
           <label class="text-xs uppercase tracking-wide text-app-textSecondary w-20">Opacity</label>
           <input id="bg-opacity" type="range" min="0" max="100" value="${appearance.background_opacity}" class="opacity-slider flex-1" />
           <span id="bg-opacity-label" class="text-xs font-mono w-12 text-right">${appearance.background_opacity}%</span>
+        </div>
+
+        <div class="flex items-center space-x-4 mt-3">
+          <label class="text-xs uppercase tracking-wide text-app-textSecondary w-20">Display</label>
+          <select id="bg-mode" class="bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono text-app-textPrimary">
+            <option value="fill" ${bgMode === "fill" ? "selected" : ""}>Fill (cover)</option>
+            <option value="fit" ${bgMode === "fit" ? "selected" : ""}>Fit (contain)</option>
+            <option value="stretch" ${bgMode === "stretch" ? "selected" : ""}>Stretch</option>
+            <option value="center" ${bgMode === "center" ? "selected" : ""}>Center</option>
+          </select>
         </div>
 
         <div class="mt-3 flex items-center space-x-3">
@@ -645,82 +555,70 @@ async function renderSettings(cfg: DesktopConfig, path: string): Promise<string>
     </div>`;
 }
 
-function readSlot(body: HTMLElement, slot: 1 | 2 | 3): SlotState {
-  const sfx = String(slot);
-  const get = (f: string): string =>
-    body.querySelector<HTMLInputElement>(`input[data-slot="${sfx}"][data-field="${f}"]`)?.value.trim() ?? "";
-  return { model_id: get("model_id"), provider: get("provider"), base_url: get("base_url"), api_key: get("api_key") };
-}
-
-function validateSlots(slots: { m1: SlotState; m2: SlotState; m3: SlotState }): { ok: boolean; errors: Record<number, string> } {
-  const errors: Record<number, string> = {};
-
-  // Model 1 — required, every field must be present.
-  const missing1: string[] = [];
-  if (!slots.m1.model_id)  missing1.push("Model ID");
-  if (!slots.m1.provider)  missing1.push("Provider");
-  if (!slots.m1.base_url)  missing1.push("Base URL");
-  if (!slots.m1.api_key)   missing1.push("API Key");
-  if (missing1.length > 0) errors[1] = `Model 1 (Big Executor) is required. Missing: ${missing1.join(", ")}`;
-
-  // Model 2 — empty is OK; partial is INVALID.
-  const m2keys = ["model_id", "provider", "base_url", "api_key"] as const;
-  const m2nonEmpty = m2keys.filter((k) => slots.m2[k].length > 0).length;
-  if (m2nonEmpty > 0 && m2nonEmpty < m2keys.length) {
-    const missing2 = m2keys.filter((k) => !slots.m2[k]);
-    errors[2] = `Model 2 (Controller) is partially configured. Either fill all fields or leave it empty. Missing: ${missing2.join(", ")}`;
-  }
-
-  // Model 3 — empty is OK; partial is INVALID.
-  const m3nonEmpty = m2keys.filter((k) => slots.m3[k].length > 0).length;
-  if (m3nonEmpty > 0 && m3nonEmpty < m2keys.length) {
-    const missing3 = m2keys.filter((k) => !slots.m3[k]);
-    errors[3] = `Model 3 (Visual Reviewer) is partially configured. Either fill all fields or leave it empty. Missing: ${missing3.join(", ")}`;
-  }
-
-  return { ok: Object.keys(errors).length === 0, errors };
-}
-
-function showSlotErrors(body: HTMLElement, errors: Record<number, string>): void {
-  for (let slot = 1; slot <= 3; slot++) {
-    const el = body.querySelector<HTMLDivElement>(`[data-slot-err="${slot}"]`);
-    if (!el) continue;
-    const msg = errors[slot];
-    if (msg) {
-      el.textContent = msg;
-      el.style.display = "block";
-    } else {
-      el.textContent = "";
-      el.style.display = "none";
-    }
-  }
-}
-
-function collectProviders(body: HTMLElement): Record<string, ModelBlock> {
-  const out: Record<string, ModelBlock> = {};
-  body.querySelectorAll<HTMLDivElement>("#providers-body [data-prov-row]").forEach((row) => {
-    const get = (f: string): string =>
-      row.querySelector<HTMLInputElement>(`input[data-prov="${f}"]`)?.value.trim() ?? "";
-    const key = get("key");
-    if (!key) return;
-    out[key] = {
-      provider: get("provider"),
-      base_url: get("url"),
-      model: get("model"),
-      api_key_env: get("env") || "OPENAI_API_KEY",
-    };
-  });
-  return out;
-}
-
 function collectAppearance(body: HTMLElement, current: AppearanceConfig): AppearanceConfig {
   const enabled = body.querySelector<HTMLDivElement>("#bg-toggle")?.classList.contains("on") ?? current.background_enabled;
   const opacity = parseInt(body.querySelector<HTMLInputElement>("#bg-opacity")?.value ?? String(current.background_opacity), 10);
+  const mode = body.querySelector<HTMLSelectElement>("#bg-mode")?.value ?? current.background_mode ?? "fill";
   return {
     background_enabled: enabled,
     background_opacity: isNaN(opacity) ? current.background_opacity : Math.max(0, Math.min(100, opacity)),
     background_image: current.background_image,
+    background_mode: mode,
   };
+}
+
+function wireProviderCatalog(body: HTMLElement): void {
+  const refresh = () => {
+    const catalog = body.querySelector<HTMLDivElement>("#provider-catalog");
+    if (catalog) {
+      catalog.innerHTML = renderProviderCatalog();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const lucide = (window as any).lucide;
+      if (lucide?.createIcons) lucide.createIcons();
+      wireProviderCatalog(body);
+    }
+  };
+
+  body.querySelector<HTMLButtonElement>("#add-provider-v2")?.addEventListener("click", () => {
+    const id = `provider${app.providers.length + 1}`;
+    app.providers.push({
+      id,
+      display_name: id,
+      protocol: "openai_compatible",
+      base_url: "",
+      api_key_env: "OPENAI_API_KEY",
+      headers: null,
+      extra_body: null,
+      models: [],
+    });
+    refresh();
+  });
+
+  body.querySelectorAll<HTMLButtonElement>("[data-provider-del]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = parseInt(btn.dataset.providerDel!, 10);
+      app.providers.splice(idx, 1);
+      refresh();
+    });
+  });
+
+  body.querySelectorAll<HTMLButtonElement>("[data-add-model]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = parseInt(btn.dataset.addModel!, 10);
+      const modelId = window.prompt("Model ID (e.g. gpt-4o):");
+      if (!modelId) return;
+      app.providers[idx].models.push({
+        id: modelId,
+        display_name: modelId,
+        vision: false,
+        tool_calling: true,
+        streaming: true,
+        context_window: null,
+        max_output_tokens: null,
+      });
+      refresh();
+    });
+  });
 }
 
 function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
@@ -738,70 +636,6 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
       if (skills.length > 8) out.innerHTML += `<div class="mt-1">+${skills.length - 8} more</div>`;
     }
   }).catch(() => { /* ignore */ });
-
-  // Editing a slot invalidates any cached validation fingerprint for that role.
-  body.querySelector<HTMLDivElement>("#slots-grid")?.addEventListener("input", (ev) => {
-    const target = ev.target as HTMLElement | null;
-    const slot = target?.getAttribute("data-slot");
-    if (!slot) return;
-    const role = roleFor[slot];
-    if (role && gatewayValidated[role] !== null) {
-      gatewayValidated[role] = null;
-      const pill = body.querySelector<HTMLSpanElement>(`[data-gw-state="${slot}"]`);
-      if (pill) {
-        pill.textContent = "config changed — re-check";
-        pill.className = "text-xs text-app-textSecondary";
-      }
-    }
-  });
-
-  // ----- Per-slot gateway live API validation -----
-  const roleFor: Record<string, "executor" | "controller" | "reviewer"> = {
-    "1": "executor",
-    "2": "controller",
-    "3": "reviewer",
-  };
-  for (let slot = 1 as 1 | 2 | 3; slot <= 3; slot++) {
-    const sfx = String(slot);
-    const btn = body.querySelector<HTMLButtonElement>(`[data-gw-check="${sfx}"]`);
-    const out = body.querySelector<HTMLDivElement>(`[data-gw-out="${sfx}"]`);
-    const pill = body.querySelector<HTMLSpanElement>(`[data-gw-state="${sfx}"]`);
-    if (!btn || !out || !pill) continue;
-    btn.addEventListener("click", async () => {
-      const s = readSlot(body, slot);
-      if (!s.model_id || !s.base_url) {
-        out.textContent = "Provide a model id and base URL first.";
-        out.className = "text-xs font-mono whitespace-pre-wrap text-app-validationErr mt-1";
-        return;
-      }
-      pill.textContent = "checking…";
-      pill.className = "text-xs text-app-textSecondary";
-      out.textContent = "";
-      const draft = buildDraftConfig(body, originalCfg);
-      try {
-        const r = await api.gatewayValidateRole(roleFor[sfx], draft);
-        if (r.ok) {
-          pill.textContent = "✓ validated";
-          pill.className = "text-xs text-app-validationOk";
-          out.textContent = `${r.detail}\nlatency ${r.latency_ms}ms\nfp ${r.fingerprint ?? ""}`;
-          out.className = "text-xs font-mono whitespace-pre-wrap text-app-textSecondary mt-1";
-          gatewayValidated[roleFor[sfx]] = { fingerprint: r.fingerprint ?? "", class: r.class, detail: r.detail };
-        } else {
-          pill.textContent = `✗ ${r.class ?? "failed"}`;
-          pill.className = "text-xs text-app-validationErr";
-          out.textContent = `${r.detail}\nclass: ${r.class ?? "unknown"}`;
-          out.className = "text-xs font-mono whitespace-pre-wrap text-app-validationErr mt-1";
-          gatewayValidated[roleFor[sfx]] = null;
-        }
-      } catch (e) {
-        pill.textContent = "error";
-        pill.className = "text-xs text-app-validationErr";
-        out.textContent = `Check failed: ${String(e)}`;
-        out.className = "text-xs font-mono whitespace-pre-wrap text-app-validationErr mt-1";
-        gatewayValidated[roleFor[sfx]] = null;
-      }
-    });
-  }
 
   // ----- Provider health check -----
   body.querySelector<HTMLButtonElement>("#hc-run")?.addEventListener("click", async () => {
@@ -872,26 +706,19 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
   // ----- SonarQube code-analysis (v0.14) -----
   wireAnalysisPanel(body);
 
-  // ----- Provider add/remove -----
-  body.querySelector<HTMLButtonElement>("#add-provider")?.addEventListener("click", () => {
-    const unique = `provider${Object.keys(originalCfg.models).length + 1}`;
-    const wrap = document.createElement("div");
-    wrap.innerHTML = renderProviderRow(unique, null);
-    const row = wrap.firstElementChild as HTMLDivElement;
-    row.querySelector<HTMLButtonElement>("[data-prov-del]")?.addEventListener("click", () => row.remove());
-    body.querySelector("#providers-body")!.appendChild(row);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const lucide = (window as any).lucide;
-    if (lucide?.createIcons) lucide.createIcons();
-  });
-  body.querySelectorAll<HTMLButtonElement>("#providers-body [data-prov-del]").forEach((b) =>
-    b.addEventListener("click", () => b.closest("[data-prov-row]")?.remove()));
+  // ----- Provider catalog (v0.17) -----
+  wireProviderCatalog(body);
 
   // ----- Live opacity preview -----
   const opacitySlider = body.querySelector<HTMLInputElement>("#bg-opacity");
   const opacityLabel = body.querySelector<HTMLSpanElement>("#bg-opacity-label");
   opacitySlider?.addEventListener("input", () => {
     if (opacityLabel) opacityLabel.textContent = `${opacitySlider.value}%`;
+    applyBackgroundFromSettings(body);
+  });
+
+  // ----- Live display-mode preview -----
+  body.querySelector<HTMLSelectElement>("#bg-mode")?.addEventListener("change", () => {
     applyBackgroundFromSettings(body);
   });
 
@@ -943,74 +770,19 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
     const status = body.querySelector<HTMLSpanElement>("#save-status")!;
     status.textContent = "Saving…";
 
-    const slots = { m1: readSlot(body, 1), m2: readSlot(body, 2), m3: readSlot(body, 3) };
-    const validation = validateSlots(slots);
-    showSlotErrors(body, validation.errors);
-    if (!validation.ok) {
-      status.textContent = "Fix the errors above before saving.";
-      return;
-    }
-
-    // Gateway gate: at minimum the executor (Model 1) must have passed a live
-    // validation. Model 2/3 only need validation when their fields are filled.
-    const draft = buildDraftConfig(body, originalCfg);
-    const need: Array<"executor" | "controller" | "reviewer"> = ["executor"];
-    if (slots.m2.model_id) need.push("controller");
-    if (slots.m3.model_id) need.push("reviewer");
-    for (const role of need) {
-      if (gatewayValidated[role] === null) {
-        status.textContent = `Run "Check API Response" for ${role} before saving.`;
-        return;
-      }
-    }
-    // Re-check freshness against the server-stored fingerprint (in case the
-    // user edited a field after the last check).
-    for (const role of need) {
-      try {
-        const st = await api.gatewayValidationStatus(role, draft);
-        if (!st.valid) {
-          status.textContent = `Configuration changed since last check (${role}). Re-run "Check API Response".`;
-          return;
-        }
-      } catch (e) {
-        status.textContent = `Validation store unreachable: ${String(e)}`;
-        return;
-      }
-    }
-
-    const providers = collectProviders(body);
-    // Make sure every slot's referenced provider exists in the map.
-    for (const s of [slots.m1, slots.m2, slots.m3]) {
-      if (s.model_id && !providers[s.model_id]) {
-        // Promote the inline slot into a provider entry so the runtime can resolve it.
-        providers[s.model_id] = {
-          provider: s.provider,
-          base_url: s.base_url,
-          model: s.model_id,
-          api_key_env: s.api_key || "OPENAI_API_KEY",
-        };
-      }
-    }
-
     const appearance = collectAppearance(body, originalCfg.appearance);
 
     try {
+      // Persist the provider catalog (v0.17).
+      await api.providersSave(app.providers);
+      // Persist appearance/frontend to config.toml.
       const path = await api.writeConfig({
-        agent: {
-          model1: slots.m1.model_id,
-          model2: slots.m2.model_id,
-          model3: slots.m3.model_id || null,
-          // Legacy mirrors so older aether CLI builds keep working.
-          executor_model: slots.m1.model_id,
-          controller_model: slots.m2.model_id || "controller",
-          reviewer_model: slots.m3.model_id || null,
-        },
-        models: providers,
+        agent: originalCfg.agent,
+        models: originalCfg.models,
         frontend: originalCfg.frontend,
         appearance,
       });
       status.textContent = `Saved to ${path}`;
-      // Apply background live (no reload).
       await refreshBackgroundPreview(body);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const lucide = (window as any).lucide;
@@ -1173,10 +945,20 @@ async function refreshBackgroundPreview(body: HTMLElement): Promise<void> {
 function applyBackgroundFromSettings(body: HTMLElement): void {
   const enabled = body.querySelector<HTMLDivElement>("#bg-toggle")?.classList.contains("on") ?? true;
   const opacity = parseInt(body.querySelector<HTMLInputElement>("#bg-opacity")?.value ?? "60", 10);
-  applyBackgroundLayer(enabled, isNaN(opacity) ? 60 : opacity);
+  const mode = body.querySelector<HTMLSelectElement>("#bg-mode")?.value ?? "fill";
+  applyBackgroundLayer(enabled, isNaN(opacity) ? 60 : opacity, mode);
 }
 
-function applyBackgroundLayer(enabled: boolean, opacityPct: number): void {
+function objectFitForMode(mode: string): string {
+  switch (mode) {
+    case "fit": return "contain";
+    case "stretch": return "fill";
+    case "center": return "none";
+    default: return "cover";
+  }
+}
+
+function applyBackgroundLayer(enabled: boolean, opacityPct: number, mode = "fill"): void {
   const img = document.querySelector<HTMLImageElement>("#bg-img");
   const fade = document.querySelector<HTMLDivElement>("#bg-fade");
   if (!img || !fade) return;
@@ -1187,6 +969,7 @@ function applyBackgroundLayer(enabled: boolean, opacityPct: number): void {
   }
   if (!img.src) img.src = `data:${cachedBackground.contentType};base64,${cachedBackground.data}`;
   img.style.display = "block";
+  img.style.objectFit = objectFitForMode(mode);
   img.style.opacity = String(opacityPct / 100);
   // The fade layer keeps the UI readable when the image is bright.
   fade.style.opacity = String(1 - opacityPct / 100 * 0.6);
@@ -1233,6 +1016,7 @@ async function boot() {
       background_enabled: true,
       background_opacity: 60,
       background_image: null,
+      background_mode: "fill",
     };
     try {
       const payload = await api.getBackground();
@@ -1240,7 +1024,7 @@ async function boot() {
         cachedBackground = { data: payload.data_base64, contentType: payload.content_type };
       }
     } catch { /* keep null; layer renders solid */ }
-    applyBackgroundLayer(appearance.background_enabled, appearance.background_opacity);
+    applyBackgroundLayer(appearance.background_enabled, appearance.background_opacity, appearance.background_mode ?? "fill");
   } catch {
     /* ignore */
   }
@@ -1297,23 +1081,8 @@ async function boot() {
     renderHeader();
   });
 
-  // Model picker (reads from config; surfaces the three model slots).
-  try {
-    const r = await api.readConfig();
-    const slots = [r.config.agent.model1, r.config.agent.model2, r.config.agent.model3].filter(
-      (k): k is string => !!k,
-    );
-    if (slots.length > 0) app.modelKey = slots[0];
-    const modelBtn = document.querySelector("#model-btn")!;
-    modelBtn.addEventListener("click", () => {
-      if (slots.length === 0) return;
-      const i = slots.indexOf(app.modelKey);
-      app.modelKey = slots[(i + 1) % slots.length];
-      renderHeader();
-    });
-  } catch {
-    /* ignore */
-  }
+  // Per-session role assignment panel (v0.17).
+  document.querySelector("#model-btn")!.addEventListener("click", () => openRolePanel());
 
   // Version label.
   try {
@@ -1322,6 +1091,270 @@ async function boot() {
   } catch {
     /* ignore */
   }
+
+  // v0.17: workspace initialization.
+  await initWorkspace();
+}
+
+// ----- Workspace management (v0.17) -----
+
+async function initWorkspace(): Promise<void> {
+  // v0.17: migrate legacy Model 1/2/3 config into the provider registry (once).
+  try { await api.migrateLegacyModels(); } catch { /* ignore */ }
+
+  try {
+    app.providers = await api.providersList();
+  } catch { app.providers = []; }
+
+  const recent = await api.workspaceList(10).catch(() => [] as WorkspaceDto[]);
+  if (recent.length === 0) {
+    showWorkspaceHome([]);
+  } else {
+    showWorkspaceHome(recent);
+  }
+  wireWorkspaceHome();
+}
+
+function showWorkspaceHome(recent: WorkspaceDto[]): void {
+  const home = document.querySelector<HTMLDivElement>("#workspace-home")!;
+  const sidebar = document.querySelector<HTMLDivElement>("#workspace-sidebar")!;
+  home.style.display = "flex";
+  sidebar.style.display = "none";
+
+  const subtitle = document.querySelector("#ws-home-subtitle")!;
+  subtitle.textContent = recent.length > 0
+    ? "Welcome back. Select a folder to continue."
+    : "Select a folder to start working.";
+
+  const list = document.querySelector<HTMLDivElement>("#ws-recent-list")!;
+  if (recent.length === 0) {
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML = recent.map((w) => `
+    <button data-ws-open="${escapeAttr(w.id)}" data-ws-path="${escapeAttr(w.path)}"
+      class="w-full text-left bg-app-surface border border-app-border rounded-lg px-4 py-3 hover:border-app-brand transition-colors">
+      <div class="text-sm font-medium text-app-textPrimary">${escapeHtml(w.name)}</div>
+      <div class="text-xs text-app-textSecondary font-mono truncate">${escapeHtml(w.path)}</div>
+    </button>
+  `).join("");
+}
+
+function wireWorkspaceHome(): void {
+  document.querySelector("#ws-select-folder-btn")!.addEventListener("click", () => void pickFolder());
+  document.querySelector("#ws-recent-list")!.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-ws-path]");
+    if (btn) void openWorkspaceByPath(btn.dataset.wsPath!);
+  });
+  document.querySelector("#ws-switch-btn")?.addEventListener("click", () => void pickFolder());
+  document.querySelector("#ws-new-session-btn")?.addEventListener("click", () => void createNewSession());
+  document.querySelector("#ws-session-list")?.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-session-open]");
+    if (btn) void openSessionById(btn.dataset.sessionOpen!);
+  });
+}
+
+async function pickFolder(): Promise<void> {
+  try {
+    const selected = await api.pickFolder();
+    if (selected) {
+      await openWorkspaceByPath(selected);
+    }
+  } catch (e) {
+    alert(`Folder picker failed: ${String(e)}`);
+  }
+}
+
+async function openWorkspaceByPath(path: string): Promise<void> {
+  try {
+    const ws = await api.workspaceOpenFolder(path);
+    app.workspace = ws;
+    await loadWorkspaceSessions();
+    showWorkspaceUi();
+  } catch (e) {
+    alert(`Failed to open workspace: ${String(e)}`);
+  }
+}
+
+async function loadWorkspaceSessions(): Promise<void> {
+  if (!app.workspace) return;
+  try {
+    app.workspaceSessions = await api.workspaceSessions(app.workspace.id, 50);
+  } catch { app.workspaceSessions = []; }
+}
+
+function showWorkspaceUi(): void {
+  const home = document.querySelector<HTMLDivElement>("#workspace-home")!;
+  const sidebar = document.querySelector<HTMLDivElement>("#workspace-sidebar")!;
+  home.style.display = "none";
+  sidebar.style.display = "flex";
+
+  if (app.workspace) {
+    document.querySelector("#ws-sidebar-name")!.textContent = app.workspace.name;
+    document.querySelector("#ws-sidebar-path")!.textContent = app.workspace.path;
+  }
+  renderSessionList();
+}
+
+function renderSessionList(): void {
+  const list = document.querySelector<HTMLDivElement>("#ws-session-list")!;
+  if (app.workspaceSessions.length === 0) {
+    list.innerHTML = `<div class="text-xs text-app-textSecondary italic px-2 py-4 text-center">No sessions yet. Create one to start.</div>`;
+    return;
+  }
+  list.innerHTML = app.workspaceSessions.map((s) => {
+    const label = s.title || s.task || "Untitled session";
+    const date = s.created_at.slice(0, 10);
+    return `
+      <button data-session-open="${escapeAttr(s.id)}"
+        class="w-full text-left px-3 py-2 rounded hover:bg-app-hover transition-colors group">
+        <div class="text-xs text-app-textPrimary truncate">${escapeHtml(label)}</div>
+        <div class="text-[10px] text-app-textSecondary">${escapeHtml(date)}</div>
+      </button>`;
+  }).join("");
+}
+
+async function createNewSession(): Promise<void> {
+  if (!app.workspace) return;
+  try {
+    const id = await api.workspaceCreateSession(app.workspace.id, undefined);
+    await loadWorkspaceSessions();
+    renderSessionList();
+    const s = createSession("New Session");
+    s.id = id;
+    app.tabs.push(s);
+    app.active = app.tabs.length - 1;
+    app.roleAssignments = null;
+    renderAll();
+  } catch (e) {
+    alert(`Failed to create session: ${String(e)}`);
+  }
+}
+
+async function openSessionById(sessionId: string): Promise<void> {
+  const existing = app.tabs.findIndex((t) => t.id === sessionId);
+  if (existing >= 0) {
+    app.active = existing;
+    await loadSessionRoles(sessionId);
+    renderAll();
+    return;
+  }
+  const meta = app.workspaceSessions.find((s) => s.id === sessionId);
+  const title = meta?.title || meta?.task || "Session";
+  const s = createSession(title);
+  s.id = sessionId;
+  app.tabs.push(s);
+  app.active = app.tabs.length - 1;
+  await loadSessionRoles(sessionId);
+  if (app.workspace) void api.workspaceSetLastSession(app.workspace.id, sessionId).catch(() => {});
+  renderAll();
+}
+
+async function loadSessionRoles(sessionId: string): Promise<void> {
+  try {
+    const json = await api.sessionGetRoles(sessionId);
+    app.roleAssignments = json ? (JSON.parse(json) as RoleAssignmentsDto) : null;
+  } catch {
+    app.roleAssignments = null;
+  }
+}
+
+// ----- Per-session role assignment panel (v0.17) -----
+
+function allModelOptions(): Array<{ provider_id: string; model_id: string; label: string; vision: boolean }> {
+  const out: Array<{ provider_id: string; model_id: string; label: string; vision: boolean }> = [];
+  for (const p of app.providers) {
+    for (const m of p.models) {
+      out.push({
+        provider_id: p.id,
+        model_id: m.id,
+        label: `${p.display_name || p.id} / ${m.display_name || m.id}`,
+        vision: m.vision,
+      });
+    }
+  }
+  return out;
+}
+
+function bindingLabel(b: { provider_id: string; model_id: string } | null): string {
+  if (!b) return "— not set —";
+  const p = app.providers.find((x) => x.id === b.provider_id);
+  const m = p?.models.find((x) => x.id === b.model_id);
+  return `${p?.display_name || b.provider_id} / ${m?.display_name || b.model_id}`;
+}
+
+function openRolePanel(): void {
+  const s = current();
+  const opts = allModelOptions();
+  const ra = app.roleAssignments ?? { executor: null, controller: null, reviewer: null };
+
+  const selectHtml = (role: "executor" | "controller" | "reviewer", requireVision: boolean) => {
+    const cur = ra[role];
+    const options = opts
+      .map((o) => {
+        const disabled = requireVision && !o.vision;
+        const selected = cur && cur.provider_id === o.provider_id && cur.model_id === o.model_id ? "selected" : "";
+        return `<option value="${escapeAttr(o.provider_id)}|${escapeAttr(o.model_id)}" ${selected} ${disabled ? "disabled" : ""}>${escapeHtml(o.label)}${disabled ? " (vision unavailable)" : ""}</option>`;
+      })
+      .join("");
+    return `<select data-role-select="${role}" class="w-full bg-app-bg border border-app-border rounded px-2 py-1.5 text-xs font-mono text-app-textPrimary">
+      <option value="">— not set —</option>
+      ${options}
+    </select>`;
+  };
+
+  const body = document.querySelector<HTMLDivElement>("#modal-body")!;
+  const modal = document.querySelector<HTMLDivElement>("#modal")!;
+  document.querySelector("#modal-title")!.textContent = "LLM Configuration";
+  modal.classList.remove("hidden");
+  modal.classList.add("flex");
+  body.innerHTML = `
+    <div class="space-y-4 max-w-xl">
+      <p class="text-xs text-app-textSecondary">Choose which model performs each AETHER role for this session. Changes apply to future turns only.</p>
+      <div>
+        <label class="text-xs uppercase tracking-wide text-app-textSecondary block mb-1">LLM 1 — Big Executor</label>
+        ${selectHtml("executor", false)}
+      </div>
+      <div>
+        <label class="text-xs uppercase tracking-wide text-app-textSecondary block mb-1">LLM 2 — Small Controller</label>
+        ${selectHtml("controller", false)}
+      </div>
+      <div>
+        <label class="text-xs uppercase tracking-wide text-app-textSecondary block mb-1">LLM 3 — Visual Reviewer (optional, requires vision)</label>
+        ${selectHtml("reviewer", true)}
+      </div>
+      <div class="flex items-center space-x-3 pt-3 border-t border-app-border">
+        <button id="role-save-btn" type="button" class="bg-app-brand text-app-bg font-semibold px-4 py-1.5 rounded text-sm hover:opacity-90">Save</button>
+        <span id="role-save-status" class="text-xs text-app-textSecondary"></span>
+      </div>
+    </div>`;
+
+  body.querySelector<HTMLButtonElement>("#role-save-btn")?.addEventListener("click", async () => {
+    const status = body.querySelector<HTMLSpanElement>("#role-save-status")!;
+    const read = (role: "executor" | "controller" | "reviewer") => {
+      const v = body.querySelector<HTMLSelectElement>(`[data-role-select="${role}"]`)?.value ?? "";
+      if (!v) return null;
+      const [provider_id, model_id] = v.split("|");
+      return { provider_id, model_id };
+    };
+    const next: RoleAssignmentsDto = {
+      executor: read("executor"),
+      controller: read("controller"),
+      reviewer: read("reviewer"),
+    };
+    if (!next.executor || !next.controller) {
+      status.textContent = "LLM 1 (Executor) and LLM 2 (Controller) are required.";
+      return;
+    }
+    try {
+      await api.sessionSetRoles(s.id, JSON.stringify(next));
+      app.roleAssignments = next;
+      status.textContent = "Saved.";
+      renderHeader();
+    } catch (e) {
+      status.textContent = `Save failed: ${String(e)}`;
+    }
+  });
 }
 
 boot();

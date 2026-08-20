@@ -62,6 +62,7 @@ export interface AppearanceConfig {
   background_enabled: boolean;
   background_opacity: number; // 0..100
   background_image: string | null; // resolved path; null ⇒ bundled default
+  background_mode: string; // "fill" | "fit" | "stretch" | "center"
 }
 
 export interface SessionRow {
@@ -235,14 +236,80 @@ export interface AnalysisProgress {
   message?: string;
 }
 
+// ---------------------------------------------------------------------------
+// v0.17 Workspace / Provider / Session architecture
+// ---------------------------------------------------------------------------
+
+export interface WorkspaceDto {
+  id: string;
+  path: string;
+  name: string;
+  created_at: string;
+  last_opened: string;
+  last_session: string | null;
+}
+
+export interface SessionRowDto {
+  id: string;
+  created_at: string;
+  task: string | null;
+  title: string | null;
+}
+
+export interface ProviderEntryDto {
+  id: string;
+  display_name: string;
+  protocol: string;
+  base_url: string;
+  api_key_env: string;
+  headers?: Record<string, string> | null;
+  extra_body?: Record<string, unknown> | null;
+  models: ModelEntryDto[];
+}
+
+export interface ModelEntryDto {
+  id: string;
+  display_name: string;
+  vision: boolean;
+  tool_calling: boolean;
+  streaming: boolean;
+  context_window: number | null;
+  max_output_tokens: number | null;
+}
+
+export interface RoleBindingDto {
+  provider_id: string;
+  model_id: string;
+}
+
+export interface RoleAssignmentsDto {
+  executor: RoleBindingDto | null;
+  controller: RoleBindingDto | null;
+  reviewer: RoleBindingDto | null;
+}
+
+export interface ProviderValidationOutcome {
+  ok: boolean;
+  class: string | null;
+  detail: string;
+  latency_ms: number;
+  fingerprint: string | null;
+}
+
 export const api = {
   readConfig: () => invoke<ConfigResponse>("read_config"),
   writeConfig: (config: DesktopConfig) => invoke<string>("write_config", { config }),
   listSessions: () => invoke<SessionRow[]>("list_sessions"),
   getSessionMessages: (session_id: string) =>
     invoke<MessageRow[]>("get_session_messages", { sessionId: session_id }),
-  runTask: (task: string, plan = false) =>
-    invoke<RunHandle>("run_task", { task, plan }),
+  runTask: (task: string, plan = false, opts?: { sessionId?: string; workspacePath?: string; roleAssignmentsJson?: string }) =>
+    invoke<RunHandle>("run_task", {
+      task,
+      plan,
+      sessionId: opts?.sessionId ?? null,
+      workspacePath: opts?.workspacePath ?? null,
+      roleAssignmentsJson: opts?.roleAssignmentsJson ?? null,
+    }),
   cancelTask: (session_id: string) => invoke<boolean>("cancel_task", { sessionId: session_id }),
   aetherDir: () => invoke<string>("aether_dir_str"),
   version: () => invoke<string>("version"),
@@ -250,8 +317,6 @@ export const api = {
   getBackground: () => invoke<BackgroundPayload>("get_background"),
   setBackgroundImage: (bytes: number[]) =>
     invoke<BackgroundValidation>("set_background_image", { bytes }),
-  requiredBackgroundResolution: () =>
-    invoke<string>("required_background_resolution"),
   checkProvider: (baseUrl: string, apiKeyEnv: string, models: string[]) =>
     invoke<HealthOutcome>("check_provider", { baseUrl, apiKeyEnv, models }),
   /** Run a live API validation for one role and persist a fingerprint snapshot. */
@@ -293,6 +358,29 @@ export const api = {
       baselineReport,
       currentReport: currentReport ?? null,
     }),
+  // Workspace / Provider / Session architecture (v0.17)
+  workspaceList: (limit?: number) =>
+    invoke<WorkspaceDto[]>("workspace_list", { limit: limit ?? null }),
+  workspaceOpenFolder: (path: string) =>
+    invoke<WorkspaceDto>("workspace_open_folder", { path }),
+  pickFolder: () => invoke<string | null>("pick_folder"),
+  workspaceRemove: (id: string) => invoke<void>("workspace_remove", { id }),
+  workspaceSetLastSession: (workspaceId: string, sessionId: string) =>
+    invoke<void>("workspace_set_last_session", { workspaceId, sessionId }),
+  workspaceSessions: (workspaceId: string, limit?: number) =>
+    invoke<SessionRowDto[]>("workspace_sessions", { workspaceId, limit: limit ?? null }),
+  workspaceCreateSession: (workspaceId: string, title?: string) =>
+    invoke<string>("workspace_create_session", { workspaceId, title: title ?? null }),
+  sessionSetRoles: (sessionId: string, assignmentsJson: string) =>
+    invoke<void>("session_set_roles", { sessionId, assignmentsJson }),
+  sessionGetRoles: (sessionId: string) =>
+    invoke<string | null>("session_get_roles", { sessionId }),
+  providersList: () => invoke<ProviderEntryDto[]>("providers_list"),
+  providersSave: (providers: ProviderEntryDto[]) =>
+    invoke<void>("providers_save", { providers }),
+  providersValidate: (providerId: string, modelId: string) =>
+    invoke<ProviderValidationOutcome>("providers_validate", { providerId, modelId }),
+  migrateLegacyModels: () => invoke<number>("migrate_legacy_models"),
 };
 
 export const events = {

@@ -50,8 +50,12 @@ impl OpenAICompatibleProvider {
     }
 
     fn build_body(&self, req: &CompletionRequest) -> Value {
+        // Always send the provider's configured model id. Callers pass the
+        // config *key* (e.g. "controller"/"executor") in `req.model`, which is
+        // not a real model name — the provider was constructed with the actual
+        // model id from `[models.<key>].model`.
         let mut body = serde_json::json!({
-            "model": req.model,
+            "model": self.default_model,
             "messages": req.messages,
             "temperature": req.temperature.unwrap_or(self.default_temperature),
             "max_tokens": req.max_tokens.unwrap_or(self.default_max_tokens),

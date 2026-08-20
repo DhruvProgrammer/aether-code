@@ -10,6 +10,9 @@
 //!     in-process. No subprocess, no visible CLI window, no PATH dependency.
 //!     Output is streamed to the frontend via `task-output` events.
 
+// Hide the console window on Windows release builds — this is a GUI app.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -134,10 +137,14 @@ struct AppearanceBlock {
     /// Resolved path to the user-chosen background. `None` ⇒ use bundled default.
     #[serde(default)]
     background_image: Option<String>,
+    /// Display mode: "fill" (cover), "fit" (contain), "stretch", "center".
+    #[serde(default = "default_bg_mode")]
+    background_mode: String,
 }
 
 fn default_bg_enabled() -> bool { true }
 fn default_bg_opacity() -> u8 { 60 }
+fn default_bg_mode() -> String { "fill".into() }
 
 impl Default for AppearanceBlock {
     fn default() -> Self {
@@ -145,6 +152,7 @@ impl Default for AppearanceBlock {
             background_enabled: default_bg_enabled(),
             background_opacity: default_bg_opacity(),
             background_image: None,
+            background_mode: default_bg_mode(),
         }
     }
 }
@@ -288,17 +296,22 @@ async fn run_task(
     state: State<'_, Arc<RunState>>,
     task: String,
     plan: Option<bool>,
+    session_id: Option<String>,
+    workspace_path: Option<String>,
+    role_assignments_json: Option<String>,
 ) -> Result<RunHandle, String> {
     if task.trim().is_empty() {
         return Err("Task is empty.".into());
     }
     let plan = plan.unwrap_or(false);
 
-    let session_id = format!(
-        "desktop-{}-{}",
-        chrono::Utc::now().format("%Y%m%d-%H%M%S"),
-        uuid::Uuid::new_v4().simple()
-    );
+    let session_id = session_id.unwrap_or_else(|| {
+        format!(
+            "desktop-{}-{}",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+            uuid::Uuid::new_v4().simple()
+        )
+    });
 
     let cancel = Arc::new(tokio::sync::Notify::new());
     {
@@ -306,9 +319,49 @@ async fn run_task(
         runs.insert(session_id.clone(), cancel.clone());
     }
 
+    // v0.17: resolve per-session role assignments + provider registry.
+    let (providers, role_assignments) = match role_assignments_json {
+        Some(json) if !json.is_empty() => {
+            let assignments: aether_config::RoleAssignments =
+                serde_json::from_str(&json).map_err(|e| format!("invalid role assignments: {e}"))?;
+            let provs = providers_list()?;
+            let entries: Vec<aether_config::ProviderEntry> = provs
+                .into_iter()
+                .map(|p| aether_config::ProviderEntry {
+                    id: p.id,
+                    display_name: p.display_name,
+                    protocol: p.protocol,
+                    base_url: p.base_url,
+                    api_key_env: p.api_key_env,
+                    headers: p.headers,
+                    extra_body: p.extra_body,
+                    models: p
+                        .models
+                        .into_iter()
+                        .map(|m| aether_config::ModelEntry {
+                            id: m.id,
+                            display_name: m.display_name,
+                            vision: m.vision,
+                            tool_calling: m.tool_calling,
+                            streaming: m.streaming,
+                            context_window: m.context_window,
+                            max_output_tokens: m.max_output_tokens,
+                        })
+                        .collect(),
+                })
+                .collect();
+            (Some(entries), Some(assignments))
+        }
+        _ => (None, None),
+    };
+
     let opts = aether_cli::run_task::RunOptions {
         task: Some(task),
         plan,
+        session_id: Some(session_id.clone()),
+        workspace_path: workspace_path.map(std::path::PathBuf::from),
+        providers,
+        role_assignments,
         ..Default::default()
     };
 
@@ -867,13 +920,12 @@ struct BackgroundValidation {
     saved_path: Option<String>,
 }
 
-/// Accepts raw image bytes (PNG or JPEG), validates dimensions against the
-/// canonical AETHER resolution, and persists the image to
-/// `~/.aether/background.png`. On rejection the image is NOT saved and a
-/// human-readable error is returned (spec §14).
+/// Accepts raw image bytes (PNG or JPEG), validates that they decode as a
+/// real image within practical size limits (any resolution is accepted), and
+/// persists the original file unchanged to `~/.aether/background.png`.
 #[tauri::command]
 async fn set_background_image(bytes: Vec<u8>) -> Result<BackgroundValidation, String> {
-    let (w, h) = background::validate_dimensions_bytes(&bytes).map_err(|e| e.to_string())?;
+    let (w, h) = background::validate_bytes(&bytes).map_err(|e| e.to_string())?;
     let dir = aether_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let dest = dir.join("background.png");
@@ -885,11 +937,6 @@ async fn set_background_image(bytes: Vec<u8>) -> Result<BackgroundValidation, St
         height: h,
         saved_path: Some(dest.display().to_string()),
     })
-}
-
-#[tauri::command]
-fn required_background_resolution() -> String {
-    background::required_resolution_label()
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,6 +1167,248 @@ async fn analysis_diff(
 }
 
 // ---------------------------------------------------------------------------
+// v0.17 Workspace / Provider / Session architecture
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct WorkspaceDto {
+    id: String,
+    path: String,
+    name: String,
+    created_at: String,
+    last_opened: String,
+    last_session: Option<String>,
+}
+
+fn workspace_store() -> Result<aether_workspace::WorkspaceStore, String> {
+    let path = aether_workspace::WorkspaceStore::default_path().map_err(|e| e.to_string())?;
+    aether_workspace::WorkspaceStore::open(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn workspace_list(limit: Option<usize>) -> Result<Vec<WorkspaceDto>, String> {
+    let store = workspace_store()?;
+    let ws = store.recent(limit.unwrap_or(20)).map_err(|e| e.to_string())?;
+    Ok(ws.into_iter().map(|w| WorkspaceDto {
+        id: w.id, path: w.path, name: w.name,
+        created_at: w.created_at, last_opened: w.last_opened, last_session: w.last_session,
+    }).collect())
+}
+
+#[tauri::command]
+fn workspace_open_folder(path: String) -> Result<WorkspaceDto, String> {
+    let mut store = workspace_store()?;
+    let w = store.open_folder(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
+    Ok(WorkspaceDto {
+        id: w.id, path: w.path, name: w.name,
+        created_at: w.created_at, last_opened: w.last_opened, last_session: w.last_session,
+    })
+}
+
+#[tauri::command]
+fn pick_folder() -> Result<Option<String>, String> {
+    let picked = rfd::FileDialog::new()
+        .set_title("Select Workspace Folder")
+        .pick_folder();
+    Ok(picked.map(|p| p.display().to_string()))
+}
+
+#[tauri::command]
+fn workspace_remove(id: String) -> Result<(), String> {
+    let store = workspace_store()?;
+    store.remove(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn workspace_set_last_session(workspace_id: String, session_id: String) -> Result<(), String> {
+    let store = workspace_store()?;
+    store.set_last_session(&workspace_id, &session_id).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct SessionRowDto {
+    id: String,
+    created_at: String,
+    task: Option<String>,
+    title: Option<String>,
+}
+
+#[tauri::command]
+fn workspace_sessions(workspace_id: String, limit: Option<usize>) -> Result<Vec<SessionRowDto>, String> {
+    let store = aether_sessions::SessionStore::open(
+        &aether_config::Config::default_dir().join("sessions.db"),
+    ).map_err(|e| e.to_string())?;
+    let sessions = store.list_by_workspace(&workspace_id, limit.unwrap_or(50)).map_err(|e| e.to_string())?;
+    Ok(sessions.into_iter().map(|s| SessionRowDto {
+        id: s.id, created_at: s.created_at, task: s.task, title: None,
+    }).collect())
+}
+
+#[tauri::command]
+fn workspace_create_session(workspace_id: String, title: Option<String>) -> Result<String, String> {
+    let store = aether_sessions::SessionStore::open(
+        &aether_config::Config::default_dir().join("sessions.db"),
+    ).map_err(|e| e.to_string())?;
+    let id = store.new_session_in_workspace(&workspace_id, title.as_deref()).map_err(|e| e.to_string())?;
+    let ws_store = workspace_store()?;
+    let _ = ws_store.set_last_session(&workspace_id, &id);
+    Ok(id)
+}
+
+#[tauri::command]
+fn session_set_roles(session_id: String, assignments_json: String) -> Result<(), String> {
+    let store = aether_sessions::SessionStore::open(
+        &aether_config::Config::default_dir().join("sessions.db"),
+    ).map_err(|e| e.to_string())?;
+    store.set_role_assignments(&session_id, &assignments_json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn session_get_roles(session_id: String) -> Result<Option<String>, String> {
+    let store = aether_sessions::SessionStore::open(
+        &aether_config::Config::default_dir().join("sessions.db"),
+    ).map_err(|e| e.to_string())?;
+    store.get_role_assignments(&session_id).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ProviderEntryDto {
+    id: String,
+    display_name: String,
+    protocol: String,
+    base_url: String,
+    api_key_env: String,
+    #[serde(default)]
+    headers: Option<serde_json::Value>,
+    #[serde(default)]
+    extra_body: Option<serde_json::Value>,
+    #[serde(default)]
+    models: Vec<ModelEntryDto>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ModelEntryDto {
+    id: String,
+    display_name: String,
+    #[serde(default)]
+    vision: bool,
+    #[serde(default = "default_true")]
+    tool_calling: bool,
+    #[serde(default = "default_true")]
+    streaming: bool,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+}
+
+fn default_true() -> bool { true }
+
+fn providers_path() -> std::path::PathBuf {
+    aether_config::Config::default_dir().join("providers.json")
+}
+
+#[tauri::command]
+fn providers_list() -> Result<Vec<ProviderEntryDto>, String> {
+    let path = providers_path();
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let txt = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let providers: Vec<ProviderEntryDto> = serde_json::from_str(&txt).unwrap_or_default();
+    Ok(providers)
+}
+
+#[tauri::command]
+fn providers_save(providers: Vec<ProviderEntryDto>) -> Result<(), String> {
+    let path = providers_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&providers).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn providers_validate(provider_id: String, model_id: String) -> Result<aether_gateway::validate::ValidationOutcome, String> {
+    let providers = providers_list()?;
+    let prov = providers.iter().find(|p| p.id == provider_id)
+        .ok_or_else(|| format!("provider '{provider_id}' not found"))?;
+    let _model = prov.models.iter().find(|m| m.id == model_id)
+        .ok_or_else(|| format!("model '{model_id}' not found in provider '{provider_id}'"))?;
+    let target = aether_gateway::ValidateTarget {
+        role: aether_gateway::Role::Executor,
+        model_key: format!("{provider_id}/{model_id}"),
+        provider_id: prov.protocol.clone(),
+        base_url: prov.base_url.clone(),
+        model_id: model_id.clone(),
+        api_key_env: prov.api_key_env.clone(),
+        extra_body: prov.extra_body.clone(),
+    };
+    Ok(aether_gateway::validate_binding(&target).await)
+}
+
+/// Migrate the legacy `[agent]` model1/model2/model3 + `[models]` map into the
+/// v0.17 provider registry. Runs once; idempotent (skips if providers.json
+/// already exists). Preserves credential env-var references — never the keys.
+#[tauri::command]
+fn migrate_legacy_models() -> Result<u32, String> {
+    let path = providers_path();
+    if path.exists() {
+        return Ok(0);
+    }
+    let cfg = aether_config::Config::load(None).map_err(|e| e.to_string())?;
+    let mut providers: Vec<ProviderEntryDto> = Vec::new();
+    let mut migrated = 0u32;
+
+    for (key, mc) in &cfg.models {
+        let prov_id = if mc.provider.is_empty() { key.clone() } else { mc.provider.clone() };
+        let entry = providers.iter_mut().find(|p| p.id == prov_id);
+        match entry {
+            Some(p) => {
+                if !p.models.iter().any(|m| m.id == mc.model) {
+                    p.models.push(ModelEntryDto {
+                        id: mc.model.clone(),
+                        display_name: mc.model.clone(),
+                        vision: false,
+                        tool_calling: true,
+                        streaming: true,
+                        context_window: None,
+                        max_output_tokens: None,
+                    });
+                }
+            }
+            None => {
+                providers.push(ProviderEntryDto {
+                    id: prov_id.clone(),
+                    display_name: prov_id.clone(),
+                    protocol: if mc.provider.is_empty() { "openai_compatible".into() } else { mc.provider.clone() },
+                    base_url: mc.base_url.clone(),
+                    api_key_env: mc.api_key_env.clone(),
+                    headers: None,
+                    extra_body: mc.extra_body.clone(),
+                    models: vec![ModelEntryDto {
+                        id: mc.model.clone(),
+                        display_name: mc.model.clone(),
+                        vision: false,
+                        tool_calling: true,
+                        streaming: true,
+                        context_window: None,
+                        max_output_tokens: None,
+                    }],
+                });
+            }
+        }
+        migrated += 1;
+    }
+
+    if !providers.is_empty() {
+        providers_save(providers)?;
+    }
+    Ok(migrated)
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1140,7 +1429,6 @@ fn main() {
             backend_status,
             get_background,
             set_background_image,
-            required_background_resolution,
             check_provider,
             gateway_validate_role,
             gateway_validation_status,
@@ -1154,6 +1442,19 @@ fn main() {
             analysis_latest,
             analysis_projects,
             analysis_diff,
+            workspace_list,
+            workspace_open_folder,
+            pick_folder,
+            workspace_remove,
+            workspace_set_last_session,
+            workspace_sessions,
+            workspace_create_session,
+            session_set_roles,
+            session_get_roles,
+            providers_list,
+            providers_save,
+            providers_validate,
+            migrate_legacy_models,
         ])
         .run(tauri::generate_context!())
         .expect("error while running aether-desktop");

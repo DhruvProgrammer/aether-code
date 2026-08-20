@@ -97,6 +97,11 @@ impl SessionStore {
         // simplest robust path is to attempt ADD COLUMN and tolerate failures.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_calls TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
+        // v0.17: workspace + role assignment columns.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN workspace_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN role_assignments TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT", []);
         Ok(Arc::new(Self { conn }))
     }
 
@@ -106,6 +111,71 @@ impl SessionStore {
         self.conn
             .execute("INSERT INTO sessions(id, created_at) VALUES (?1, ?2)", (id.as_str(), now.as_str()))?;
         Ok(id)
+    }
+
+    /// Create a session belonging to a workspace with an optional title.
+    pub fn new_session_in_workspace(&self, workspace_id: &str, title: Option<&str>) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO sessions(id, created_at, workspace_id, title, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (id.as_str(), now.as_str(), workspace_id, title, now.as_str()),
+        )?;
+        Ok(id)
+    }
+
+    /// List sessions for a specific workspace, newest-first.
+    pub fn list_by_workspace(&self, workspace_id: &str, limit: usize) -> Result<Vec<SessionMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, task, plan, result FROM sessions WHERE workspace_id = ?1 ORDER BY COALESCE(updated_at, created_at) DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![workspace_id, limit as i64], |r| {
+            Ok(SessionMeta {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                task: r.get(2)?,
+                plan: r.get(3)?,
+                result: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Store per-session role assignments as JSON.
+    pub fn set_role_assignments(&self, session_id: &str, assignments_json: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE sessions SET role_assignments = ?2, updated_at = ?3 WHERE id = ?1",
+            (session_id, assignments_json, now.as_str()),
+        )?;
+        Ok(())
+    }
+
+    /// Fetch per-session role assignments JSON.
+    pub fn get_role_assignments(&self, session_id: &str) -> Result<Option<String>> {
+        let result: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT role_assignments FROM sessions WHERE id = ?1",
+                (session_id,),
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        Ok(result)
+    }
+
+    /// Update session title.
+    pub fn set_title(&self, session_id: &str, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET title = ?2 WHERE id = ?1",
+            (session_id, title),
+        )?;
+        Ok(())
     }
 
     pub fn record_run(&self, session_id: &str, task: &str, plan: &str, result: &str) -> Result<()> {

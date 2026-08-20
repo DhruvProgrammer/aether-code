@@ -32,14 +32,6 @@ pub struct Config {
     pub appearance: AppearanceConfig,
 }
 
-/// Canonical AETHER background image resolution.
-///
-/// Centralised so the desktop binary, the renderer and any future tooling all
-/// validate against the same dimensions. Change this single constant to change
-/// the requirement globally.
-pub const BACKGROUND_WIDTH: u32 = 1920;
-pub const BACKGROUND_HEIGHT: u32 = 1080;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppearanceConfig {
     /// Master switch for the desktop background image.
@@ -52,9 +44,13 @@ pub struct AppearanceConfig {
     /// falls back to the bundled default background shipped under `resources/`.
     #[serde(default)]
     pub background_image: Option<String>,
+    /// Display mode: "fill" (cover), "fit" (contain), "stretch", "center".
+    #[serde(default = "dft_bg_mode")]
+    pub background_mode: String,
 }
 fn dft_bg_enabled() -> bool { true }
 fn dft_bg_opacity() -> u8 { 60 }
+fn dft_bg_mode() -> String { "fill".into() }
 
 impl Default for AppearanceConfig {
     fn default() -> Self {
@@ -62,6 +58,7 @@ impl Default for AppearanceConfig {
             background_enabled: dft_bg_enabled(),
             background_opacity: dft_bg_opacity(),
             background_image: None,
+            background_mode: dft_bg_mode(),
         }
     }
 }
@@ -222,7 +219,7 @@ impl Default for ContextConfig {
     fn default() -> Self { ContextConfig { max_tokens: dft_ctx() } }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub provider: String,
     pub base_url: String,
@@ -230,6 +227,102 @@ pub struct ModelConfig {
     pub api_key_env: String,
     #[serde(default)]
     pub extra_body: Option<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
+// Provider registry (v0.17 redesign)
+// ---------------------------------------------------------------------------
+
+/// A provider entry in the registry. Credentials are stored once per provider;
+/// models reference the provider by ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEntry {
+    /// Unique provider ID (user-chosen slug, e.g. "nvidia", "openrouter").
+    pub id: String,
+    /// Human-readable display name.
+    #[serde(default)]
+    pub display_name: String,
+    /// Protocol adapter: currently only "openai_compatible".
+    #[serde(default = "dft_protocol")]
+    pub protocol: String,
+    /// Base URL for the provider's API.
+    pub base_url: String,
+    /// Environment variable name holding the API key (never the key itself).
+    pub api_key_env: String,
+    /// Optional extra headers sent with every request.
+    #[serde(default)]
+    pub headers: Option<serde_json::Value>,
+    /// Optional extra body fields merged into every request.
+    #[serde(default)]
+    pub extra_body: Option<serde_json::Value>,
+    /// Models registered under this provider.
+    #[serde(default)]
+    pub models: Vec<ModelEntry>,
+}
+fn dft_protocol() -> String { "openai_compatible".into() }
+
+/// A model entry under a provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    /// The model ID sent to the API (e.g. "gpt-4o", "meta/llama-3.1-70b").
+    pub id: String,
+    /// Human-readable display name.
+    #[serde(default)]
+    pub display_name: String,
+    /// Whether the model supports vision/image input.
+    #[serde(default)]
+    pub vision: bool,
+    /// Whether the model supports tool calling.
+    #[serde(default = "dft_true")]
+    pub tool_calling: bool,
+    /// Whether the model supports streaming.
+    #[serde(default = "dft_true")]
+    pub streaming: bool,
+    /// Context window size in tokens (when known).
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    /// Maximum output tokens (when known).
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+}
+
+/// Per-session role assignment: which provider/model performs each AETHER role.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RoleAssignments {
+    /// LLM 1 — Big Executor. Required.
+    pub executor: Option<RoleBinding>,
+    /// LLM 2 — Small Controller. Required.
+    pub controller: Option<RoleBinding>,
+    /// LLM 3 — Visual Frontend Reviewer. Optional.
+    pub reviewer: Option<RoleBinding>,
+}
+
+/// A single role → provider/model binding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleBinding {
+    /// Provider ID from the registry.
+    pub provider_id: String,
+    /// Model ID within that provider.
+    pub model_id: String,
+}
+
+impl ProviderEntry {
+    /// Resolve a model entry by ID.
+    pub fn model(&self, model_id: &str) -> Option<&ModelEntry> {
+        self.models.iter().find(|m| m.id == model_id)
+    }
+
+    /// Build a `ModelConfig` compatible with the legacy `[models]` map for a
+    /// given model under this provider. Used by the gateway adapter.
+    pub fn to_model_config(&self, model_id: &str) -> Option<ModelConfig> {
+        self.model(model_id).map(|_m| ModelConfig {
+            provider: self.protocol.clone(),
+            base_url: self.base_url.clone(),
+            model: model_id.to_string(),
+            api_key_env: self.api_key_env.clone(),
+            extra_body: self.extra_body.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -451,12 +544,7 @@ mod tests {
         assert!(cfg.appearance.background_enabled);
         assert_eq!(cfg.appearance.background_opacity, 60);
         assert_eq!(cfg.appearance.background_image, None);
-    }
-
-    #[test]
-    fn background_resolution_is_canonical() {
-        assert_eq!(BACKGROUND_WIDTH, 1920);
-        assert_eq!(BACKGROUND_HEIGHT, 1080);
+        assert_eq!(cfg.appearance.background_mode, "fill");
     }
 
     #[test]

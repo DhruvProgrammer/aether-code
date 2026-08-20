@@ -36,6 +36,14 @@ pub struct RunOptions {
     pub session_id: Option<String>,
     pub config: Option<PathBuf>,
     pub tui: bool,
+    /// v0.17: provider registry for per-session role assignment. When present
+    /// alongside `role_assignments`, the gateway is assembled from these
+    /// explicit bindings instead of the global `[agent]`/`[models]` config.
+    pub providers: Option<Vec<aether_config::ProviderEntry>>,
+    /// v0.17: per-session role assignments (executor/controller/reviewer).
+    pub role_assignments: Option<aether_config::RoleAssignments>,
+    /// v0.17: workspace folder to run the task in (sets the agent cwd).
+    pub workspace_path: Option<PathBuf>,
 }
 
 impl Default for RunOptions {
@@ -55,6 +63,9 @@ impl Default for RunOptions {
             session_id: None,
             config: None,
             tui: false,
+            providers: None,
+            role_assignments: None,
+            workspace_path: None,
         }
     }
 }
@@ -117,7 +128,14 @@ pub async fn run(
         return run_rollback(&cfg, session, &sink).await;
     }
 
-    if cfg.model(&cfg.agent.controller_model).is_none() || cfg.model(&cfg.agent.executor_model).is_none() {
+    // v0.17: per-session role assignments take precedence over the global
+    // [agent]/[models] config. When a provider registry + role assignments
+    // are supplied, the gateway is assembled from those explicit bindings.
+    let use_session_bindings = opts.providers.is_some() && opts.role_assignments.is_some();
+
+    if !use_session_bindings
+        && (cfg.model(&cfg.agent.controller_model).is_none() || cfg.model(&cfg.agent.executor_model).is_none())
+    {
         emit(&sink, "stderr", "AETHER: no controller or executor model configured. Open the desktop Settings and configure at least Model 1.");
         (sink)(TaskEvent::Exit { code: 2, success: false });
         return Ok(());
@@ -133,12 +151,31 @@ pub async fn run(
     }
 
     // ---- v0.15 Model Gateway ----
-    let gateway_bundle = match aether_gateway::GatewayBundle::from_config(&cfg, aether_gateway::GatewayConfig::default()) {
-        Ok(b) => b,
-        Err(e) => {
-            emit(&sink, "stderr", &format!("gateway assembly failed: {e}"));
-            (sink)(TaskEvent::Exit { code: 2, success: false });
-            return Ok(());
+    // v0.17: assemble from per-session role assignments when provided,
+    // otherwise fall back to the global [agent]/[models] config.
+    let gateway_bundle = if use_session_bindings {
+        let providers_reg = opts.providers.clone().unwrap_or_default();
+        let assignments = opts.role_assignments.clone().unwrap_or_default();
+        match aether_gateway::GatewayBundle::from_providers(
+            &providers_reg,
+            &assignments,
+            aether_gateway::GatewayConfig::default(),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                emit(&sink, "stderr", &format!("gateway assembly failed: {e}"));
+                (sink)(TaskEvent::Exit { code: 2, success: false });
+                return Ok(());
+            }
+        }
+    } else {
+        match aether_gateway::GatewayBundle::from_config(&cfg, aether_gateway::GatewayConfig::default()) {
+            Ok(b) => b,
+            Err(e) => {
+                emit(&sink, "stderr", &format!("gateway assembly failed: {e}"));
+                (sink)(TaskEvent::Exit { code: 2, success: false });
+                return Ok(());
+            }
         }
     };
     let providers = gateway_bundle.providers.clone();
@@ -226,7 +263,11 @@ pub async fn run(
         }
     };
 
-    let base_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // v0.17: when a workspace folder is supplied, run the agent inside it.
+    let base_cwd = opts
+        .workspace_path
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let run_cwd = if opts.worktree {
         match make_worktree(&base_cwd) {
             Ok(p) => {
