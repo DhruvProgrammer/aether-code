@@ -320,6 +320,18 @@ pub async fn run(
     let evidence = Arc::new(aether_evidence::EvidenceBag::new());
     let context_workspace = Arc::new(aether_context::ContextWorkspace::new());
 
+    // ---- Session compaction (structured checkpoints) ----
+    // The compactor uses the session's configured Model 2 (controller) to
+    // generate checkpoints. No routing, no model switching.
+    let compactor = Arc::new(aether_context::SessionCompactor::new(
+        controller.clone(),
+        cfg.agent.controller_model.clone(),
+        cfg.context.max_tokens,
+        Arc::new(aether_core::compaction_store::SessionCheckpointStore::new(
+            aether_config::Config::default_dir().join("sessions.db"),
+        )),
+    ));
+
     let agent = Agent::new(
         controller,
         cfg.agent.controller_model.clone(),
@@ -348,6 +360,7 @@ pub async fn run(
     .with_plugins(plugins)
     .with_evidence(evidence)
     .with_context_workspace(context_workspace)
+    .with_compactor(compactor)
     .with_cancel(cancel);
 
     let format = |task: &str| -> String {

@@ -31,6 +31,10 @@ pub struct Executor {
     pub(crate) agent_id: Option<String>,
     pub(crate) permission_engine: Option<Arc<aether_permissions::PermissionEngine>>,
     pub(crate) context_manager: Option<Arc<aether_context::ContextManager>>,
+    /// Session compactor (structured checkpoint compaction). When present,
+    /// preflight context estimation + automatic compaction + overflow recovery
+    /// replace the legacy `compact_messages` heuristic.
+    pub(crate) compactor: Option<Arc<aether_context::SessionCompactor>>,
 }
 
 impl Executor {
@@ -63,18 +67,21 @@ impl Executor {
             agent_id: None,
             permission_engine: None,
             context_manager: None,
+            compactor: None,
         }
     }
 
     pub fn with_agent_id(mut self, id: impl Into<String>) -> Self { self.agent_id = Some(id.into()); self }
     pub fn with_permission_engine(mut self, e: Arc<aether_permissions::PermissionEngine>) -> Self { self.permission_engine = Some(e); self }
     pub fn with_context_manager(mut self, c: Arc<aether_context::ContextManager>) -> Self { self.context_manager = Some(c); self }
+    pub fn with_compactor(mut self, c: Arc<aether_context::SessionCompactor>) -> Self { self.compactor = Some(c); self }
 
     pub async fn run(&self, task: &str) -> Result<String> {
+        let system_content = crate::prompt::system_for(&self.system_prompt);
         let mut messages = vec![
             Message {
                 role: "system".into(),
-                content: crate::prompt::system_for(&self.system_prompt),
+                content: system_content.clone(),
                 ..Default::default()
             },
             Message {
@@ -83,9 +90,6 @@ impl Executor {
                 ..Default::default()
             },
         ];
-
-        // Context compaction (spec §20): bound the transcript before each model call.
-        messages = compact_messages(messages, self.context_max_tokens);
 
         let tool_schemas: Vec<Value> = self
             .tools
@@ -104,6 +108,11 @@ impl Executor {
             .collect();
         let has_tools = !tool_schemas.is_empty();
 
+        // Context compaction (spec §20): bound the transcript before each model call.
+        // When a SessionCompactor is configured, preflight estimation + structured
+        // checkpoint compaction is used; otherwise the legacy heuristic applies.
+        messages = self.preflight_compact(messages, &system_content, &tool_schemas).await;
+
         for _step in 0..self.max_iterations {
             let req = CompletionRequest {
                 model: self.model.clone(),
@@ -111,7 +120,41 @@ impl Executor {
                 tools: if has_tools { Some(tool_schemas.clone()) } else { None },
                 ..Default::default()
             };
-            let resp = self.provider.complete(req).await?;
+            let resp = match self.provider.complete(req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Context overflow recovery: compact once, retry once.
+                    if is_context_overflow(&e) {
+                        if let Some(compactor) = &self.compactor {
+                            match compactor
+                                .compact(&self.session_id, &system_content, &messages, aether_context::CompactTrigger::Overflow)
+                                .await
+                            {
+                                Ok(rebuilt) => {
+                                    messages = rebuilt;
+                                    let retry = CompletionRequest {
+                                        model: self.model.clone(),
+                                        messages: messages.clone(),
+                                        tools: if has_tools { Some(tool_schemas.clone()) } else { None },
+                                        ..Default::default()
+                                    };
+                                    // Retry exactly once; no infinite loop.
+                                    self.provider.complete(retry).await?
+                                }
+                                Err(ce) => {
+                                    return Err(anyhow::anyhow!(
+                                        "context overflow and compaction failed: {ce}"
+                                    ));
+                                }
+                            }
+                        } else {
+                            return Err(e.into());
+                        }
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            };
 
             if resp.tool_calls.is_empty() && resp.content.is_none() {
                 return Ok("The model returned an empty response; no actions were taken.".into());
@@ -151,9 +194,42 @@ impl Executor {
                     ..Default::default()
                 });
             }
-            messages = compact_messages(messages, self.context_max_tokens);
+            messages = self.preflight_compact(messages, &system_content, &tool_schemas).await;
         }
         Ok("Max iterations reached without a final answer.".into())
+    }
+
+    /// Preflight context estimation + automatic compaction. When a
+    /// [`SessionCompactor`] is configured, estimates the request size against
+    /// the model's context window and compacts (via structured checkpoint) if
+    /// it approaches the safe limit. Otherwise falls back to the legacy
+    /// `compact_messages` heuristic. The original request continues after a
+    /// successful compaction — the caller never has to resend it.
+    async fn preflight_compact(
+        &self,
+        messages: Vec<Message>,
+        system_content: &str,
+        tool_schemas: &[Value],
+    ) -> Vec<Message> {
+        let Some(compactor) = &self.compactor else {
+            return compact_messages(messages, self.context_max_tokens);
+        };
+        let window = compactor.context_window();
+        let estimated = aether_context::checkpoint::estimate_request_tokens(
+            system_content,
+            tool_schemas,
+            &messages,
+        );
+        if !aether_context::checkpoint::should_compact(estimated, window) {
+            return messages;
+        }
+        match compactor
+            .compact(&self.session_id, system_content, &messages, aether_context::CompactTrigger::Automatic)
+            .await
+        {
+            Ok(rebuilt) => rebuilt,
+            Err(_) => messages, // keep previous state on failure
+        }
     }
 
     async fn execute_tool(&self, tc: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -259,6 +335,21 @@ fn estimate_tokens(msgs: &[Message]) -> usize {
     msgs.iter().map(|m| m.content.chars().count() / 4 + 16).sum()
 }
 
+/// Classify a provider error as a context-overflow failure. Used to trigger
+/// overflow recovery (compact once, retry once).
+fn is_context_overflow(e: &aether_models::ProviderError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("context length")
+        || msg.contains("context_length")
+        || msg.contains("maximum context")
+        || msg.contains("too many tokens")
+        || msg.contains("token limit")
+        || msg.contains("max_tokens")
+        || msg.contains("context window")
+        || msg.contains("reduce the length")
+        || msg.contains("413")
+}
+
 /// Resolve a `Permission::Ask`:
 /// - **bash** keeps fail-open semantics in non-TTY environments because `Policy::check_bash`
 ///   already hard-denies catastrophic commands. Safe bash falls through to the configured
@@ -321,4 +412,40 @@ fn compact_messages(mut msgs: Vec<Message>, max_tokens: u32) -> Vec<Message> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overflow_classification_detects_context_errors() {
+        let e = aether_models::ProviderError::Api(
+            "This model's maximum context length is 128000 tokens".into(),
+        );
+        assert!(is_context_overflow(&e));
+        let e2 = aether_models::ProviderError::Api("reduce the length of your input".into());
+        assert!(is_context_overflow(&e2));
+        let e3 = aether_models::ProviderError::Api("rate limit exceeded".into());
+        assert!(!is_context_overflow(&e3));
+    }
+
+    #[test]
+    fn legacy_compact_keeps_system_and_recent() {
+        let mut msgs = vec![Message {
+            role: "system".into(),
+            content: "SYS".into(),
+            ..Default::default()
+        }];
+        for i in 0..30 {
+            msgs.push(Message {
+                role: "user".into(),
+                content: format!("m{i} {}", "x".repeat(400)),
+                ..Default::default()
+            });
+        }
+        let out = compact_messages(msgs, 500);
+        assert_eq!(out[0].role, "system");
+        assert!(out.len() <= 12);
+    }
 }

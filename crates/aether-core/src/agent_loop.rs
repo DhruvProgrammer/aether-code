@@ -74,6 +74,10 @@ pub struct Agent {
     /// External cancel signal. When notified, the agent loop returns at the
     /// next iteration boundary. Used by the desktop to abort in-process runs.
     cancel: Option<Arc<tokio::sync::Notify>>,
+    /// Session compactor (structured checkpoint compaction). When present, the
+    /// Executor uses preflight context estimation + automatic compaction +
+    /// overflow recovery instead of the legacy truncation heuristic.
+    compactor: Option<Arc<aether_context::SessionCompactor>>,
 }
 
 impl Agent {
@@ -128,6 +132,7 @@ impl Agent {
             evidence: None,
             context_workspace: None,
             cancel: None,
+            compactor: None,
         }
     }
 
@@ -163,6 +168,12 @@ impl Agent {
     /// next iteration boundary once the handle is notified.
     pub fn with_cancel(mut self, handle: Arc<tokio::sync::Notify>) -> Self {
         self.cancel = Some(handle);
+        self
+    }
+
+    /// Inject the session compactor (structured checkpoint compaction).
+    pub fn with_compactor(mut self, c: Arc<aether_context::SessionCompactor>) -> Self {
+        self.compactor = Some(c);
         self
     }
 
@@ -408,6 +419,7 @@ impl Agent {
             .with_agent_id("coder");
             if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
             if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
+            if let Some(cp) = &self.compactor { coder = coder.with_compactor(cp.clone()); }
             let result = coder.run(&cycle_task).await?;
             eng.record_action(&format!("execute plan (iter {})", iter + 1));
             eng.observe("executor", &summarize(&result), None, None);
@@ -813,6 +825,7 @@ impl CorrectionExecutor for Agent {
         .with_agent_id("correction-coder");
         if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
         if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
+        if let Some(cp) = &self.compactor { coder = coder.with_compactor(cp.clone()); }
         coder.run(plan).await
     }
 }

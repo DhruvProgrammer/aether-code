@@ -29,6 +29,7 @@ pub mod events;
 pub mod summarizer;
 pub mod thresholds;
 pub mod workspace;
+pub mod checkpoint;
 
 pub use state::{
     ContextSegment, ContextSegmentKind, ContextState, SegmentMeta, TokenUsage,
@@ -39,3 +40,7 @@ pub use events::{CompactionEvent, ContextEventSink, NullSink};
 pub use summarizer::{ExtractiveSummarizer, NoopSummarizer, Summarizer};
 pub use thresholds::{ContextThresholds, ThresholdAction};
 pub use workspace::{AgentContextStatus, ContextWorkspace, SharedSegment};
+pub use checkpoint::{
+    CheckpointStore, CompactionCheckpoint, CompactionError, CompactionStatus, CompactTrigger,
+    MemoryCheckpointStore, SessionCompactor,
+};

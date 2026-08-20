@@ -235,6 +235,7 @@ async function send() {
         "/settings     Open the Settings modal",
         "/history      Open the History modal",
         "/cancel       Cancel the running task",
+        "/compact      Compact session context (structured checkpoint)",
         "/new          Start a new tab",
         "/status       Show internal backend status",
       ].join("\n"),
@@ -249,6 +250,22 @@ async function send() {
   if (text === "/new") { newTab(); return; }
   if (text === "/settings") { openModal("settings"); return; }
   if (text === "/history") { openModal("history"); return; }
+  if (text === "/compact") {
+    s.blocks.push({ id: newId(s), kind: "status", text: "Compacting context…" });
+    renderAll();
+    try {
+      const r = await api.compactSession(s.id);
+      s.blocks.push({
+        id: newId(s),
+        kind: r.status === "completed" ? "info" : "error",
+        text: `${r.message} (${r.tokens_before} → ${r.tokens_after} tokens)`,
+      });
+    } catch (e) {
+      s.blocks.push({ id: newId(s), kind: "error", text: `Compact failed: ${String(e)}` });
+    }
+    renderAll();
+    return;
+  }
   if (text === "/cancel") {
     if (s.running) {
       await api.cancelTask(s.id);

@@ -1409,6 +1409,127 @@ fn migrate_legacy_models() -> Result<u32, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Session compaction (v0.18)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct CompactResultDto {
+    status: String,
+    tokens_before: u32,
+    tokens_after: u32,
+    message: String,
+}
+
+/// Manually compact a session's context (`/compact`). Uses the session's
+/// configured Model 2 (controller) to generate a structured checkpoint.
+/// The durable message history is never deleted; only the active context is
+/// reduced. Model assignments are never modified.
+#[tauri::command]
+async fn compact_session(session_id: String) -> Result<CompactResultDto, String> {
+    // Load messages + resolve the controller binding BEFORE any await so the
+    // non-Sync SessionStore is never held across an await point.
+    let (messages, tokens_before, controller, controller_model, context_window) = {
+        let store = aether_sessions::SessionStore::open(&sessions_db()).map_err(|e| e.to_string())?;
+        let rows = store.get_messages(&session_id, 10_000).map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            return Ok(CompactResultDto {
+                status: "idle".into(),
+                tokens_before: 0,
+                tokens_after: 0,
+                message: "No messages to compact.".into(),
+            });
+        }
+        let messages: Vec<aether_models::Message> = rows
+            .iter()
+            .map(|r| aether_models::Message {
+                role: r.role.clone(),
+                content: r.content.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let tokens_before = aether_context::checkpoint::estimate_message_tokens(&messages);
+        let (controller, controller_model, context_window) =
+            resolve_session_controller(&session_id)?;
+        (messages, tokens_before, controller, controller_model, context_window)
+    };
+
+    let compactor = aether_context::SessionCompactor::new(
+        controller,
+        controller_model,
+        context_window,
+        Arc::new(aether_core::compaction_store::SessionCheckpointStore::new(sessions_db())),
+    );
+
+    match compactor
+        .compact(&session_id, "AETHER session compaction", &messages, aether_context::CompactTrigger::Manual)
+        .await
+    {
+        Ok(rebuilt) => {
+            let tokens_after = aether_context::checkpoint::estimate_message_tokens(&rebuilt);
+            Ok(CompactResultDto {
+                status: "completed".into(),
+                tokens_before,
+                tokens_after,
+                message: "Context compacted".into(),
+            })
+        }
+        Err(e) => Ok(CompactResultDto {
+            status: "failed".into(),
+            tokens_before,
+            tokens_after: tokens_before,
+            message: format!("Compaction failed (previous state kept): {e}"),
+        }),
+    }
+}
+
+/// Resolve the session's configured Model 2 (controller) provider + model +
+/// context window from the provider registry and per-session role assignments.
+/// Falls back to the global config when no session binding exists.
+fn resolve_session_controller(
+    session_id: &str,
+) -> Result<(Arc<dyn aether_models::ModelProvider>, String, u32), String> {
+    let cfg = aether_config::Config::load(None).map_err(|e| e.to_string())?;
+    let context_window = cfg.context.max_tokens;
+
+    // Try per-session role assignments first (v0.17 architecture).
+    let store = aether_sessions::SessionStore::open(&sessions_db()).map_err(|e| e.to_string())?;
+    if let Some(json) = store.get_role_assignments(session_id).map_err(|e| e.to_string())? {
+        if let Ok(assignments) = serde_json::from_str::<aether_config::RoleAssignments>(&json) {
+            if let Some(ctrl) = &assignments.controller {
+                let providers = providers_list()?;
+                if let Some(prov) = providers.iter().find(|p| p.id == ctrl.provider_id) {
+                    if prov.models.iter().any(|m| m.id == ctrl.model_id) {
+                        let window = prov
+                            .models
+                            .iter()
+                            .find(|m| m.id == ctrl.model_id)
+                            .and_then(|m| m.context_window)
+                            .unwrap_or(context_window);
+                        let mc = aether_config::ModelConfig {
+                            provider: prov.protocol.clone(),
+                            base_url: prov.base_url.clone(),
+                            model: ctrl.model_id.clone(),
+                            api_key_env: prov.api_key_env.clone(),
+                            extra_body: prov.extra_body.clone(),
+                        };
+                        let provider = aether_models::build_provider(&mc).map_err(|e| e.to_string())?;
+                        return Ok((Arc::from(provider), mc.model.clone(), window));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to the global controller model.
+    let key = cfg.agent.model2.clone().unwrap_or_else(|| cfg.agent.controller_model.clone());
+    let mc = cfg
+        .model(&key)
+        .ok_or_else(|| format!("controller model '{key}' not found in config"))?;
+    let provider = aether_models::build_provider(mc).map_err(|e| e.to_string())?;
+    Ok((Arc::from(provider), mc.model.clone(), context_window))
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1455,6 +1576,7 @@ fn main() {
             providers_save,
             providers_validate,
             migrate_legacy_models,
+            compact_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running aether-desktop");

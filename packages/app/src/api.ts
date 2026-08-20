@@ -296,6 +296,13 @@ export interface ProviderValidationOutcome {
   fingerprint: string | null;
 }
 
+export interface CompactResultDto {
+  status: string; // idle | completed | failed
+  tokens_before: number;
+  tokens_after: number;
+  message: string;
+}
+
 export const api = {
   readConfig: () => invoke<ConfigResponse>("read_config"),
   writeConfig: (config: DesktopConfig) => invoke<string>("write_config", { config }),
@@ -381,6 +388,8 @@ export const api = {
   providersValidate: (providerId: string, modelId: string) =>
     invoke<ProviderValidationOutcome>("providers_validate", { providerId, modelId }),
   migrateLegacyModels: () => invoke<number>("migrate_legacy_models"),
+  compactSession: (sessionId: string) =>
+    invoke<CompactResultDto>("compact_session", { sessionId }),
 };
 
 export const events = {

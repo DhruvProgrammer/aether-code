@@ -3,6 +3,7 @@
 
 pub mod agent_loop;
 pub mod agents;
+pub mod compaction_store;
 pub mod controller;
 pub mod eng;
 pub mod executor;
