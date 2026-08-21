@@ -432,6 +432,12 @@ async fn run_task(
                         },
                     );
                 }
+                TaskEventBridge::Agent(aether_cli::run_task::TaskEvent::TaskState { json }) => {
+                    let _ = app_emit.emit("task-state", TaskStateEvent {
+                        session_id: sid_emit.clone(),
+                        payload: json,
+                    });
+                }
                 TaskEventBridge::Agent(aether_cli::run_task::TaskEvent::Exit { .. }) => {}
                 TaskEventBridge::Exit { code, success } => {
                     {
@@ -497,6 +503,12 @@ struct TaskExit {
     session_id: String,
     code: Option<i32>,
     success: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct TaskStateEvent {
+    session_id: String,
+    payload: String,
 }
 
 /// Cancel a running task. The agent loop checks the cancel handle at every
@@ -1530,6 +1542,64 @@ fn resolve_session_controller(
 }
 
 // ---------------------------------------------------------------------------
+// Task state machine (v0.19)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct TaskStateDto {
+    session_id: String,
+    state: String,
+    active_role: String,
+    activity: String,
+    plan_step: Option<u32>,
+    total_steps: Option<u32>,
+    active_tool: Option<String>,
+    attempt_count: u32,
+    repair_attempt_count: u32,
+    replan_count: u32,
+    verification_attempt_count: u32,
+    last_error: Option<String>,
+    next_action: Option<String>,
+    transitions_len: usize,
+}
+
+#[tauri::command]
+async fn get_task_state(session_id: String) -> Result<Option<TaskStateDto>, String> {
+    let path = sessions_db();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let store = aether_sessions::SessionStore::open(&path).map_err(|e| e.to_string())?;
+    let json = store
+        .get_kv(&session_id, "task_state")
+        .map_err(|e| e.to_string())?;
+    match json {
+        Some(j) => {
+            let tsm = aether_core::task_state::TaskStateMachine::deserialize(&j)
+                .ok_or("failed to parse task state")?;
+            let r = &tsm.record;
+            Ok(Some(TaskStateDto {
+                session_id: r.session_id.clone(),
+                state: r.state.label().to_string(),
+                active_role: r.active_role.label().to_string(),
+                activity: r.current_activity.clone(),
+                plan_step: r.current_plan_step,
+                total_steps: r.total_plan_steps,
+                active_tool: r.active_tool.clone(),
+                attempt_count: r.attempt_count,
+                repair_attempt_count: r.repair_attempt_count,
+                replan_count: r.replan_count,
+                verification_attempt_count: r.verification_attempt_count,
+                last_error: r.last_error.clone(),
+                next_action: r.next_action.clone(),
+                transitions_len: r.transitions.len(),
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1577,6 +1647,7 @@ fn main() {
             providers_validate,
             migrate_legacy_models,
             compact_session,
+            get_task_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running aether-desktop");

@@ -10,4 +10,5 @@ pub mod executor;
 pub mod mode;
 pub mod prompt;
 pub mod subagents;
+pub mod task_state;
 pub mod visual;

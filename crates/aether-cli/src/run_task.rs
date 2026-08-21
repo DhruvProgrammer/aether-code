@@ -80,6 +80,8 @@ pub enum TaskEvent {
     /// The agent loop returned an error result. The sink gets a final Exit
     /// event with `success=false` alongside this.
     Error { message: String },
+    /// Authoritative task-state update from the 3-LLM state machine.
+    TaskState { json: String },
 }
 
 /// Output sink for the agent loop. Implementations decide where the lines go
@@ -361,6 +363,14 @@ pub async fn run(
     .with_evidence(evidence)
     .with_context_workspace(context_workspace)
     .with_compactor(compactor)
+    .with_task_event_sink({
+        let sink2 = sink.clone();
+        Arc::new(move |ev: aether_core::task_state::TaskEventKind| {
+            if let Ok(json) = serde_json::to_string(&ev) {
+                (sink2)(TaskEvent::TaskState { json });
+            }
+        })
+    })
     .with_cancel(cancel);
 
     let format = |task: &str| -> String {

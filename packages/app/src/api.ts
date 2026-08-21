@@ -303,6 +303,32 @@ export interface CompactResultDto {
   message: string;
 }
 
+// ---------------------------------------------------------------------------
+// v0.19 Task State Machine
+// ---------------------------------------------------------------------------
+
+export interface TaskStateDto {
+  session_id: string;
+  state: string;
+  active_role: string;
+  activity: string;
+  plan_step: number | null;
+  total_steps: number | null;
+  active_tool: string | null;
+  attempt_count: number;
+  repair_attempt_count: number;
+  replan_count: number;
+  verification_attempt_count: number;
+  last_error: string | null;
+  next_action: string | null;
+  transitions_len: number;
+}
+
+export interface TaskStateEvent {
+  session_id: string;
+  payload: string;
+}
+
 export const api = {
   readConfig: () => invoke<ConfigResponse>("read_config"),
   writeConfig: (config: DesktopConfig) => invoke<string>("write_config", { config }),
@@ -390,6 +416,8 @@ export const api = {
   migrateLegacyModels: () => invoke<number>("migrate_legacy_models"),
   compactSession: (sessionId: string) =>
     invoke<CompactResultDto>("compact_session", { sessionId }),
+  getTaskState: (sessionId: string) =>
+    invoke<TaskStateDto | null>("get_task_state", { sessionId }),
 };
 
 export const events = {
@@ -397,6 +425,8 @@ export const events = {
     listen<TaskOutput>("task-output", (e) => cb(e.payload)),
   onTaskExit: (cb: (e: TaskExit) => void): Promise<UnlistenFn> =>
     listen<TaskExit>("task-exit", (e) => cb(e.payload)),
+  onTaskState: (cb: (e: TaskStateEvent) => void): Promise<UnlistenFn> =>
+    listen<TaskStateEvent>("task-state", (e) => cb(e.payload)),
   onAnalysisProgress: (cb: (e: AnalysisProgress) => void): Promise<UnlistenFn> =>
     listen<AnalysisProgress>("analysis-progress", (e) => cb(e.payload)),
 };

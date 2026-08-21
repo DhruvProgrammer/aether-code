@@ -126,6 +126,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         TaskEvent::Exit { code, success } => {
             *sink_state.lock().unwrap() = (code, success);
         }
+        TaskEvent::TaskState { .. } => {}
     });
     run(opts, cancel, sink).await?;
     let (code, success) = *exit_state.lock().unwrap();

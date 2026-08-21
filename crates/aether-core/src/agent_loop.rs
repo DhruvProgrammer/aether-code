@@ -25,6 +25,7 @@ use crate::eng::{LoopAction, LoopEngine, LoopState};
 use crate::executor::Executor;
 use crate::mode::Mode;
 use crate::subagents::{run_role, SubagentResult, EXPLORER};
+use crate::task_state::{LlmRole, TaskEventKind, TaskState, TaskStateMachine};
 use crate::visual::{CorrectionExecutor, VisualReviewEngine, should_run_visual_review};
 use aether_config::FrontendConfig;
 
@@ -78,6 +79,9 @@ pub struct Agent {
     /// Executor uses preflight context estimation + automatic compaction +
     /// overflow recovery instead of the legacy truncation heuristic.
     compactor: Option<Arc<aether_context::SessionCompactor>>,
+    /// Optional sink for authoritative task-state events. The desktop bridges
+    /// these to the frontend so the UI reflects real backend state.
+    task_event_sink: Option<Arc<dyn Fn(TaskEventKind) + Send + Sync>>,
 }
 
 impl Agent {
@@ -133,6 +137,7 @@ impl Agent {
             context_workspace: None,
             cancel: None,
             compactor: None,
+            task_event_sink: None,
         }
     }
 
@@ -175,6 +180,18 @@ impl Agent {
     pub fn with_compactor(mut self, c: Arc<aether_context::SessionCompactor>) -> Self {
         self.compactor = Some(c);
         self
+    }
+
+    /// Inject a sink for authoritative task-state events (desktop IPC bridge).
+    pub fn with_task_event_sink(mut self, sink: Arc<dyn Fn(TaskEventKind) + Send + Sync>) -> Self {
+        self.task_event_sink = Some(sink);
+        self
+    }
+
+    fn emit_task_event(&self, event: TaskEventKind) {
+        if let Some(sink) = &self.task_event_sink {
+            sink(event);
+        }
     }
 
     /// Accessor used by the Executor when integrating with the permission
@@ -259,6 +276,17 @@ impl Agent {
         let registry = AgentRegistry::load_from_dir(&self.cwd);
         let mut lifecycle = LifecycleTracker::new(3, 5);
 
+        // --- Authoritative task state machine (3-LLM lifecycle) ---
+        let task_id = format!("task-{}", uuid::Uuid::new_v4().simple());
+        let mut tsm = TaskStateMachine::new(&task_id, sid);
+        self.emit_task_event(TaskEventKind::TaskCreated {
+            task_id: task_id.clone(),
+            session_id: sid.to_string(),
+        });
+        if let Some(store) = &self.session {
+            let _ = store.set_kv(sid, "task_state", &tsm.serialize());
+        }
+
         // --- Loop engineering: establish the EngineeringModel -------------------
         let mut eng = LoopEngine::new(task);
         // Resume: seed the model from a prior session's persisted engineering state.
@@ -298,6 +326,26 @@ impl Agent {
         };
 
         // Multi-agent: Explorer (SMALL LLM) gathers repo findings before the Controller plans.
+        // Task state: CREATED → UNDERSTANDING (LLM 3 observes/understands).
+        let _ = tsm.transition(TaskState::Understanding, LlmRole::Reviewer, "initial understanding");
+        tsm.set_activity("Understanding the task and inspecting workspace");
+        self.emit_task_event(TaskEventKind::TaskStateChanged {
+            task_id: task_id.clone(),
+            session_id: sid.to_string(),
+            from_state: "CREATED".into(),
+            to_state: "UNDERSTANDING".into(),
+            active_role: LlmRole::Reviewer.label().into(),
+            activity: tsm.record.current_activity.clone(),
+            reason: "initial understanding".into(),
+        });
+        self.emit_task_event(TaskEventKind::LlmActivated {
+            task_id: task_id.clone(),
+            role: LlmRole::Reviewer.label().into(),
+        });
+        if let Some(store) = &self.session {
+            let _ = store.set_kv(sid, "task_state", &tsm.serialize());
+        }
+
         let mut exploration = String::new();
         if self.subagents_enabled {
             if let Some(explorer_def) = registry.find("explorer") {
@@ -369,6 +417,14 @@ impl Agent {
             if let Some(c) = &self.cancel {
                 if tokio::time::timeout(std::time::Duration::ZERO, c.notified()).await.is_ok() {
                     final_result = "[cancelled by caller]".into();
+                    let _ = tsm.transition(TaskState::Cancelled, LlmRole::System, "cancelled by user");
+                    self.emit_task_event(TaskEventKind::TaskCancelled {
+                        task_id: task_id.clone(),
+                        session_id: sid.to_string(),
+                    });
+                    if let Some(store) = &self.session {
+                        let _ = store.set_kv(sid, "task_state", &tsm.serialize());
+                    }
                     break;
                 }
             }
@@ -382,6 +438,25 @@ impl Agent {
             };
 
             // Plan (or replan) with the model-informed task.
+            // Task state: UNDERSTANDING → PLANNING (LLM 2 plans).
+            let plan_from = tsm.state();
+            if plan_from == TaskState::Understanding {
+                let _ = tsm.transition(TaskState::Planning, LlmRole::Planner, "planning");
+            }
+            tsm.set_activity("Building execution strategy");
+            self.emit_task_event(TaskEventKind::TaskStateChanged {
+                task_id: task_id.clone(),
+                session_id: sid.to_string(),
+                from_state: plan_from.label().into(),
+                to_state: tsm.state().label().into(),
+                active_role: LlmRole::Planner.label().into(),
+                activity: tsm.record.current_activity.clone(),
+                reason: "planning".into(),
+            });
+            if let Some(store) = &self.session {
+                let _ = store.set_kv(sid, "task_state", &tsm.serialize());
+            }
+
             let plan = crate::controller::plan(
                 self.controller.as_ref(),
                 &self.controller_model,
@@ -399,6 +474,50 @@ impl Agent {
             eng.set_strategy(&plan);
             eng.add_decision(&format!("plan iteration {}", iter + 1), "controller produced plan", 0.6);
             persist_trace(&self.session, sid, "plan", "controller", &plan.chars().take(240).collect::<String>());
+
+            // Task state: PLANNING/REPLANNING → PLAN_READY → EXECUTING (LLM 1).
+            // On repair cycles (iter > 0): REPLANNING → REPAIRING (LLM 1 repairs).
+            tsm.set_plan(&plan, None);
+            tsm.record_strategy(&plan);
+            if iter == 0 {
+                let _ = tsm.transition(TaskState::PlanReady, LlmRole::Planner, "plan produced");
+                let _ = tsm.transition(TaskState::Executing, LlmRole::Executor, "executing approved plan");
+                tsm.set_activity("Implementing planned changes");
+                self.emit_task_event(TaskEventKind::TaskStateChanged {
+                    task_id: task_id.clone(),
+                    session_id: sid.to_string(),
+                    from_state: "PLAN_READY".into(),
+                    to_state: "EXECUTING".into(),
+                    active_role: LlmRole::Executor.label().into(),
+                    activity: tsm.record.current_activity.clone(),
+                    reason: "executing approved plan".into(),
+                });
+                self.emit_task_event(TaskEventKind::LlmHandoff {
+                    task_id: task_id.clone(),
+                    from_role: LlmRole::Planner.label().into(),
+                    to_role: LlmRole::Executor.label().into(),
+                });
+            } else {
+                let _ = tsm.transition(TaskState::Repairing, LlmRole::Executor, "implementing repair plan");
+                tsm.set_activity("Implementing repair");
+                self.emit_task_event(TaskEventKind::TaskStateChanged {
+                    task_id: task_id.clone(),
+                    session_id: sid.to_string(),
+                    from_state: "REPLANNING".into(),
+                    to_state: "REPAIRING".into(),
+                    active_role: LlmRole::Executor.label().into(),
+                    activity: tsm.record.current_activity.clone(),
+                    reason: "implementing repair plan".into(),
+                });
+                self.emit_task_event(TaskEventKind::LlmHandoff {
+                    task_id: task_id.clone(),
+                    from_role: LlmRole::Planner.label().into(),
+                    to_role: LlmRole::Executor.label().into(),
+                });
+            }
+            if let Some(store) = &self.session {
+                let _ = store.set_kv(sid, "task_state", &tsm.serialize());
+            }
 
             // Model 1 always runs on the explicitly configured executor provider.
             // No cost routing, no dynamic selection (v0.15 gateway spec §1, §23).
@@ -424,6 +543,28 @@ impl Agent {
             eng.record_action(&format!("execute plan (iter {})", iter + 1));
             eng.observe("executor", &summarize(&result), None, None);
             persist_trace(&self.session, sid, "execute", "implementer", &summarize(&result));
+
+            // Task state: EXECUTING/REPAIRING → REVIEWING (LLM 3 reviews; LLM 1 cannot self-complete).
+            let exec_from = tsm.state();
+            let _ = tsm.transition(TaskState::Reviewing, LlmRole::Reviewer, "execution finished — independent review");
+            tsm.set_activity("Reviewing implementation against objective");
+            self.emit_task_event(TaskEventKind::TaskStateChanged {
+                task_id: task_id.clone(),
+                session_id: sid.to_string(),
+                from_state: exec_from.label().into(),
+                to_state: "REVIEWING".into(),
+                active_role: LlmRole::Reviewer.label().into(),
+                activity: tsm.record.current_activity.clone(),
+                reason: "execution finished — independent review".into(),
+            });
+            self.emit_task_event(TaskEventKind::LlmHandoff {
+                task_id: task_id.clone(),
+                from_role: LlmRole::Executor.label().into(),
+                to_role: LlmRole::Reviewer.label().into(),
+            });
+            if let Some(store) = &self.session {
+                let _ = store.set_kv(sid, "task_state", &tsm.serialize());
+            }
 
             // Subagent handoff: the routed verification pipeline (spec §17-§18, §58).
             let mut review: Option<SubagentResult> = None;
@@ -607,6 +748,62 @@ impl Agent {
                 eng.set_next_best_action("Continue implementing remaining plan steps");
             }
 
+            // Task state: REVIEWING → VERIFYING (LLM 3 owns verification).
+            let _ = tsm.transition(TaskState::Verifying, LlmRole::Reviewer, "verification pass");
+            tsm.set_activity("Inspecting implementation and test evidence");
+            self.emit_task_event(TaskEventKind::TaskStateChanged {
+                task_id: task_id.clone(),
+                session_id: sid.to_string(),
+                from_state: "REVIEWING".into(),
+                to_state: "VERIFYING".into(),
+                active_role: LlmRole::Reviewer.label().into(),
+                activity: tsm.record.current_activity.clone(),
+                reason: "verification pass".into(),
+            });
+
+            let verification_passed = if verify_ids.is_empty() {
+                true
+            } else {
+                let review_ok = review.as_ref().map_or(true, |r| r.status == "ok");
+                let test_ok = test.as_ref().map_or(true, |t| t.status == "ok");
+                let sec_ok = security.as_ref().map_or(true, |s| s.status == "ok");
+                review_ok && test_ok && sec_ok
+            };
+
+            if verification_passed {
+                tsm.add_verification_evidence("review", "pass", "reviewer approved", None);
+                tsm.add_verification_evidence("tests", "pass", "tester approved", None);
+                tsm.conclude_verification(true);
+                let _ = tsm.transition(TaskState::Completed, LlmRole::Reviewer, "verification passed — LLM 3 concludes");
+                self.emit_task_event(TaskEventKind::TaskCompleted {
+                    task_id: task_id.clone(),
+                    session_id: sid.to_string(),
+                });
+            } else {
+                let fail_detail = review
+                    .as_ref()
+                    .filter(|r| r.status != "ok")
+                    .map(|r| r.summary.clone())
+                    .or_else(|| test.as_ref().filter(|t| t.status != "ok").map(|t| t.summary.clone()))
+                    .unwrap_or_else(|| "verification failed".into());
+                tsm.add_verification_evidence("review", "fail", &fail_detail, None);
+                tsm.conclude_verification(false);
+                tsm.record_error(&fail_detail, "verification");
+                let _ = tsm.transition(TaskState::Replanning, LlmRole::Planner, "verification failed — replanning");
+                self.emit_task_event(TaskEventKind::TaskStateChanged {
+                    task_id: task_id.clone(),
+                    session_id: sid.to_string(),
+                    from_state: "VERIFYING".into(),
+                    to_state: "REPLANNING".into(),
+                    active_role: LlmRole::Planner.label().into(),
+                    activity: "Analyzing failure and creating repair plan".into(),
+                    reason: "verification failed".into(),
+                });
+            }
+            if let Some(store) = &self.session {
+                let _ = store.set_kv(sid, "task_state", &tsm.serialize());
+            }
+
             if let Some(store) = &self.session {
                 if let Err(e) = store.set_kv(
                     sid,
@@ -619,15 +816,59 @@ impl Agent {
 
             final_result = format!("{result}\n{}", self.handoff_text(&review, &test, &security));
             println!("{}", eng.render_panel());
+            println!("{}", tsm.render_panel());
+
+            if tsm.state() == TaskState::Completed {
+                persist_trace(&self.session, sid, "decision", "task-state-machine", "COMPLETED");
+                break;
+            }
+            if tsm.state() == TaskState::Failed {
+                persist_trace(&self.session, sid, "decision", "task-state-machine", "FAILED");
+                break;
+            }
+            if tsm.doom_detected() {
+                let reason = tsm.doom_reason().unwrap_or("doom loop detected").to_string();
+                tsm.record_error(&reason, "doom_loop");
+                let _ = tsm.transition(TaskState::Failed, LlmRole::System, &reason);
+                self.emit_task_event(TaskEventKind::TaskFailed {
+                    task_id: task_id.clone(),
+                    session_id: sid.to_string(),
+                    reason: reason.clone(),
+                });
+                if let Some(store) = &self.session {
+                    let _ = store.set_kv(sid, "task_state", &tsm.serialize());
+                }
+                escalation = Some(format!("[DOOM LOOP] {reason}\n{}", eng.escalation_briefing()));
+                break;
+            }
 
             match eng.decide(iter + 1, loop_budget) {
                 LoopAction::Escalate => {
                     persist_trace(&self.session, sid, "decision", "loop-engine", "ESCALATE");
+                    let _ = tsm.transition(TaskState::Failed, LlmRole::System, "loop engine escalated");
+                    self.emit_task_event(TaskEventKind::TaskFailed {
+                        task_id: task_id.clone(),
+                        session_id: sid.to_string(),
+                        reason: "loop engine escalated".into(),
+                    });
+                    if let Some(store) = &self.session {
+                        let _ = store.set_kv(sid, "task_state", &tsm.serialize());
+                    }
                     escalation = Some(eng.escalation_briefing());
                     break;
                 }
                 LoopAction::Stop => {
                     persist_trace(&self.session, sid, "decision", "loop-engine", "STOP");
+                    if !tsm.state().is_terminal() {
+                        if tsm.record.verification.has_evidence() && tsm.record.verification.overall_pass {
+                            let _ = tsm.transition(TaskState::Completed, LlmRole::Reviewer, "loop budget exhausted with passing verification");
+                        } else {
+                            let _ = tsm.transition(TaskState::Failed, LlmRole::System, "loop budget exhausted");
+                        }
+                        if let Some(store) = &self.session {
+                            let _ = store.set_kv(sid, "task_state", &tsm.serialize());
+                        }
+                    }
                     break;
                 }
                 LoopAction::Continue => {
@@ -699,9 +940,15 @@ impl Agent {
             review: last_review,
             test: last_test,
             engineering: eng.state_summary(),
+            task_state: tsm.state().label().to_string(),
+            task_state_json: tsm.serialize(),
         };
         if let Some(esc) = &escalation {
             outcome.result.push_str(esc);
+        }
+
+        if let Some(store) = &self.session {
+            let _ = store.set_kv(sid, "task_state", &tsm.serialize());
         }
 
         // v0.13: plugin session-end hook.
@@ -768,6 +1015,8 @@ impl Agent {
             review: None,
             test: None,
             engineering: String::new(),
+            task_state: "PLAN_READY".into(),
+            task_state_json: String::new(),
         })
     }
 
@@ -845,4 +1094,8 @@ pub struct AgentOutcome {
     pub review: Option<SubagentResult>,
     pub test: Option<SubagentResult>,
     pub engineering: String,
+    /// Final authoritative task state label (e.g. "COMPLETED", "FAILED").
+    pub task_state: String,
+    /// Serialized task state machine record for persistence/UI.
+    pub task_state_json: String,
 }
