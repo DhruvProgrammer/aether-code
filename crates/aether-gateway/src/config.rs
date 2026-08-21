@@ -348,6 +348,8 @@ mod tests {
                 protocol: "openai_compatible".into(),
                 base_url: "https://nvidia.example/v1".into(),
                 api_key_env: "GW_FP_NVIDIA".into(),
+                auth_type: None,
+                api_key: None,
                 headers: None,
                 extra_body: None,
                 models: vec![
@@ -361,6 +363,8 @@ mod tests {
                 protocol: "openai_compatible".into(),
                 base_url: "https://openrouter.example/v1".into(),
                 api_key_env: "GW_FP_OPENROUTER".into(),
+                auth_type: None,
+                api_key: None,
                 headers: None,
                 extra_body: None,
                 models: vec![

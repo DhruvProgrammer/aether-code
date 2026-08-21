@@ -57,7 +57,7 @@ impl HealthChecker {
         });
         if !url_ok { can_save = false; }
 
-        // 2. Validate auth (env var resolves?).
+        // 2. Validate auth (env var resolves? or raw present). Never expose secret.
         let (auth_ok, auth_detail) = match &p.auth {
             AuthConfig::None => (true, "no auth".to_string()),
             AuthConfig::BearerEnv { name } | AuthConfig::ApiKeyEnv { name } => {
@@ -65,6 +65,13 @@ impl HealthChecker {
                     Ok(v) if !v.is_empty() => (true, format!("env {name} resolved")),
                     Ok(_) => (false, format!("env {name} is empty")),
                     Err(_) => (false, format!("env {name} is not set")),
+                }
+            }
+            AuthConfig::BearerRaw { key } | AuthConfig::ApiKeyRaw { key } => {
+                if key.trim().is_empty() {
+                    (false, "credential is empty".into())
+                } else {
+                    (true, "credential present".into())
                 }
             }
         };
@@ -86,11 +93,16 @@ impl HealthChecker {
                 .timeout(Duration::from_secs(8))
                 .build()
                 .unwrap_or_default();
-            let req = match &p.auth {
+            let mut req = match &p.auth {
                 AuthConfig::BearerEnv { name } => client.get(&probe_url).bearer_auth(std::env::var(name).unwrap_or_default()),
+                AuthConfig::BearerRaw { key } => client.get(&probe_url).bearer_auth(key),
                 AuthConfig::ApiKeyEnv { name } => client.get(&probe_url).header("x-api-key", std::env::var(name).unwrap_or_default()),
+                AuthConfig::ApiKeyRaw { key } => client.get(&probe_url).header("x-api-key", key),
                 AuthConfig::None => client.get(&probe_url),
             };
+            for (k, v) in &p.custom_headers {
+                req = req.header(k, v);
+            }
             let res = req.send().await;
             latency_ms = t.elapsed().as_millis() as u64;
             match res {

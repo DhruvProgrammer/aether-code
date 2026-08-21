@@ -249,8 +249,15 @@ pub struct ProviderEntry {
     pub protocol: String,
     /// Base URL for the provider's API.
     pub base_url: String,
-    /// Environment variable name holding the API key (never the key itself).
+    /// Environment variable name holding the API key (legacy) or raw key itself if `auth_type` is `raw`.
+    /// Kept for backward compatibility; prefer `auth_type` + `credential` / `api_key`.
     pub api_key_env: String,
+    /// Explicit authentication type: `env_var` (default) or `raw` (direct key) or `none`.
+    #[serde(default)]
+    pub auth_type: Option<String>,
+    /// Raw API key when `auth_type` is `raw`. Never logged.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Optional extra headers sent with every request.
     #[serde(default)]
     pub headers: Option<serde_json::Value>,
@@ -314,6 +321,86 @@ impl ProviderEntry {
         self.models.iter().find(|m| m.id == model_id)
     }
 
+    /// Whether the stored api_key_env value looks like an env var name (UPPER_SNAKE).
+    fn is_env_var_name(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && s.len() >= 2 && s.len() <= 64
+    }
+
+    /// Effective credential string to use for ModelConfig.api_key_env.
+    /// If auth_type is "raw" and api_key is set, use api_key directly.
+    /// Otherwise, if api_key_env looks like raw key (contains lowercase, hyphen, or nvapi/sk- prefix), treat as raw.
+    pub fn effective_credential(&self) -> String {
+        if let Some(t) = self.auth_type.as_deref() {
+            if t == "raw" {
+                if let Some(k) = self.api_key.as_deref().filter(|s| !s.is_empty()) {
+                    return k.to_string();
+                }
+                // Fallback: if api_key is empty but api_key_env looks like raw, use it
+                if !Self::is_env_var_name(&self.api_key_env) && !self.api_key_env.is_empty() {
+                    return self.api_key_env.clone();
+                }
+            } else if t == "env_var" {
+                return self.api_key_env.clone();
+            } else if t == "none" {
+                return String::new();
+            }
+        }
+        // Auto-detect legacy: if api_key is set, prefer it
+        if let Some(k) = self.api_key.as_deref().filter(|s| !s.is_empty()) {
+            return k.to_string();
+        }
+        self.api_key_env.clone()
+    }
+
+    /// Whether this entry's headers contain misplaced model IDs (legacy bug where model was added as header).
+    pub fn needs_header_migration(&self) -> bool {
+        if let Some(v) = self.headers.as_ref().and_then(|h| h.as_object()) {
+            for (k, val) in v {
+                if k == val.as_str().unwrap_or("") && (k.contains('/') || k.contains("nemotron") || k.contains("gpt") || k.contains("claude")) && k.len() > 8 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Migrate headers that are actually model IDs into the models list. Returns true if migrated.
+    pub fn migrate_headers_to_models(&mut self) -> bool {
+        let mut migrated = false;
+        if let Some(obj) = self.headers.clone().and_then(|v| v.as_object().cloned()) {
+            let mut new_headers = serde_json::Map::new();
+            for (k, v) in obj {
+                let val_str = v.as_str().unwrap_or("");
+                let is_model_like = k == val_str && (k.contains('/') || k.len() > 12 && (k.contains("nemotron") || k.contains("gpt") || k.contains("claude") || k.contains("llama")));
+                if is_model_like {
+                    if !self.models.iter().any(|m| m.id == k) {
+                        self.models.push(ModelEntry {
+                            id: k.clone(),
+                            display_name: k.clone(),
+                            vision: false,
+                            tool_calling: true,
+                            streaming: true,
+                            context_window: None,
+                            max_output_tokens: None,
+                        });
+                        migrated = true;
+                    }
+                    // Do not keep this header
+                } else {
+                    new_headers.insert(k, v);
+                }
+            }
+            if migrated {
+                if new_headers.is_empty() {
+                    self.headers = None;
+                } else {
+                    self.headers = Some(serde_json::Value::Object(new_headers));
+                }
+            }
+        }
+        migrated
+    }
+
     /// Build a `ModelConfig` compatible with the legacy `[models]` map for a
     /// given model under this provider. Used by the gateway adapter.
     pub fn to_model_config(&self, model_id: &str) -> Option<ModelConfig> {
@@ -321,7 +408,7 @@ impl ProviderEntry {
             provider: self.protocol.clone(),
             base_url: self.base_url.clone(),
             model: model_id.to_string(),
-            api_key_env: self.api_key_env.clone(),
+            api_key_env: self.effective_credential(),
             headers: self.headers.clone(),
             extra_body: self.extra_body.clone(),
         })

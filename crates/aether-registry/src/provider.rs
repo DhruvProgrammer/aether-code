@@ -3,23 +3,60 @@
 use serde::{Deserialize, Serialize};
 
 /// Authentication scheme.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum AuthConfig {
     /// `Authorization: Bearer <key>`. Key read from env var `name`.
     BearerEnv { name: String },
+    /// `Authorization: Bearer <key>` with raw key value (not env var).
+    BearerRaw { key: String },
     /// `x-api-key: <key>`. Key read from env var `name`.
     ApiKeyEnv { name: String },
+    /// `x-api-key: <key>` with raw key value.
+    ApiKeyRaw { key: String },
     /// No auth (local server, Ollama-style).
     None,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BearerEnv { name } => f.debug_struct("BearerEnv").field("name", name).finish(),
+            Self::BearerRaw { .. } => f.debug_struct("BearerRaw").field("key", &"[REDACTED]").finish(),
+            Self::ApiKeyEnv { name } => f.debug_struct("ApiKeyEnv").field("name", name).finish(),
+            Self::ApiKeyRaw { .. } => f.debug_struct("ApiKeyRaw").field("key", &"[REDACTED]").finish(),
+            Self::None => write!(f, "None"),
+        }
+    }
 }
 
 impl AuthConfig {
     pub fn env_var(&self) -> Option<&str> {
         match self {
             Self::BearerEnv { name } | Self::ApiKeyEnv { name } => Some(name.as_str()),
-            Self::None => None,
+            Self::BearerRaw { .. } | Self::ApiKeyRaw { .. } | Self::None => None,
         }
+    }
+
+    /// Resolve the actual key value, handling env var vs raw.
+    pub fn resolve(&self) -> Result<String, String> {
+        match self {
+            Self::BearerEnv { name } | Self::ApiKeyEnv { name } => {
+                std::env::var(name).map_err(|_| format!("env {name} is not set"))
+            }
+            Self::BearerRaw { key } | Self::ApiKeyRaw { key } => {
+                if key.trim().is_empty() {
+                    Err("credential is empty".into())
+                } else {
+                    Ok(key.clone())
+                }
+            }
+            Self::None => Ok(String::new()),
+        }
+    }
+
+    pub fn is_raw(&self) -> bool {
+        matches!(self, Self::BearerRaw { .. } | Self::ApiKeyRaw { .. })
     }
 }
 

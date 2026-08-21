@@ -262,6 +262,8 @@ export interface ProviderEntryDto {
   protocol: string;
   base_url: string;
   api_key_env: string;
+  auth_type?: string | null;
+  api_key?: string | null;
   headers?: Record<string, string> | null;
   extra_body?: Record<string, unknown> | null;
   models: ModelEntryDto[];

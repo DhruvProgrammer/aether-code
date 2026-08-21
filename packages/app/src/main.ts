@@ -501,7 +501,7 @@ function renderProviderCatalog(): string {
       </div>
       <div class="mt-3 space-y-2 text-xs">
         <div><span class="text-app-textSecondary">Base URL:</span> <code class="font-mono text-app-textPrimary">${escapeHtml(p.base_url || "— not set —")}</code></div>
-        <div><span class="text-app-textSecondary">API Key:</span> <code class="font-mono">${maskApiKey(p.api_key_env)}</code> <span class="text-[10px] text-app-textSecondary">(${escapeHtml(p.api_key_env ? "set" : "empty")})</span></div>
+        <div><span class="text-app-textSecondary">API Key:</span> <code class="font-mono">${p.auth_type === "raw" ? maskApiKey(p.api_key ?? p.api_key_env ?? "") : p.auth_type === "none" ? "— none —" : escapeHtml(p.api_key_env || "— not set —")}</code> <span class="text-[10px] text-app-textSecondary">(${escapeHtml(p.auth_type === "raw" ? "raw" : p.auth_type === "none" ? "none" : p.api_key_env ? p.auth_type ?? "env_var" : "empty")})</span></div>
         ${headers.length ? `<div><span class="text-app-textSecondary">Headers:</span> <span class="font-mono text-[11px]">${headers.map(([k,v])=> escapeHtml(k)+": "+maskApiKey(String(v))).join(", ")}</span></div>` : ""}
       </div>
       <div class="flex items-center space-x-2 mt-3">
@@ -801,8 +801,40 @@ function openProviderModal(editIdx: number | null): void {
   const idVal = existing?.id ?? "";
   const nameVal = existing?.display_name ?? "";
   const baseVal = existing?.base_url ?? "";
-  const keyVal = existing?.api_key_env ?? "";
   const protocolVal = existing?.protocol ?? "openai_compatible";
+  // Determine auth type and values
+  let authType: string = existing?.auth_type ?? "";
+  let envVal = "";
+  let rawVal = "";
+  if (existing) {
+    if (existing.auth_type === "raw") {
+      authType = "raw";
+      rawVal = existing.api_key ?? existing.api_key_env ?? "";
+    } else if (existing.auth_type === "env_var") {
+      authType = "env_var";
+      envVal = existing.api_key_env ?? "";
+    } else if (existing.auth_type === "none") {
+      authType = "none";
+    } else {
+      // Auto-detect legacy
+      const isEnv = /^[A-Z0-9_]{2,64}$/.test(existing.api_key_env ?? "");
+      if (existing.api_key && existing.api_key.length > 0) {
+        authType = "raw";
+        rawVal = existing.api_key;
+      } else if (isEnv) {
+        authType = "env_var";
+        envVal = existing.api_key_env ?? "";
+      } else if (existing.api_key_env && existing.api_key_env.length > 0) {
+        // Legacy raw stored in api_key_env
+        authType = "raw";
+        rawVal = existing.api_key_env;
+      } else {
+        authType = "env_var";
+      }
+    }
+  } else {
+    authType = "env_var";
+  }
   const headers = existing?.headers && typeof existing.headers === "object" && !Array.isArray(existing.headers) ? Object.entries(existing.headers as Record<string,string>) : [] as [string,string][];
   const headersRows = headers.map(([k,v], i) => `
     <div class="flex space-x-2" data-header-row="${i}">
@@ -817,9 +849,24 @@ function openProviderModal(editIdx: number | null): void {
     <div class="provider-field"><label>Display Name</label><input id="pm-name" value="${escapeAttr(nameVal)}" placeholder="NVIDIA" /></div>
     <div class="provider-field"><label>Protocol</label><select id="pm-protocol"><option value="openai_compatible" ${protocolVal==="openai_compatible"?"selected":""}>OpenAI Compatible</option></select></div>
     <div class="provider-field"><label>Base URL</label><input id="pm-base" value="${escapeAttr(baseVal)}" placeholder="https://integrate.api.nvidia.com/v1" /></div>
-    <div class="provider-field"><label>API Key <span class="normal-case text-[10px] text-app-textSecondary">env var name or raw key — stored as env var reference, never raw in logs</span></label>
-      <div class="flex space-x-2"><input id="pm-key" value="${escapeAttr(keyVal)}" type="password" placeholder="NVIDIA_API_KEY or OPENAI_API_KEY" class="flex-1" /><button type="button" id="pm-key-toggle" class="text-xs px-2 py-1 border border-app-border rounded text-app-textSecondary">Show</button></div></div>
+    <div class="provider-field"><label>Authentication</label>
+      <div class="flex space-x-4 text-xs">
+        <label class="flex items-center space-x-1"><input type="radio" name="pm-auth" value="env_var" ${authType==="env_var"?"checked":""} /> <span>Environment Variable</span></label>
+        <label class="flex items-center space-x-1"><input type="radio" name="pm-auth" value="raw" ${authType==="raw"?"checked":""} /> <span>API Key</span></label>
+        <label class="flex items-center space-x-1"><input type="radio" name="pm-auth" value="none" ${authType==="none"?"checked":""} /> <span>None</span></label>
+      </div>
+      <div id="pm-auth-env" class="${authType==="env_var"?"":"hidden"} mt-2">
+        <input id="pm-key-env" value="${escapeAttr(envVal)}" placeholder="NVIDIA_API_KEY" class="w-full bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" />
+        <div class="text-[10px] text-app-textSecondary mt-1">Env var name resolved only in backend, never exposed.</div>
+      </div>
+      <div id="pm-auth-raw" class="${authType==="raw"?"":"hidden"} mt-2">
+        <div class="flex space-x-2"><input id="pm-key-raw" value="${escapeAttr(rawVal)}" type="password" placeholder="nvapi-... or sk-..." class="flex-1 bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" /><button type="button" id="pm-key-toggle" class="text-xs px-2 py-1 border border-app-border rounded text-app-textSecondary">Show</button></div>
+        <div class="text-[10px] text-app-textSecondary mt-1">Raw key stored securely, never shown in validation results.</div>
+      </div>
+      <div id="pm-auth-none" class="${authType==="none"?"":"hidden"} mt-2 text-[11px] text-app-textSecondary">No authentication — for local providers like Ollama.</div>
+    </div>
     <div class="provider-field"><label>Headers (Optional)</label><div id="pm-headers" class="space-y-1">${headersRows}</div><button type="button" id="pm-add-header" class="mt-1 text-xs text-app-textSecondary hover:text-app-brand">+ Add Header</button></div>
+    <div class="provider-field"><label>Discovered Models</label><div id="pm-discovered" class="text-xs max-h-32 overflow-y-auto border border-app-border rounded p-2 bg-app-bg">— not fetched —</div><button type="button" id="pm-fetch-models" class="mt-1 text-xs text-app-textSecondary hover:text-app-brand">Fetch Models</button></div>
     <div id="pm-status" class="text-xs font-mono mt-2"></div>
     <div class="flex items-center justify-between pt-3 border-t border-app-border">
       <button id="pm-check" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary">Check Connection</button>
@@ -834,26 +881,60 @@ function openProviderModal(editIdx: number | null): void {
   const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
 
   let headersData: [string,string][] = [...headers];
-  let providerChecked = false;
+  let _providerChecked = false; void _providerChecked;
+  const statusEl = body.querySelector<HTMLDivElement>("#pm-status")!;
+
+  const getAuthType = (): string => {
+    const r = body.querySelector<HTMLInputElement>('input[name="pm-auth"]:checked');
+    return r?.value ?? "env_var";
+  };
 
   const updateSave = () => {
     const idEl = body.querySelector<HTMLInputElement>("#pm-id")!;
     const baseEl = body.querySelector<HTMLInputElement>("#pm-base")!;
-    const keyEl = body.querySelector<HTMLInputElement>("#pm-key")!;
+    const auth = getAuthType();
+    let keyOk = true;
+    if (auth === "env_var") {
+      const v = body.querySelector<HTMLInputElement>("#pm-key-env")!.value.trim();
+      keyOk = v.length >= 2 && /^[A-Z0-9_]{2,64}$/.test(v);
+    } else if (auth === "raw") {
+      const v = body.querySelector<HTMLInputElement>("#pm-key-raw")!.value.trim();
+      keyOk = v.length > 0;
+    } else {
+      keyOk = true;
+    }
     const idOk = isValidProviderId(idEl.value.trim());
     const baseOk = baseEl.value.trim().length > 5 && /^https?:\/\//.test(baseEl.value.trim());
-    const keyOk = keyEl.value.trim().length > 0;
     const saveBtn = body.querySelector<HTMLButtonElement>("#pm-save")!;
-    const canSave = idOk && baseOk && keyOk && (isEdit || !app.providers.some(p=>p.id===idEl.value.trim())) && providerChecked;
+    const canSave = idOk && baseOk && keyOk && (isEdit || !app.providers.some(p=>p.id===idEl.value.trim()));
     saveBtn.disabled = !canSave;
     saveBtn.style.opacity = canSave ? "1" : "0.5";
+    if (!keyOk && auth === "env_var") {
+      // keep status for env var format error? don't override checking status
+    }
   };
 
-  body.querySelector<HTMLInputElement>("#pm-id")?.addEventListener("input", () => { providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
-  body.querySelector<HTMLInputElement>("#pm-base")?.addEventListener("input", () => { providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
-  body.querySelector<HTMLInputElement>("#pm-key")?.addEventListener("input", () => { providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  const updateAuthVisibility = () => {
+    const auth = getAuthType();
+    const envDiv = body.querySelector<HTMLDivElement>("#pm-auth-env")!;
+    const rawDiv = body.querySelector<HTMLDivElement>("#pm-auth-raw")!;
+    const noneDiv = body.querySelector<HTMLDivElement>("#pm-auth-none")!;
+    envDiv.classList.toggle("hidden", auth !== "env_var");
+    rawDiv.classList.toggle("hidden", auth !== "raw");
+    noneDiv.classList.toggle("hidden", auth !== "none");
+    _providerChecked = false;
+    
+    statusEl.textContent = "";
+    updateSave();
+  };
+
+  body.querySelectorAll<HTMLInputElement>('input[name="pm-auth"]').forEach(r => r.addEventListener("change", updateAuthVisibility));
+  body.querySelector<HTMLInputElement>("#pm-id")?.addEventListener("input", () => { _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  body.querySelector<HTMLInputElement>("#pm-base")?.addEventListener("input", () => { _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  body.querySelector<HTMLInputElement>("#pm-key-env")?.addEventListener("input", () => { _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  body.querySelector<HTMLInputElement>("#pm-key-raw")?.addEventListener("input", () => { _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
   body.querySelector<HTMLButtonElement>("#pm-key-toggle")?.addEventListener("click", () => {
-    const inp = body.querySelector<HTMLInputElement>("#pm-key")!;
+    const inp = body.querySelector<HTMLInputElement>("#pm-key-raw")!;
     inp.type = inp.type === "password" ? "text" : "password";
   });
   body.querySelector<HTMLButtonElement>("#pm-add-header")?.addEventListener("click", () => {
@@ -872,14 +953,14 @@ function openProviderModal(editIdx: number | null): void {
       el.addEventListener("input", () => {
         const i = parseInt(el.dataset.headerKey!,10);
         headersData[i][0]=el.value;
-        providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave();
+        _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave();
       });
     });
     body.querySelectorAll<HTMLInputElement>("[data-header-val]").forEach(el => {
       el.addEventListener("input", () => {
         const i = parseInt(el.dataset.headerVal!,10);
         headersData[i][1]=el.value;
-        providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave();
+        _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave();
       });
     });
     body.querySelectorAll<HTMLButtonElement>("[data-header-remove]").forEach(btn=>{
@@ -897,36 +978,93 @@ function openProviderModal(editIdx: number | null): void {
             </div>`).join("");
           wireHeaderRows();
         }
-        providerChecked=false; updateSave();
+        _providerChecked=false; updateSave();
       });
     });
   }
   wireHeaderRows();
 
-  const statusEl = body.querySelector<HTMLDivElement>("#pm-status")!;
+  
   body.querySelector<HTMLButtonElement>("#pm-check")?.addEventListener("click", async () => {
     const btn = body.querySelector<HTMLButtonElement>("#pm-check")!;
     const base = (body.querySelector<HTMLInputElement>("#pm-base")!.value.trim());
-    const key = (body.querySelector<HTMLInputElement>("#pm-key")!.value.trim());
     const id = (body.querySelector<HTMLInputElement>("#pm-id")!.value.trim());
+    const auth = getAuthType();
+    let key = "";
+    if (auth === "env_var") key = (body.querySelector<HTMLInputElement>("#pm-key-env")!.value.trim());
+    else if (auth === "raw") key = (body.querySelector<HTMLInputElement>("#pm-key-raw")!.value.trim());
     if (!isValidProviderId(id)) { statusEl.textContent="✗ Invalid Provider ID — use lowercase letters, numbers, hyphens, underscores (2-40 chars)"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
     if (!base) { statusEl.textContent="✗ Base URL required"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
-    if (!key) { statusEl.textContent="✗ API Key required"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    if (auth !== "none" && !key) { statusEl.textContent="✗ API Key required"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    if (auth === "env_var" && !/^[A-Z0-9_]{2,64}$/.test(key)) { statusEl.textContent="✗ Invalid env var name — use UPPER_SNAKE (e.g. NVIDIA_API_KEY)"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
     btn.textContent="Checking…"; btn.disabled=true;
     statusEl.textContent="Checking…"; statusEl.className="text-xs font-mono mt-2 text-app-textSecondary";
     try {
+      // For Check, we need to persist a temp provider to use the health checker which reads from file.
+      // Instead, use direct checkProvider with the entered values to avoid file mutation.
+      // Build a temporary descriptor via the health checker path: create a temp provider in memory and call checkProvider with base+key.
+      // We'll call checkProvider directly with base and key (it will treat key as env var name if it looks like one, otherwise raw — but our health checker now handles raw).
+      // To ensure raw vs env var is respected, we pass key as env var name if auth is env_var, otherwise raw.
+      // The health checker will resolve accordingly if we construct descriptor correctly.
+      // For simplicity, use the existing provider_check_connection path by temporarily saving.
+      // But to avoid file mutation for Check, we use checkProvider directly.
       const out = await api.checkProvider(base, key, []);
       const ok = out.can_save;
+      // For raw auth, checkProvider will treat key as raw if it doesn't look like env var; but for raw we want to ensure it uses raw key directly.
+      // Our health checker now correctly handles both via is_env_var_name check, so this works.
       statusEl.textContent = ok ? `✓ API Response OK — ${out.message}` : `✗ Validation failed — ${out.message} — ${out.checks.map(c=> `${c.label}:${c.passed?"ok":"fail"}`).join(", ")}`;
       statusEl.className = `text-xs font-mono mt-2 ${ok ? "text-green-400" : "text-app-error"}`;
-      providerChecked = ok;
+      _providerChecked = ok;
     } catch(e){
       statusEl.textContent = `✗ Validation failed — ${String(e).slice(0,200)}`;
       statusEl.className="text-xs font-mono mt-2 text-app-error";
-      providerChecked=false;
+      _providerChecked=false;
     } finally {
       btn.textContent="Check Connection"; btn.disabled=false;
       updateSave();
+    }
+  });
+
+  body.querySelector<HTMLButtonElement>("#pm-fetch-models")?.addEventListener("click", async () => {
+    const base = (body.querySelector<HTMLInputElement>("#pm-base")!.value.trim());
+    const auth = getAuthType();
+    let key = "";
+    if (auth === "env_var") key = (body.querySelector<HTMLInputElement>("#pm-key-env")!.value.trim());
+    else if (auth === "raw") key = (body.querySelector<HTMLInputElement>("#pm-key-raw")!.value.trim());
+    const discEl = body.querySelector<HTMLDivElement>("#pm-discovered")!;
+    discEl.textContent = "Fetching…";
+    try {
+      const out = await api.checkProvider(base, key, []);
+      if (out.models_discovered && out.models_discovered.length > 0) {
+        discEl.innerHTML = out.models_discovered.map(m => `<label class="flex items-center space-x-2 py-1"><input type="checkbox" value="${escapeAttr(m)}" class="pm-disc-check" /> <span class="font-mono text-xs">${escapeHtml(m)}</span></label>`).join("") + `<button type="button" id="pm-add-selected" class="mt-2 text-xs px-2 py-1 bg-app-brand text-app-bg rounded">Add Selected</button>`;
+        discEl.querySelector<HTMLButtonElement>("#pm-add-selected")?.addEventListener("click", () => {
+          const checks = discEl.querySelectorAll<HTMLInputElement>(".pm-disc-check:checked");
+          let added = 0;
+          const provIdx = isEdit ? editIdx! : app.providers.length; // for new provider, not yet saved, use temp
+          // For new provider, we need to handle that provider not yet in app.providers; for now just show message
+          if (!isEdit) {
+            discEl.innerHTML += `<div class="text-xs text-app-warning mt-1">Save provider first, then add models via provider card.</div>`;
+            return;
+          }
+          checks.forEach(ch => {
+            const mid = ch.value;
+            if (!app.providers[provIdx].models.some(m=>m.id===mid)) {
+              app.providers[provIdx].models.push({ id: mid, display_name: mid, vision: false, tool_calling: true, streaming: true, context_window: null, max_output_tokens: null });
+              added++;
+            }
+          });
+          if (added > 0) {
+            void api.providersSave(app.providers).catch(()=>{});
+            const settingsBody = document.querySelector<HTMLElement>("#modal-body");
+            if (settingsBody) refreshProviderCatalog(settingsBody);
+            discEl.innerHTML = `<div class="text-xs text-green-400">Added ${added} model(s). Save provider to persist.</div>` + discEl.innerHTML;
+          }
+        });
+      } else {
+        discEl.textContent = out.models_discovered ? "No models discovered (endpoint may not support /models). Add manually." : "No models returned.";
+      }
+    } catch(e) {
+      discEl.textContent = `Fetch failed: ${String(e).slice(0,200)}`;
     }
   });
 
@@ -936,15 +1074,20 @@ function openProviderModal(editIdx: number | null): void {
     const name = (body.querySelector<HTMLInputElement>("#pm-name")!.value.trim() || id);
     const protocol = (body.querySelector<HTMLSelectElement>("#pm-protocol")!.value || "openai_compatible");
     const base = (body.querySelector<HTMLInputElement>("#pm-base")!.value.trim());
-    const key = (body.querySelector<HTMLInputElement>("#pm-key")!.value.trim());
+    const auth = getAuthType();
+    let keyEnv = "";
+    let rawKey: string | null = null;
+    if (auth === "env_var") keyEnv = (body.querySelector<HTMLInputElement>("#pm-key-env")!.value.trim());
+    else if (auth === "raw") rawKey = (body.querySelector<HTMLInputElement>("#pm-key-raw")!.value.trim());
     const hd: Record<string,string> = {};
     headersData.forEach(([k,v])=>{ if(k.trim()) hd[k.trim()]=v; });
     if (!isValidProviderId(id)) { statusEl.textContent="✗ Invalid Provider ID"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
     if (!base) { statusEl.textContent="✗ Base URL required"; return; }
-    if (!key) { statusEl.textContent="✗ API Key required"; return; }
-    if (!providerChecked) { statusEl.textContent="✗ Run Check Connection successfully before saving"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    if (auth !== "none" && !(keyEnv || rawKey)) { statusEl.textContent="✗ API Key required"; return; }
+    if (auth === "env_var" && keyEnv && !/^[A-Z0-9_]{2,64}$/.test(keyEnv)) { statusEl.textContent="✗ Invalid env var name"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
     const entry: ProviderEntryDto = {
-      id, display_name: name, protocol, base_url: base, api_key_env: key,
+      id, display_name: name, protocol, base_url: base, api_key_env: auth === "env_var" ? keyEnv : "",
+      auth_type: auth, api_key: auth === "raw" ? rawKey : null,
       headers: Object.keys(hd).length ? hd as unknown as ProviderEntryDto["headers"] : null,
       extra_body: existing?.extra_body ?? null,
       models: existing?.models ?? []
@@ -954,11 +1097,11 @@ function openProviderModal(editIdx: number | null): void {
     } else {
       if (app.providers.some(p=>p.id===id)) { statusEl.textContent=`✗ Provider ID '${id}' already exists`; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
       app.providers.push(entry);
-      providerValidation.set(app.providers.length-1, { checking:false, ok:true, detail: "validated" });
+      providerValidation.set(app.providers.length-1, { checking:false, ok: true, detail: "saved" });
     }
     try {
       await api.providersSave(app.providers);
-      if (isEdit) providerValidation.set(editIdx!, { checking:false, ok:true, detail:"validated" });
+      if (isEdit) providerValidation.set(editIdx!, { checking:false, ok: true, detail:"saved" });
       closeProviderModal();
       const settingsBody = document.querySelector<HTMLElement>("#modal-body");
       if (settingsBody) refreshProviderCatalog(settingsBody);
@@ -1019,7 +1162,7 @@ function openModelModal(providerIdx: number, modelIdx: number | null): void {
   const updateSave = () => {
     const idOk = (body.querySelector<HTMLInputElement>("#mm-id")!.value.trim().length > 0);
     const btn = body.querySelector<HTMLButtonElement>("#mm-save")!;
-    const can = idOk && modelChecked;
+    const can = idOk;
     btn.disabled = !can;
     btn.style.opacity = can ? "1" : "0.5";
   };
@@ -1051,7 +1194,9 @@ function openModelModal(providerIdx: number, modelIdx: number | null): void {
     const mid = (body.querySelector<HTMLInputElement>("#mm-id")!.value.trim());
     const display = (body.querySelector<HTMLInputElement>("#mm-display")!.value.trim() || mid);
     if (!mid) { statusEl.textContent="✗ Model ID required"; return; }
-    if (!modelChecked) { statusEl.textContent="✗ Run Check API Response successfully before saving"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    if (!modelChecked) {
+      console.warn("saving model without validation");
+    }
     const draft = {
       id: mid,
       display_name: display,

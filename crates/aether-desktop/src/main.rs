@@ -335,6 +335,8 @@ async fn run_task(
                     protocol: p.protocol,
                     base_url: p.base_url,
                     api_key_env: p.api_key_env,
+                    auth_type: p.auth_type,
+                    api_key: p.api_key,
                     headers: p.headers,
                     extra_body: p.extra_body,
                     models: p
@@ -702,7 +704,41 @@ async fn check_provider(
     api_key_env: String,
     models: Vec<String>,
 ) -> aether_registry::HealthOutcome {
-    let p = aether_registry::ProviderDescriptor::new_openai_compatible("probe", base_url, api_key_env);
+    let p = if api_key_env.trim().is_empty() {
+        aether_registry::ProviderDescriptor {
+            id: "probe".into(),
+            display_name: String::new(),
+            provider_type: "openai_compatible".into(),
+            base_url: base_url.clone(),
+            auth: aether_registry::provider::AuthConfig::None,
+            custom_headers: Default::default(),
+            extra_env: Vec::new(),
+            limits: Default::default(),
+            pricing: None,
+            status: aether_registry::provider::ProviderStatus::Unknown,
+            last_latency_ms: None,
+            last_error: None,
+            models: vec![],
+        }
+    } else if is_env_var_name(&api_key_env) {
+        aether_registry::ProviderDescriptor::new_openai_compatible("probe", base_url.clone(), api_key_env.clone())
+    } else {
+        aether_registry::ProviderDescriptor {
+            id: "probe".into(),
+            display_name: String::new(),
+            provider_type: "openai_compatible".into(),
+            base_url: base_url.clone(),
+            auth: aether_registry::provider::AuthConfig::BearerRaw { key: api_key_env.clone() },
+            custom_headers: Default::default(),
+            extra_env: Vec::new(),
+            limits: Default::default(),
+            pricing: None,
+            status: aether_registry::provider::ProviderStatus::Unknown,
+            last_latency_ms: None,
+            last_error: None,
+            models: vec![],
+        }
+    };
     let mut p = p;
     for m in models { p = p.with_model(m); }
     aether_registry::HealthChecker::new().check(&p).await
@@ -1296,6 +1332,10 @@ struct ProviderEntryDto {
     base_url: String,
     api_key_env: String,
     #[serde(default)]
+    auth_type: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
     headers: Option<serde_json::Value>,
     #[serde(default)]
     extra_body: Option<serde_json::Value>,
@@ -1325,6 +1365,32 @@ fn providers_path() -> std::path::PathBuf {
     aether_config::Config::default_dir().join("providers.json")
 }
 
+fn is_env_var_name(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && s.len() >= 2 && s.len() <= 64
+}
+
+fn effective_credential(p: &ProviderEntryDto) -> String {
+    if let Some(t) = p.auth_type.as_deref() {
+        if t == "raw" {
+            if let Some(k) = p.api_key.as_deref().filter(|s| !s.is_empty()) {
+                return k.to_string();
+            }
+            if !p.api_key_env.is_empty() && !is_env_var_name(&p.api_key_env) {
+                return p.api_key_env.clone();
+            }
+            return p.api_key.clone().unwrap_or_default();
+        } else if t == "env_var" {
+            return p.api_key_env.clone();
+        } else if t == "none" {
+            return String::new();
+        }
+    }
+    if let Some(k) = p.api_key.as_deref().filter(|s| !s.is_empty()) {
+        return k.to_string();
+    }
+    p.api_key_env.clone()
+}
+
 #[tauri::command]
 fn providers_list() -> Result<Vec<ProviderEntryDto>, String> {
     let path = providers_path();
@@ -1332,7 +1398,66 @@ fn providers_list() -> Result<Vec<ProviderEntryDto>, String> {
         return Ok(vec![]);
     }
     let txt = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let providers: Vec<ProviderEntryDto> = serde_json::from_str(&txt).unwrap_or_default();
+    let mut providers: Vec<ProviderEntryDto> = serde_json::from_str(&txt).unwrap_or_default();
+    let mut migrated = false;
+    for p in &mut providers {
+        // Migrate auth_type / api_key for legacy entries where api_key_env contains raw key
+        if p.auth_type.is_none() {
+            if p.api_key.is_none() && !p.api_key_env.is_empty() && !is_env_var_name(&p.api_key_env) {
+                // Looks like raw key stored in api_key_env (legacy bug)
+                p.auth_type = Some("raw".into());
+                p.api_key = Some(p.api_key_env.clone());
+                migrated = true;
+            } else if p.auth_type.is_none() && !p.api_key_env.is_empty() {
+                p.auth_type = Some("env_var".into());
+                migrated = true;
+            } else if p.api_key_env.is_empty() && p.api_key.is_none() {
+                p.auth_type = Some("none".into());
+                migrated = true;
+            }
+        }
+        // Migrate headers that are actually model IDs
+        if let Some(v) = p.headers.clone().and_then(|h| h.as_object().cloned()) {
+            let mut new_headers = serde_json::Map::new();
+            let mut to_migrate = Vec::new();
+            for (k, val) in &v {
+                let val_str = val.as_str().unwrap_or("");
+                let is_model_like = k == val_str && (k.contains('/') || k.len() > 12 && (k.contains("nemotron") || k.contains("gpt") || k.contains("claude") || k.contains("llama")));
+                if is_model_like {
+                    to_migrate.push(k.clone());
+                } else {
+                    new_headers.insert(k.clone(), val.clone());
+                }
+            }
+            if !to_migrate.is_empty() {
+                for mid in to_migrate {
+                    if !p.models.iter().any(|m| m.id == mid) {
+                        p.models.push(ModelEntryDto {
+                            id: mid.clone(),
+                            display_name: mid.clone(),
+                            vision: false,
+                            tool_calling: true,
+                            streaming: true,
+                            context_window: None,
+                            max_output_tokens: None,
+                        });
+                    }
+                }
+                if new_headers.is_empty() {
+                    p.headers = None;
+                } else {
+                    p.headers = Some(serde_json::Value::Object(new_headers));
+                }
+                migrated = true;
+            }
+        }
+    }
+    if migrated {
+        // Persist migrated file without exposing secrets in logs
+        if let Ok(json) = serde_json::to_string_pretty(&providers) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
     Ok(providers)
 }
 
@@ -1352,14 +1477,14 @@ async fn providers_validate(provider_id: String, model_id: String) -> Result<aet
     let prov = providers.iter().find(|p| p.id == provider_id)
         .ok_or_else(|| format!("provider '{provider_id}' not found"))?;
     // Allow validation of a model_id that is not yet in the provider's model list (e.g. Add Model flow).
-    // The model list is just UI state; validation should succeed/fail based on the provider's actual API response.
+    let cred = effective_credential(prov);
     let target = aether_gateway::ValidateTarget {
         role: aether_gateway::Role::Executor,
         model_key: format!("{provider_id}/{model_id}"),
         provider_id: prov.id.clone(),
         base_url: prov.base_url.clone(),
         model_id: model_id.clone(),
-        api_key_env: prov.api_key_env.clone(),
+        api_key_env: cred,
         headers: prov.headers.clone(),
         extra_body: prov.extra_body.clone(),
     };
@@ -1374,14 +1499,71 @@ async fn provider_check_connection(provider_id: String) -> Result<aether_registr
     if prov.base_url.trim().is_empty() {
         return Err("Base URL is empty — configure it before checking connection".into());
     }
-    if prov.api_key_env.trim().is_empty() {
-        return Err("API Key env is empty — configure it before checking connection".into());
+    let cred = effective_credential(prov);
+    if cred.trim().is_empty() && prov.auth_type.as_deref() != Some("none") {
+        // Check if headers provide auth
+        let has_headers = prov.headers.as_ref().and_then(|h| h.as_object()).map(|o| !o.is_empty()).unwrap_or(false);
+        if !has_headers {
+            return Err("Authentication is not configured — set API Key or Environment Variable".into());
+        }
     }
-    let mut desc = aether_registry::ProviderDescriptor::new_openai_compatible(
-        prov.id.clone(),
-        prov.base_url.clone(),
-        prov.api_key_env.clone(),
-    );
+    let mut desc = if prov.auth_type.as_deref() == Some("none") && cred.trim().is_empty() {
+        aether_registry::ProviderDescriptor {
+            id: prov.id.clone(),
+            display_name: prov.display_name.clone(),
+            provider_type: prov.protocol.clone(),
+            base_url: prov.base_url.clone(),
+            auth: aether_registry::provider::AuthConfig::None,
+            custom_headers: Default::default(),
+            extra_env: Vec::new(),
+            limits: Default::default(),
+            pricing: None,
+            status: aether_registry::provider::ProviderStatus::Unknown,
+            last_latency_ms: None,
+            last_error: None,
+            models: vec![],
+        }
+    } else if !cred.is_empty() && is_env_var_name(&cred) {
+        // Check if env var actually exists for better error message; health checker will also check
+        aether_registry::ProviderDescriptor::new_openai_compatible(
+            prov.id.clone(),
+            prov.base_url.clone(),
+            cred,
+        )
+    } else if !cred.is_empty() {
+        // Raw key
+        let mut d = aether_registry::ProviderDescriptor {
+            id: prov.id.clone(),
+            display_name: prov.display_name.clone(),
+            provider_type: prov.protocol.clone(),
+            base_url: prov.base_url.clone(),
+            auth: aether_registry::provider::AuthConfig::BearerRaw { key: cred },
+            custom_headers: Default::default(),
+            extra_env: Vec::new(),
+            limits: Default::default(),
+            pricing: None,
+            status: aether_registry::provider::ProviderStatus::Unknown,
+            last_latency_ms: None,
+            last_error: None,
+            models: vec![],
+        };
+        // Also handle headers below
+        d
+    } else {
+        aether_registry::ProviderDescriptor::new_openai_compatible(
+            prov.id.clone(),
+            prov.base_url.clone(),
+            prov.api_key_env.clone(),
+        )
+    };
+    // Custom headers
+    if let Some(h) = prov.headers.as_ref().and_then(|v| v.as_object()) {
+        for (k, v) in h {
+            if let Some(s) = v.as_str() {
+                desc = desc.with_header(k, s);
+            }
+        }
+    }
     for m in &prov.models {
         desc = desc.with_model(m.id.clone());
     }
@@ -1425,6 +1607,8 @@ fn migrate_legacy_models() -> Result<u32, String> {
                     protocol: if mc.provider.is_empty() { "openai_compatible".into() } else { mc.provider.clone() },
                     base_url: mc.base_url.clone(),
                     api_key_env: mc.api_key_env.clone(),
+                    auth_type: Some("env_var".into()),
+                    api_key: None,
                     headers: None,
                     extra_body: mc.extra_body.clone(),
                     models: vec![ModelEntryDto {
