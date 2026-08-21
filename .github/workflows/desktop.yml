@@ -51,6 +51,11 @@ jobs:
           mkdir -p crates/aether-desktop/dist
           cp -r packages/app/dist/. crates/aether-desktop/dist/
 
+      - name: Clean stale installers from cache
+        shell: bash
+        run: |
+          rm -rf target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+
       - name: Build Tauri installer
         working-directory: crates/aether-desktop
         env:
