@@ -23,6 +23,7 @@ pub struct ValidateTarget {
     pub base_url: String,
     pub model_id: String,
     pub api_key_env: String,
+    pub headers: Option<serde_json::Value>,
     pub extra_body: Option<serde_json::Value>,
 }
 
@@ -149,6 +150,7 @@ pub async fn validate_binding(target: &ValidateTarget) -> ValidationOutcome {
         &target.base_url,
         &target.model_id,
         &target.api_key_env,
+        target.headers.as_ref(),
         target.extra_body.as_ref(),
     );
     let snapshot = ModelRoleSnapshot {
@@ -206,6 +208,7 @@ mod tests {
             base_url: "https://example.invalid/v1".into(),
             model_id: "gpt".into(),
             api_key_env: "GW_TEST_MISSING_KEY".into(),
+            headers: None,
             extra_body: None,
         };
         let out = validate_binding(&t).await;
@@ -233,6 +236,7 @@ mod tests {
             base_url: "http://127.0.0.1:1/v1".into(),
             model_id: "gpt".into(),
             api_key_env: "GW_TEST_CONN_REFUSED_KEY".into(),
+            headers: None,
             extra_body: None,
         };
         let started = std::time::Instant::now();

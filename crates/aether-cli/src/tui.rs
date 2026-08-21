@@ -813,6 +813,7 @@ pub async fn run_tui(cli: Cli, _original_args: Vec<String>) -> Result<()> {
                 base_url: base_url.clone(),
                 model: "gpt-4o-mini".into(),
                 api_key_env: "OPENAI_API_KEY".into(),
+                headers: None,
                 extra_body: None,
             };
             // We won't actually call the placeholder provider at runtime, but
@@ -867,6 +868,7 @@ pub async fn run_tui(cli: Cli, _original_args: Vec<String>) -> Result<()> {
             base_url: base_url.clone(),
             model: "gpt-4o-mini".into(),
             api_key_env: "OPENAI_API_KEY".into(),
+            headers: None,
             extra_body: None,
         };
         std::env::set_var("OPENAI_API_KEY", "PENDING_SETUP");

@@ -606,6 +606,7 @@ async fn gateway_validate_role(role: String, config: DesktopConfig) -> Result<Ro
         base_url: mb.base_url.clone(),
         model_id: mb.model.clone(),
         api_key_env: mb.api_key_env.clone(),
+        headers: None,
         extra_body: mb.extra_body.clone(),
     };
     let out = aether_gateway::validate_binding(&target).await;
@@ -649,6 +650,7 @@ async fn gateway_validation_status(role: String, config: DesktopConfig) -> Resul
             &mb.base_url,
             &mb.model,
             &mb.api_key_env,
+            None,
             mb.extra_body.as_ref(),
         ),
         None => String::new(),
@@ -1346,18 +1348,41 @@ async fn providers_validate(provider_id: String, model_id: String) -> Result<aet
     let providers = providers_list()?;
     let prov = providers.iter().find(|p| p.id == provider_id)
         .ok_or_else(|| format!("provider '{provider_id}' not found"))?;
-    let _model = prov.models.iter().find(|m| m.id == model_id)
-        .ok_or_else(|| format!("model '{model_id}' not found in provider '{provider_id}'"))?;
+    // Allow validation of a model_id that is not yet in the provider's model list (e.g. Add Model flow).
+    // The model list is just UI state; validation should succeed/fail based on the provider's actual API response.
     let target = aether_gateway::ValidateTarget {
         role: aether_gateway::Role::Executor,
         model_key: format!("{provider_id}/{model_id}"),
-        provider_id: prov.protocol.clone(),
+        provider_id: prov.id.clone(),
         base_url: prov.base_url.clone(),
         model_id: model_id.clone(),
         api_key_env: prov.api_key_env.clone(),
+        headers: prov.headers.clone(),
         extra_body: prov.extra_body.clone(),
     };
     Ok(aether_gateway::validate_binding(&target).await)
+}
+
+#[tauri::command]
+async fn provider_check_connection(provider_id: String) -> Result<aether_registry::HealthOutcome, String> {
+    let providers = providers_list()?;
+    let prov = providers.iter().find(|p| p.id == provider_id)
+        .ok_or_else(|| format!("provider '{provider_id}' not found"))?;
+    if prov.base_url.trim().is_empty() {
+        return Err("Base URL is empty — configure it before checking connection".into());
+    }
+    if prov.api_key_env.trim().is_empty() {
+        return Err("API Key env is empty — configure it before checking connection".into());
+    }
+    let mut desc = aether_registry::ProviderDescriptor::new_openai_compatible(
+        prov.id.clone(),
+        prov.base_url.clone(),
+        prov.api_key_env.clone(),
+    );
+    for m in &prov.models {
+        desc = desc.with_model(m.id.clone());
+    }
+    Ok(aether_registry::HealthChecker::new().check(&desc).await)
 }
 
 /// Migrate the legacy `[agent]` model1/model2/model3 + `[models]` map into the
@@ -1522,6 +1547,7 @@ fn resolve_session_controller(
                             base_url: prov.base_url.clone(),
                             model: ctrl.model_id.clone(),
                             api_key_env: prov.api_key_env.clone(),
+                            headers: prov.headers.clone(),
                             extra_body: prov.extra_body.clone(),
                         };
                         let provider = aether_models::build_provider(&mc).map_err(|e| e.to_string())?;
@@ -1645,6 +1671,7 @@ fn main() {
             providers_list,
             providers_save,
             providers_validate,
+            provider_check_connection,
             migrate_legacy_models,
             compact_session,
             get_task_state,

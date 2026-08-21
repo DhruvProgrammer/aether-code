@@ -85,6 +85,26 @@
       .bg-preview img { width: 100%; height: 100%; object-fit: cover; }
       .validation-err { color: #bc484a; font-size: 11px; font-family: 'JetBrains Mono', monospace; white-space: pre-wrap; margin-top: 6px; }
       .validation-ok  { color: #7ca6b4; font-size: 11px; margin-top: 6px; }
+
+      /* ---- Sidebar collapse (spec §30) ---- */
+      #workspace-sidebar { transition: width 0.22s cubic-bezier(.2,.8,.2,1); overflow: hidden; }
+      #workspace-sidebar.collapsed { width: 48px !important; }
+      #workspace-sidebar.collapsed .collapse-hide { display: none !important; }
+      #workspace-sidebar.collapsed .collapse-show { display: flex !important; }
+      #main-content { transition: margin-left 0.22s cubic-bezier(.2,.8,.2,1); }
+      .sidebar-toggle { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 6px; border: 1px solid #2a2f3d; color: #8c9296; background: #1d2230; }
+      .sidebar-toggle:hover { border-color: #7ca6b4; color: #7ca6b4; }
+      /* ---- Provider card redesign ---- */
+      .provider-card { background: #1d2230; border: 1px solid #2a2f3d; border-radius: 10px; padding: 16px; }
+      .provider-field { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+      .provider-field label { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: #8c9296; }
+      .provider-field input, .provider-field select { background: #0f1115; border: 1px solid #2a2f3d; border-radius: 6px; padding: 6px 8px; color: #e8e8e8; font-size: 12px; font-family: 'JetBrains Mono', ui-monospace, monospace; }
+      .provider-field input:focus, .provider-field select:focus { outline: none; border-color: #7ca6b4; }
+      .provider-header-row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+      /* ---- Modal overlays for provider/model ---- */
+      .modal-overlay { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,.55); backdrop-filter: blur(4px); display:none; align-items:center; justify-content:center; padding: 20px; }
+      .modal-overlay.open { display:flex; }
+      .modal-card { background:#161922; border:1px solid #2a2f3d; border-radius: 12px; width: 100%; max-width: 560px; max-height: 85vh; overflow: hidden; display:flex; flex-direction:column; }
     </style>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
@@ -117,22 +137,32 @@
     <div id="workspace-sidebar" class="fixed left-0 top-10 bottom-0 w-64 bg-app-surface border-r border-app-border z-30 flex-col" style="display:none">
       <div class="p-4 border-b border-app-border">
         <div class="flex items-center justify-between">
-          <div class="min-w-0">
+          <div class="min-w-0 collapse-hide">
             <div id="ws-sidebar-name" class="text-sm font-semibold text-app-textPrimary truncate">Workspace</div>
             <div id="ws-sidebar-path" class="text-xs text-app-textSecondary truncate font-mono"></div>
           </div>
-          <button id="ws-switch-btn" class="text-app-textSecondary hover:text-app-brand shrink-0 ml-2" title="Switch folder">
-            <i class="w-4 h-4" data-lucide="folder-open"></i>
-          </button>
+          <div class="flex items-center space-x-1 shrink-0">
+            <button id="sidebar-toggle" class="sidebar-toggle" title="Collapse sidebar">
+              <i class="w-3.5 h-3.5" data-lucide="panel-left-close"></i>
+            </button>
+            <button id="ws-switch-btn" class="text-app-textSecondary hover:text-app-brand ml-1 collapse-hide" title="Switch folder">
+              <i class="w-4 h-4" data-lucide="folder-open"></i>
+            </button>
+          </div>
         </div>
       </div>
-      <div class="p-3">
+      <div class="p-3 collapse-hide">
         <button id="ws-new-session-btn" class="w-full flex items-center space-x-2 text-xs text-app-textSecondary hover:text-app-brand border border-app-border rounded px-3 py-2 hover:border-app-brand transition-colors">
           <i class="w-3.5 h-3.5" data-lucide="plus"></i>
           <span>New Session</span>
         </button>
       </div>
-      <div id="ws-session-list" class="flex-1 overflow-y-auto px-3 pb-3 space-y-1"></div>
+      <div id="ws-session-list" class="flex-1 overflow-y-auto px-3 pb-3 space-y-1 collapse-hide"></div>
+      <div class="collapse-show hidden items-center justify-center p-3">
+        <button id="sidebar-expand" class="sidebar-toggle" title="Expand sidebar">
+          <i class="w-3.5 h-3.5" data-lucide="panel-left-open"></i>
+        </button>
+      </div>
     </div>
 
     <!-- BEGIN: Top Window Controls -->
@@ -161,7 +191,7 @@
     </div>
 
     <!-- BEGIN: Main App Header -->
-    <header class="flex items-center justify-between px-6 py-4 shrink-0">
+    <header id="app-header" class="flex items-center justify-between px-6 py-4 shrink-0">
       <h1 id="session-title" class="text-lg font-semibold text-app-brand">aether</h1>
       <div class="flex items-center space-x-4">
         <div id="status-pill" class="hidden items-center space-x-2 text-xs text-app-textSecondary bg-app-surface border border-app-border rounded-full px-3 py-1">
@@ -183,7 +213,7 @@
     </main>
 
     <!-- BEGIN: Input Area -->
-    <div class="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-app-bg via-app-bg to-transparent">
+    <div id="input-bar" class="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-app-bg via-app-bg to-transparent">
       <div class="max-w-4xl mx-auto">
         <div class="bg-app-inputBg border border-app-border rounded-xl p-3 flex flex-col shadow-lg focus-within:border-app-brand/60 transition-colors">
           <textarea id="prompt-input" rows="1" class="w-full bg-transparent border-none text-app-textPrimary placeholder-app-textSecondary focus:ring-0 resize-none pb-3 text-sm font-sans" placeholder="Ask anything, / for commands, @ for context..."></textarea>
@@ -227,6 +257,26 @@
       </div>
     </div>
 
+    <!-- Provider Modal -->
+    <div id="provider-modal" class="modal-overlay">
+      <div class="modal-card">
+        <div class="flex items-center justify-between px-5 py-3 border-b border-app-border">
+          <h2 id="provider-modal-title" class="text-sm font-semibold text-app-brand">Add Provider</h2>
+          <button id="provider-modal-close" class="text-app-textSecondary hover:text-app-textPrimary"><i class="w-5 h-5" data-lucide="x"></i></button>
+        </div>
+        <div id="provider-modal-body" class="p-5 overflow-y-auto space-y-4"></div>
+      </div>
+    </div>
+    <!-- Model Modal -->
+    <div id="model-modal" class="modal-overlay">
+      <div class="modal-card">
+        <div class="flex items-center justify-between px-5 py-3 border-b border-app-border">
+          <h2 id="model-modal-title" class="text-sm font-semibold text-app-brand">Add Model</h2>
+          <button id="model-modal-close" class="text-app-textSecondary hover:text-app-textPrimary"><i class="w-5 h-5" data-lucide="x"></i></button>
+        </div>
+        <div id="model-modal-body" class="p-5 overflow-y-auto space-y-4"></div>
+      </div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -68,6 +68,32 @@ function classifyLine(line: string): { kind: BlockKind; text: string } {
   return { kind: "assistant", text: line };
 }
 
+function validateBeforeSend(): string | null {
+  if (!app.workspace) return "No workspace selected — select a folder first.";
+  if (app.providers.length === 0) return "No providers configured. Open Settings → LLM Providers and add a provider first. [/settings]";
+  if (!app.roleAssignments?.executor || !app.roleAssignments?.controller) {
+    return "No model configured for LLM 1 (Executor) or LLM 2 (Controller). Click the model selector below (— not set —) and assign a provider/model for each role before sending. LLM 3 is optional.";
+  }
+  const exec = app.roleAssignments.executor!;
+  const ctrl = app.roleAssignments.controller!;
+  const execProv = app.providers.find((p) => p.id === exec.provider_id);
+  if (!execProv) return `Executor provider '${exec.provider_id}' not found. Reconfigure LLM 1 in the model selector.`;
+  if (!execProv.models.some((m) => m.id === exec.model_id)) return `Executor model '${exec.model_id}' not found in provider '${exec.provider_id}'. Reconfigure LLM 1 or add the model in Settings.`;
+  const ctrlProv = app.providers.find((p) => p.id === ctrl.provider_id);
+  if (!ctrlProv) return `Controller provider '${ctrl.provider_id}' not found. Reconfigure LLM 2.`;
+  if (!ctrlProv.models.some((m) => m.id === ctrl.model_id)) return `Controller model '${ctrl.model_id}' not found in provider '${ctrl.provider_id}'.`;
+  if (!execProv.base_url || !execProv.base_url.trim()) return `Provider '${execProv.id}' has no Base URL configured. Open Settings and set it.`;
+  if (!execProv.api_key_env || !execProv.api_key_env.trim()) return `Provider '${execProv.id}' has no API Key configured. Open Settings and set it.`;
+  if (!ctrlProv.base_url || !ctrlProv.base_url.trim()) return `Provider '${ctrlProv.id}' has no Base URL configured.`;
+  if (app.roleAssignments.reviewer) {
+    const rev = app.roleAssignments.reviewer;
+    const revProv = app.providers.find((p) => p.id === rev.provider_id);
+    if (!revProv) return `Reviewer provider '${rev.provider_id}' not found.`;
+    if (!revProv.models.some((m) => m.id === rev.model_id)) return `Reviewer model '${rev.model_id}' not found in provider '${rev.provider_id}'.`;
+  }
+  return null;
+}
+
 function appendLine(s: Session, line: string) {
   const cls = classifyLine(line);
   const last = s.blocks[s.blocks.length - 1];
@@ -285,6 +311,14 @@ async function send() {
     return;
   }
 
+  // Validate session state before execution (critical crash guard).
+  const precheck = validateBeforeSend();
+  if (precheck) {
+    s.blocks.push({ id: newId(s), kind: "error", text: precheck });
+    renderAll();
+    return;
+  }
+
   // Real task.
   s.running = true;
   renderAll();
@@ -308,19 +342,50 @@ async function send() {
 function attachListeners(s: Session) {
   detachListeners();
   events.onTaskOutput((o: TaskOutput) => {
-    if (o.session_id !== s.id) return;
-    appendLine(s, o.line);
-    renderStream();
+    try {
+      if (o.session_id !== s.id) return;
+      if (o.stream === "stderr") {
+        // Provider/gateway errors are already human-readable and must never terminate the app.
+        // Render as error block; include actionable hint when recognizable.
+        let msg = o.line || "";
+        // Defensive: never expose raw keys/headers
+        if (/sk-[a-zA-Z0-9]{10,}/.test(msg)) msg = msg.replace(/sk-[a-zA-Z0-9_\-]+/g, "[REDACTED]");
+        s.blocks.push({ id: newId(s), kind: "error", text: msg });
+      } else {
+        appendLine(s, o.line);
+      }
+      renderStream();
+    } catch (e) {
+      console.error("task-output handler failed", e);
+      try { s.blocks.push({ id: newId(s), kind: "error", text: `Rendering error: ${String(e)}` }); renderStream(); } catch {}
+    }
   }).then((u) => activeUnlistens.push(u));
   events.onTaskExit((e: TaskExit) => {
-    if (e.session_id !== s.id) return;
-    s.running = false;
-    if (!e.success) {
-      s.blocks.push({ id: newId(s), kind: "error", text: `Exit code: ${e.code ?? "?"}` });
+    try {
+      if (e.session_id !== s.id) return;
+      s.running = false;
+      if (!e.success) {
+        const code = e.code ?? "?";
+        // Keep exit reason user-friendly; task-output already contains the typed provider error.
+        if (!s.blocks.some((b) => b.kind === "error" && b.text.includes("Exit code"))) {
+          s.blocks.push({ id: newId(s), kind: "error", text: `Task finished with exit code: ${code}. Check provider errors above. [Settings: /settings] [Model selector: click — not set —]` });
+        }
+      }
+      renderAll();
+    } catch (err) {
+      console.error("task-exit handler failed", err);
+    } finally {
+      detachListeners();
     }
-    renderAll();
-    detachListeners();
   }).then((u) => activeUnlistens.push(u));
+  // Also listen for task-state updates if available (render in status pill or console)
+  events.onTaskState?.((st) => {
+    try {
+      if (st.session_id !== s.id) return;
+      // Keep task state for debugging; not rendered as block to avoid clutter.
+      console.debug("task-state", st.payload);
+    } catch {}
+  }).then((u) => { if (u) activeUnlistens.push(u); }).catch(()=>{});
 }
 
 function detachListeners() {
@@ -399,36 +464,71 @@ function closeModal() {
 //   * Model 2/3 — completely empty is VALID; partially configured is INVALID
 //     and the UI shows which field is missing.
 
+const providerValidation = new Map<number, { checking: boolean; ok?: boolean; detail: string }>();
+const modelValidation = new Map<string, { checking: boolean; ok?: boolean; detail: string }>();
+
+function maskApiKey(s: string): string {
+  if (!s) return "—";
+  if (s.length <= 4) return "••••";
+  return "•".repeat(Math.min(s.length, 16));
+}
+
 function renderProviderCatalog(): string {
   if (app.providers.length === 0) {
     return `<div class="text-xs text-app-textSecondary italic py-4 text-center">No providers configured yet. Add one below.</div>`;
   }
-  return app.providers.map((p, idx) => `
-    <div class="model-card" data-provider-card="${idx}">
-      <div class="flex items-center justify-between mb-2">
-        <div class="flex items-center space-x-2">
-          <span class="slot-title">${escapeHtml(p.display_name || p.id)}</span>
-          <span class="role-pill">${escapeHtml(p.protocol)}</span>
+  return app.providers.map((p, idx) => {
+    const pv = providerValidation.get(idx);
+    const pvLabel = pv ? (pv.checking ? "Checking…" : pv.ok ? "✓ Connected" : `✗ ${escapeHtml(pv.detail.slice(0,80))}`) : "— not checked —";
+    const pvClass = pv?.checking ? "text-app-textSecondary" : pv?.ok ? "text-green-400" : pv?.ok === false ? "text-app-error" : "text-app-textSecondary";
+    const headers = p.headers && typeof p.headers === "object" && !Array.isArray(p.headers) ? Object.entries(p.headers as Record<string,string>) : [];
+    return `
+    <div class="provider-card" data-provider-card="${idx}">
+      <div class="provider-header-row">
+        <div>
+          <div class="slot-title">${escapeHtml(p.display_name || p.id)} <span class="text-[10px] font-mono text-app-textSecondary">(${escapeHtml(p.id)})</span></div>
+          <div class="text-xs text-app-textSecondary">${escapeHtml(p.protocol)}</div>
         </div>
-        <button type="button" data-provider-del="${idx}" class="text-app-textSecondary hover:text-app-error" title="Remove provider">
-          <i class="w-4 h-4" data-lucide="trash-2"></i>
-        </button>
+        <div class="flex items-center space-x-1">
+          <button type="button" data-provider-edit="${idx}" class="text-xs px-2 py-1 border border-app-border rounded text-app-textSecondary hover:text-app-brand hover:border-app-brand">Edit</button>
+          <button type="button" data-provider-del="${idx}" class="text-app-textSecondary hover:text-app-error p-1" title="Delete provider"><i class="w-4 h-4" data-lucide="trash-2"></i></button>
+        </div>
       </div>
-      <div class="text-xs text-app-textSecondary font-mono mb-2">${escapeHtml(p.base_url)}</div>
-      <div class="text-xs text-app-textSecondary mb-2">API Key env: <code class="font-mono">${escapeHtml(p.api_key_env)}</code></div>
-      <div class="space-y-1">
-        ${p.models.map((m) => `
-          <div class="flex items-center justify-between text-xs px-2 py-1 bg-app-bg rounded">
-            <span class="text-app-textPrimary font-mono">${escapeHtml(m.display_name || m.id)}</span>
-            <span class="text-app-textSecondary">${m.vision ? "vision" : ""} ${m.tool_calling ? "tools" : ""}</span>
-          </div>
-        `).join("")}
+      <div class="mt-3 space-y-2 text-xs">
+        <div><span class="text-app-textSecondary">Base URL:</span> <code class="font-mono text-app-textPrimary">${escapeHtml(p.base_url || "— not set —")}</code></div>
+        <div><span class="text-app-textSecondary">API Key:</span> <code class="font-mono">${maskApiKey(p.api_key_env)}</code> <span class="text-[10px] text-app-textSecondary">(${escapeHtml(p.api_key_env ? "set" : "empty")})</span></div>
+        ${headers.length ? `<div><span class="text-app-textSecondary">Headers:</span> <span class="font-mono text-[11px]">${headers.map(([k,v])=> escapeHtml(k)+": "+maskApiKey(String(v))).join(", ")}</span></div>` : ""}
       </div>
-      <button type="button" data-add-model="${idx}" class="mt-2 text-xs text-app-textSecondary hover:text-app-brand inline-flex items-center">
-        <i class="w-3 h-3 mr-1" data-lucide="plus"></i> Add Model
-      </button>
-    </div>
-  `).join("");
+      <div class="flex items-center space-x-2 mt-3">
+        <button type="button" data-provider-check="${idx}" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary hover:text-app-textPrimary">${pv?.checking ? "Checking…" : "Check Connection"}</button>
+        <span data-provider-status="${idx}" class="text-xs font-mono ${pvClass}">${pvLabel}</span>
+      </div>
+      <div class="mt-4">
+        <div class="text-xs uppercase tracking-wide text-app-textSecondary mb-2">Models (${p.models.length})</div>
+        <div class="space-y-1">
+          ${p.models.length ? p.models.map((m, mid) => {
+            const key = `${idx}:${mid}`;
+            const mv = modelValidation.get(key);
+            const mvLabel = mv ? (mv.checking ? "Checking…" : mv.ok ? "✓ OK" : `✗ ${escapeHtml(mv.detail.slice(0,60))}`) : "—";
+            const mvClass = mv?.checking ? "text-app-textSecondary" : mv?.ok ? "text-green-400" : mv?.ok===false ? "text-app-error" : "text-app-textSecondary";
+            return `<div class="flex items-center justify-between text-xs px-3 py-2 bg-app-bg rounded border border-app-border/50">
+              <div class="min-w-0">
+                <div class="font-mono text-app-textPrimary truncate">${escapeHtml(m.display_name || m.id)} <span class="text-[10px] text-app-textSecondary">(${escapeHtml(m.id)})</span></div>
+                <div class="text-[10px] text-app-textSecondary">${m.tool_calling?"tools ":""}${m.vision?"vision ":""}${m.streaming?"streaming":""} ${m.context_window?`· ${m.context_window} ctx`: ""}</div>
+                <div class="text-[10px] font-mono ${mvClass}">${mvLabel}</div>
+              </div>
+              <div class="flex items-center space-x-1 shrink-0 ml-2">
+                <button type="button" data-model-check="${idx}|${mid}" class="text-[10px] px-2 py-1 border border-app-border rounded hover:border-app-brand text-app-textSecondary">${mv?.checking?"…":"Check"}</button>
+                <button type="button" data-model-edit="${idx}|${mid}" class="text-app-textSecondary hover:text-app-brand p-1" title="Edit model"><i class="w-3.5 h-3.5" data-lucide="pencil"></i></button>
+                <button type="button" data-model-del="${idx}|${mid}" class="text-app-textSecondary hover:text-app-error p-1" title="Remove model"><i class="w-3.5 h-3.5" data-lucide="trash-2"></i></button>
+              </div>
+            </div>`;
+          }).join("") : `<div class="text-xs text-app-textSecondary italic py-2">No models — add one. Credentials are stored once per provider.</div>`}
+        </div>
+        <button type="button" data-add-model="${idx}" class="mt-2 text-xs text-app-brand hover:underline inline-flex items-center"><i class="w-3 h-3 mr-1" data-lucide="plus"></i> Add Model</button>
+      </div>
+    </div>`;
+  }).join("");
 }
 
 async function renderSettings(cfg: DesktopConfig, path: string): Promise<string> {
@@ -584,58 +684,449 @@ function collectAppearance(body: HTMLElement, current: AppearanceConfig): Appear
   };
 }
 
-function wireProviderCatalog(body: HTMLElement): void {
-  const refresh = () => {
-    const catalog = body.querySelector<HTMLDivElement>("#provider-catalog");
-    if (catalog) {
-      catalog.innerHTML = renderProviderCatalog();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const lucide = (window as any).lucide;
-      if (lucide?.createIcons) lucide.createIcons();
-      wireProviderCatalog(body);
-    }
-  };
+function refreshProviderCatalog(body: HTMLElement): void {
+  const catalog = body.querySelector<HTMLDivElement>("#provider-catalog");
+  if (!catalog) return;
+  catalog.innerHTML = renderProviderCatalog();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lucide = (window as any).lucide;
+  if (lucide?.createIcons) lucide.createIcons();
+  wireProviderCatalog(body);
+}
 
-  body.querySelector<HTMLButtonElement>("#add-provider-v2")?.addEventListener("click", () => {
-    const id = `provider${app.providers.length + 1}`;
-    app.providers.push({
-      id,
-      display_name: id,
-      protocol: "openai_compatible",
-      base_url: "",
-      api_key_env: "OPENAI_API_KEY",
-      headers: null,
-      extra_body: null,
-      models: [],
+function isValidProviderId(id: string): boolean {
+  return /^[a-z0-9_-]+$/.test(id) && id.length >= 2 && id.length <= 40;
+}
+
+function wireProviderCatalog(body: HTMLElement): void {
+  body.querySelector<HTMLButtonElement>("#add-provider-v2")?.addEventListener("click", () => openProviderModal(null));
+
+  body.querySelectorAll<HTMLButtonElement>("[data-provider-edit]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = parseInt(btn.dataset.providerEdit!, 10);
+      openProviderModal(idx);
     });
-    refresh();
   });
 
   body.querySelectorAll<HTMLButtonElement>("[data-provider-del]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const idx = parseInt(btn.dataset.providerDel!, 10);
       app.providers.splice(idx, 1);
-      refresh();
+      providerValidation.delete(idx);
+      // reindex validation maps
+      const newMap = new Map<number, { checking: boolean; ok?: boolean; detail: string }>();
+      providerValidation.forEach((v, k) => {
+        if (k < idx) newMap.set(k, v);
+        else if (k > idx) newMap.set(k - 1, v);
+      });
+      providerValidation.clear();
+      newMap.forEach((v, k) => providerValidation.set(k, v));
+      refreshProviderCatalog(body);
+    });
+  });
+
+  body.querySelectorAll<HTMLButtonElement>("[data-provider-check]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const idx = parseInt(btn.dataset.providerCheck!, 10);
+      const prov = app.providers[idx];
+      providerValidation.set(idx, { checking: true, detail: "checking…" });
+      refreshProviderCatalog(body);
+      try {
+        const out = await api.providerCheckConnection(prov.id);
+        const ok = out.can_save;
+        providerValidation.set(idx, { checking: false, ok, detail: out.message + (out.checks?.length ? " — " + out.checks.map(c=> `${c.label}:${c.passed?"ok":"fail"}`).join(", ") : "") });
+      } catch (e) {
+        providerValidation.set(idx, { checking: false, ok: false, detail: String(e) });
+      }
+      refreshProviderCatalog(body);
     });
   });
 
   body.querySelectorAll<HTMLButtonElement>("[data-add-model]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const idx = parseInt(btn.dataset.addModel!, 10);
-      const modelId = window.prompt("Model ID (e.g. gpt-4o):");
-      if (!modelId) return;
-      app.providers[idx].models.push({
-        id: modelId,
-        display_name: modelId,
-        vision: false,
-        tool_calling: true,
-        streaming: true,
-        context_window: null,
-        max_output_tokens: null,
-      });
-      refresh();
+      openModelModal(idx, null);
     });
   });
+
+  body.querySelectorAll<HTMLButtonElement>("[data-model-edit]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const [pi, mi] = btn.dataset.modelEdit!.split("|").map((n) => parseInt(n, 10));
+      openModelModal(pi, mi);
+    });
+  });
+
+  body.querySelectorAll<HTMLButtonElement>("[data-model-del]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const [pi, mi] = btn.dataset.modelDel!.split("|").map((n) => parseInt(n, 10));
+      const prov = app.providers[pi];
+      prov.models.splice(mi, 1);
+      modelValidation.delete(`${pi}:${mi}`);
+      refreshProviderCatalog(body);
+    });
+  });
+
+  body.querySelectorAll<HTMLButtonElement>("[data-model-check]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const [pi, mi] = btn.dataset.modelCheck!.split("|").map((n) => parseInt(n, 10));
+      const prov = app.providers[pi];
+      const model = prov.models[mi];
+      const key = `${pi}:${mi}`;
+      modelValidation.set(key, { checking: true, detail: "checking…" });
+      refreshProviderCatalog(body);
+      try {
+        const out = await api.providersValidate(prov.id, model.id);
+        modelValidation.set(key, { checking: false, ok: out.ok, detail: out.detail });
+      } catch (e) {
+        modelValidation.set(key, { checking: false, ok: false, detail: String(e) });
+      }
+      refreshProviderCatalog(body);
+    });
+  });
+}
+
+function openProviderModal(editIdx: number | null): void {
+  const modal = document.querySelector<HTMLDivElement>("#provider-modal")!;
+  const title = document.querySelector<HTMLHeadingElement>("#provider-modal-title")!;
+  const body = document.querySelector<HTMLDivElement>("#provider-modal-body")!;
+  const isEdit = editIdx !== null;
+  const existing = isEdit ? app.providers[editIdx!] : null;
+  title.textContent = isEdit ? "Edit Provider" : "Add Provider";
+  const idReadonly = isEdit ? "readonly" : "";
+  const idVal = existing?.id ?? "";
+  const nameVal = existing?.display_name ?? "";
+  const baseVal = existing?.base_url ?? "";
+  const keyVal = existing?.api_key_env ?? "";
+  const protocolVal = existing?.protocol ?? "openai_compatible";
+  const headers = existing?.headers && typeof existing.headers === "object" && !Array.isArray(existing.headers) ? Object.entries(existing.headers as Record<string,string>) : [] as [string,string][];
+  const headersRows = headers.map(([k,v], i) => `
+    <div class="flex space-x-2" data-header-row="${i}">
+      <input data-header-key="${i}" value="${escapeAttr(k)}" placeholder="Header Name" class="flex-1 bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" />
+      <input data-header-val="${i}" value="${escapeAttr(v)}" placeholder="Value" class="flex-1 bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" />
+      <button type="button" data-header-remove="${i}" class="text-app-error text-xs px-2">×</button>
+    </div>`).join("") || `<div class="text-xs text-app-textSecondary italic">No headers.</div>`;
+
+  body.innerHTML = `
+    <div class="provider-field"><label>Provider ID <span class="normal-case text-[10px] text-app-textSecondary">(lowercase, numbers, hyphens, underscores)</span></label>
+      <input id="pm-id" value="${escapeAttr(idVal)}" ${idReadonly} placeholder="nvidia" class="font-mono ${isEdit?"bg-app-surface opacity-60":""}" /></div>
+    <div class="provider-field"><label>Display Name</label><input id="pm-name" value="${escapeAttr(nameVal)}" placeholder="NVIDIA" /></div>
+    <div class="provider-field"><label>Protocol</label><select id="pm-protocol"><option value="openai_compatible" ${protocolVal==="openai_compatible"?"selected":""}>OpenAI Compatible</option></select></div>
+    <div class="provider-field"><label>Base URL</label><input id="pm-base" value="${escapeAttr(baseVal)}" placeholder="https://integrate.api.nvidia.com/v1" /></div>
+    <div class="provider-field"><label>API Key <span class="normal-case text-[10px] text-app-textSecondary">env var name or raw key — stored as env var reference, never raw in logs</span></label>
+      <div class="flex space-x-2"><input id="pm-key" value="${escapeAttr(keyVal)}" type="password" placeholder="NVIDIA_API_KEY or OPENAI_API_KEY" class="flex-1" /><button type="button" id="pm-key-toggle" class="text-xs px-2 py-1 border border-app-border rounded text-app-textSecondary">Show</button></div></div>
+    <div class="provider-field"><label>Headers (Optional)</label><div id="pm-headers" class="space-y-1">${headersRows}</div><button type="button" id="pm-add-header" class="mt-1 text-xs text-app-textSecondary hover:text-app-brand">+ Add Header</button></div>
+    <div id="pm-status" class="text-xs font-mono mt-2"></div>
+    <div class="flex items-center justify-between pt-3 border-t border-app-border">
+      <button id="pm-check" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary">Check Connection</button>
+      <div class="flex space-x-2">
+        <button id="pm-cancel" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded text-app-textSecondary">Cancel</button>
+        <button id="pm-save" type="button" class="text-xs px-4 py-1.5 bg-app-brand text-app-bg rounded font-semibold opacity-50" disabled>Save Provider</button>
+      </div>
+    </div>`;
+
+  modal.classList.add("open");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
+
+  let headersData: [string,string][] = [...headers];
+  let providerChecked = false;
+
+  const updateSave = () => {
+    const idEl = body.querySelector<HTMLInputElement>("#pm-id")!;
+    const baseEl = body.querySelector<HTMLInputElement>("#pm-base")!;
+    const keyEl = body.querySelector<HTMLInputElement>("#pm-key")!;
+    const idOk = isValidProviderId(idEl.value.trim());
+    const baseOk = baseEl.value.trim().length > 5 && /^https?:\/\//.test(baseEl.value.trim());
+    const keyOk = keyEl.value.trim().length > 0;
+    const saveBtn = body.querySelector<HTMLButtonElement>("#pm-save")!;
+    const canSave = idOk && baseOk && keyOk && (isEdit || !app.providers.some(p=>p.id===idEl.value.trim())) && providerChecked;
+    saveBtn.disabled = !canSave;
+    saveBtn.style.opacity = canSave ? "1" : "0.5";
+  };
+
+  body.querySelector<HTMLInputElement>("#pm-id")?.addEventListener("input", () => { providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  body.querySelector<HTMLInputElement>("#pm-base")?.addEventListener("input", () => { providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  body.querySelector<HTMLInputElement>("#pm-key")?.addEventListener("input", () => { providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  body.querySelector<HTMLButtonElement>("#pm-key-toggle")?.addEventListener("click", () => {
+    const inp = body.querySelector<HTMLInputElement>("#pm-key")!;
+    inp.type = inp.type === "password" ? "text" : "password";
+  });
+  body.querySelector<HTMLButtonElement>("#pm-add-header")?.addEventListener("click", () => {
+    headersData.push(["",""]);
+    const container = body.querySelector<HTMLDivElement>("#pm-headers")!;
+    container.innerHTML = headersData.map(([k,v], i) => `
+      <div class="flex space-x-2" data-header-row="${i}">
+        <input data-header-key="${i}" value="${escapeAttr(k)}" placeholder="Header Name" class="flex-1 bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" />
+        <input data-header-val="${i}" value="${escapeAttr(v)}" placeholder="Value" class="flex-1 bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" />
+        <button type="button" data-header-remove="${i}" class="text-app-error text-xs px-2">×</button>
+      </div>`).join("");
+    wireHeaderRows();
+  });
+  function wireHeaderRows() {
+    body.querySelectorAll<HTMLInputElement>("[data-header-key]").forEach(el => {
+      el.addEventListener("input", () => {
+        const i = parseInt(el.dataset.headerKey!,10);
+        headersData[i][0]=el.value;
+        providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave();
+      });
+    });
+    body.querySelectorAll<HTMLInputElement>("[data-header-val]").forEach(el => {
+      el.addEventListener("input", () => {
+        const i = parseInt(el.dataset.headerVal!,10);
+        headersData[i][1]=el.value;
+        providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave();
+      });
+    });
+    body.querySelectorAll<HTMLButtonElement>("[data-header-remove]").forEach(btn=>{
+      btn.addEventListener("click",()=>{
+        const i=parseInt(btn.dataset.headerRemove!,10);
+        headersData.splice(i,1);
+        const cont = body.querySelector<HTMLDivElement>("#pm-headers")!;
+        if(headersData.length===0) cont.innerHTML = `<div class="text-xs text-app-textSecondary italic">No headers.</div>`;
+        else {
+          cont.innerHTML = headersData.map(([k,v], idx) => `
+            <div class="flex space-x-2" data-header-row="${idx}">
+              <input data-header-key="${idx}" value="${escapeAttr(k)}" placeholder="Header Name" class="flex-1 bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" />
+              <input data-header-val="${idx}" value="${escapeAttr(v)}" placeholder="Value" class="flex-1 bg-app-bg border border-app-border rounded px-2 py-1 text-xs font-mono" />
+              <button type="button" data-header-remove="${idx}" class="text-app-error text-xs px-2">×</button>
+            </div>`).join("");
+          wireHeaderRows();
+        }
+        providerChecked=false; updateSave();
+      });
+    });
+  }
+  wireHeaderRows();
+
+  const statusEl = body.querySelector<HTMLDivElement>("#pm-status")!;
+  body.querySelector<HTMLButtonElement>("#pm-check")?.addEventListener("click", async () => {
+    const btn = body.querySelector<HTMLButtonElement>("#pm-check")!;
+    const base = (body.querySelector<HTMLInputElement>("#pm-base")!.value.trim());
+    const key = (body.querySelector<HTMLInputElement>("#pm-key")!.value.trim());
+    const id = (body.querySelector<HTMLInputElement>("#pm-id")!.value.trim());
+    if (!isValidProviderId(id)) { statusEl.textContent="✗ Invalid Provider ID — use lowercase letters, numbers, hyphens, underscores (2-40 chars)"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    if (!base) { statusEl.textContent="✗ Base URL required"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    if (!key) { statusEl.textContent="✗ API Key required"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    btn.textContent="Checking…"; btn.disabled=true;
+    statusEl.textContent="Checking…"; statusEl.className="text-xs font-mono mt-2 text-app-textSecondary";
+    try {
+      const out = await api.checkProvider(base, key, []);
+      const ok = out.can_save;
+      statusEl.textContent = ok ? `✓ API Response OK — ${out.message}` : `✗ Validation failed — ${out.message} — ${out.checks.map(c=> `${c.label}:${c.passed?"ok":"fail"}`).join(", ")}`;
+      statusEl.className = `text-xs font-mono mt-2 ${ok ? "text-green-400" : "text-app-error"}`;
+      providerChecked = ok;
+    } catch(e){
+      statusEl.textContent = `✗ Validation failed — ${String(e).slice(0,200)}`;
+      statusEl.className="text-xs font-mono mt-2 text-app-error";
+      providerChecked=false;
+    } finally {
+      btn.textContent="Check Connection"; btn.disabled=false;
+      updateSave();
+    }
+  });
+
+  body.querySelector<HTMLButtonElement>("#pm-cancel")?.addEventListener("click", closeProviderModal);
+  body.querySelector<HTMLButtonElement>("#pm-save")?.addEventListener("click", async () => {
+    const id = (body.querySelector<HTMLInputElement>("#pm-id")!.value.trim());
+    const name = (body.querySelector<HTMLInputElement>("#pm-name")!.value.trim() || id);
+    const protocol = (body.querySelector<HTMLSelectElement>("#pm-protocol")!.value || "openai_compatible");
+    const base = (body.querySelector<HTMLInputElement>("#pm-base")!.value.trim());
+    const key = (body.querySelector<HTMLInputElement>("#pm-key")!.value.trim());
+    const hd: Record<string,string> = {};
+    headersData.forEach(([k,v])=>{ if(k.trim()) hd[k.trim()]=v; });
+    if (!isValidProviderId(id)) { statusEl.textContent="✗ Invalid Provider ID"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    if (!base) { statusEl.textContent="✗ Base URL required"; return; }
+    if (!key) { statusEl.textContent="✗ API Key required"; return; }
+    if (!providerChecked) { statusEl.textContent="✗ Run Check Connection successfully before saving"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    const entry: ProviderEntryDto = {
+      id, display_name: name, protocol, base_url: base, api_key_env: key,
+      headers: Object.keys(hd).length ? hd as unknown as ProviderEntryDto["headers"] : null,
+      extra_body: existing?.extra_body ?? null,
+      models: existing?.models ?? []
+    };
+    if (isEdit) {
+      app.providers[editIdx!] = entry;
+    } else {
+      if (app.providers.some(p=>p.id===id)) { statusEl.textContent=`✗ Provider ID '${id}' already exists`; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+      app.providers.push(entry);
+      providerValidation.set(app.providers.length-1, { checking:false, ok:true, detail: "validated" });
+    }
+    try {
+      await api.providersSave(app.providers);
+      if (isEdit) providerValidation.set(editIdx!, { checking:false, ok:true, detail:"validated" });
+      closeProviderModal();
+      const settingsBody = document.querySelector<HTMLElement>("#modal-body");
+      if (settingsBody) refreshProviderCatalog(settingsBody);
+    } catch(e){
+      statusEl.textContent = `Save failed: ${String(e)}`;
+      statusEl.className="text-xs font-mono mt-2 text-app-error";
+    }
+  });
+
+  updateSave();
+}
+
+function closeProviderModal(): void {
+  const modal = document.querySelector<HTMLDivElement>("#provider-modal")!;
+  modal.classList.remove("open");
+}
+
+function openModelModal(providerIdx: number, modelIdx: number | null): void {
+  const modal = document.querySelector<HTMLDivElement>("#model-modal")!;
+  const title = document.querySelector<HTMLHeadingElement>("#model-modal-title")!;
+  const body = document.querySelector<HTMLDivElement>("#model-modal-body")!;
+  const prov = app.providers[providerIdx];
+  const isEdit = modelIdx !== null;
+  const existing = isEdit ? prov.models[modelIdx!] : null;
+  title.textContent = isEdit ? "Edit Model" : "Add Model";
+  const modelIdVal = existing?.id ?? "";
+  const displayVal = existing?.display_name ?? "";
+  const toolsVal = existing ? existing.tool_calling : true;
+  const visionVal = existing ? existing.vision : false;
+  const streamingVal = existing ? existing.streaming : true;
+  const ctxVal = existing?.context_window ?? "";
+
+  body.innerHTML = `
+    <div class="text-xs text-app-textSecondary mb-2">Provider: <span class="font-mono text-app-textPrimary">${escapeHtml(prov.display_name || prov.id)}</span> <span class="font-mono text-[10px] text-app-textSecondary">(${escapeHtml(prov.id)})</span></div>
+    <div class="provider-field"><label>Model ID <span class="text-[10px] normal-case text-app-textSecondary">(sent to API)</span></label><input id="mm-id" value="${escapeAttr(modelIdVal)}" placeholder="gpt-4o or meta/llama-3.1-70b" /></div>
+    <div class="provider-field"><label>Display Name <span class="text-[10px] normal-case text-app-textSecondary">(shown in UI)</span></label><input id="mm-display" value="${escapeAttr(displayVal)}" placeholder="Llama 3.1 70B" /></div>
+    <div class="provider-field"><label>Capabilities</label>
+      <label class="flex items-center space-x-2 text-xs"><input type="checkbox" id="mm-tools" ${toolsVal?"checked":""} /> <span>Tools</span></label>
+      <label class="flex items-center space-x-2 text-xs"><input type="checkbox" id="mm-vision" ${visionVal?"checked":""} /> <span>Vision</span></label>
+      <label class="flex items-center space-x-2 text-xs"><input type="checkbox" id="mm-streaming" ${streamingVal?"checked":""} /> <span>Streaming</span></label>
+    </div>
+    <div class="provider-field"><label>Context Window (optional)</label><input id="mm-ctx" value="${escapeAttr(String(ctxVal))}" placeholder="128000" type="number" /></div>
+    <div id="mm-status" class="text-xs font-mono mt-2"></div>
+    <div class="flex items-center justify-between pt-3 border-t border-app-border">
+      <button id="mm-check" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded hover:border-app-brand text-app-textSecondary">Check API Response</button>
+      <div class="flex space-x-2">
+        <button id="mm-cancel" type="button" class="text-xs px-3 py-1.5 border border-app-border rounded text-app-textSecondary">Cancel</button>
+        <button id="mm-save" type="button" class="text-xs px-4 py-1.5 bg-app-brand text-app-bg rounded font-semibold opacity-50" disabled>Save Model</button>
+      </div>
+    </div>`;
+
+  modal.classList.add("open");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
+
+  let modelChecked = false;
+  const statusEl = body.querySelector<HTMLDivElement>("#mm-status")!;
+  const updateSave = () => {
+    const idOk = (body.querySelector<HTMLInputElement>("#mm-id")!.value.trim().length > 0);
+    const btn = body.querySelector<HTMLButtonElement>("#mm-save")!;
+    const can = idOk && modelChecked;
+    btn.disabled = !can;
+    btn.style.opacity = can ? "1" : "0.5";
+  };
+  body.querySelector<HTMLInputElement>("#mm-id")?.addEventListener("input", ()=>{ modelChecked=false; statusEl.textContent=""; updateSave(); });
+  body.querySelector<HTMLButtonElement>("#mm-check")?.addEventListener("click", async () => {
+    const mid = (body.querySelector<HTMLInputElement>("#mm-id")!.value.trim());
+    if (!mid) { statusEl.textContent="✗ Model ID required"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    const btn = body.querySelector<HTMLButtonElement>("#mm-check")!;
+    btn.textContent="Checking…"; btn.disabled=true;
+    statusEl.textContent="Checking…"; statusEl.className="text-xs font-mono mt-2 text-app-textSecondary";
+    try {
+      const out = await api.providersValidate(prov.id, mid);
+      statusEl.textContent = out.ok ? `✓ API Response OK — ${out.detail.slice(0,120)}` : `✗ Validation failed — ${out.detail.slice(0,160)} [${out.class ?? "unknown"}]`;
+      statusEl.className = `text-xs font-mono mt-2 ${out.ok ? "text-green-400" : "text-app-error"}`;
+      modelChecked = out.ok;
+    } catch(e){
+      statusEl.textContent = `✗ Validation failed — ${String(e).slice(0,200)}`;
+      statusEl.className="text-xs font-mono mt-2 text-app-error";
+      modelChecked=false;
+    } finally {
+      btn.textContent="Check API Response"; btn.disabled=false;
+      updateSave();
+    }
+  });
+  body.querySelector<HTMLButtonElement>("#mm-cancel")?.addEventListener("click", () => {
+    closeModelModal();
+  });
+  body.querySelector<HTMLButtonElement>("#mm-save")?.addEventListener("click", async () => {
+    const mid = (body.querySelector<HTMLInputElement>("#mm-id")!.value.trim());
+    const display = (body.querySelector<HTMLInputElement>("#mm-display")!.value.trim() || mid);
+    if (!mid) { statusEl.textContent="✗ Model ID required"; return; }
+    if (!modelChecked) { statusEl.textContent="✗ Run Check API Response successfully before saving"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    const draft = {
+      id: mid,
+      display_name: display,
+      vision: (body.querySelector<HTMLInputElement>("#mm-vision")!.checked),
+      tool_calling: (body.querySelector<HTMLInputElement>("#mm-tools")!.checked),
+      streaming: (body.querySelector<HTMLInputElement>("#mm-streaming")!.checked),
+      context_window: (()=>{ const v=(body.querySelector<HTMLInputElement>("#mm-ctx")!.value.trim()); const n=parseInt(v,10); return isNaN(n)? null: n; })(),
+      max_output_tokens: null,
+    };
+    if (isEdit) {
+      prov.models[modelIdx!] = draft as typeof prov.models[number];
+    } else {
+      if (prov.models.some(m=>m.id===mid)) {
+        statusEl.textContent=`✗ Model ID '${mid}' already exists in this provider`;
+        statusEl.className="text-xs font-mono mt-2 text-app-error";
+        return;
+      }
+      prov.models.push(draft as typeof prov.models[number]);
+    }
+    try {
+      await api.providersSave(app.providers);
+      const key = `${providerIdx}:${isEdit? modelIdx! : prov.models.findIndex(m=>m.id===mid)}`;
+      modelValidation.set(key, { checking:false, ok:true, detail:"validated" });
+      closeModelModal();
+      const settingsBody = document.querySelector<HTMLElement>("#modal-body");
+      if (settingsBody) refreshProviderCatalog(settingsBody);
+    } catch(e){
+      statusEl.textContent = `Save failed: ${String(e)}`;
+      statusEl.className="text-xs font-mono mt-2 text-app-error";
+    }
+  });
+  updateSave();
+}
+
+function closeModelModal(): void {
+  const modal = document.querySelector<HTMLDivElement>("#model-modal")!;
+  modal.classList.remove("open");
+}
+
+// ----- Sidebar collapse (spec §30) -----
+
+const SIDEBAR_KEY = "aether_sidebar_collapsed";
+
+function isSidebarCollapsed(): boolean {
+  return localStorage.getItem(SIDEBAR_KEY) === "1";
+}
+
+function setSidebarCollapsed(collapsed: boolean): void {
+  localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0");
+  const sidebar = document.querySelector<HTMLDivElement>("#workspace-sidebar")!;
+  if (collapsed) sidebar.classList.add("collapsed");
+  else sidebar.classList.remove("collapsed");
+  updateMainMargins();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
+}
+
+function updateMainMargins(): void {
+  const sidebar = document.querySelector<HTMLDivElement>("#workspace-sidebar")!;
+  const isHome = document.querySelector<HTMLDivElement>("#workspace-home")?.style.display !== "none";
+  const header = document.querySelector<HTMLElement>("#app-header");
+  const stream = document.querySelector<HTMLDivElement>("#stream");
+  const inputBar = document.querySelector<HTMLDivElement>("#input-bar");
+  const collapsed = sidebar.classList.contains("collapsed");
+  const visible = sidebar.style.display !== "none" && !isHome;
+  const left = !visible ? "0" : collapsed ? "48px" : "256px";
+  if (header) header.style.marginLeft = left;
+  if (stream) stream.style.marginLeft = left;
+  if (inputBar) inputBar.style.left = left;
+}
+
+function initSidebar(): void {
+  const collapsed = isSidebarCollapsed();
+  if (collapsed) document.querySelector<HTMLDivElement>("#workspace-sidebar")?.classList.add("collapsed");
+  updateMainMargins();
+  document.querySelector("#sidebar-toggle")?.addEventListener("click", () => setSidebarCollapsed(true));
+  document.querySelector("#sidebar-expand")?.addEventListener("click", () => setSidebarCollapsed(false));
+  // also wire top-bar toggle if present
+  // Ensure layout updates on window resize
+  window.addEventListener("resize", updateMainMargins);
 }
 
 function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
@@ -1023,8 +1514,28 @@ function wireHistory(body: HTMLElement) {
 // ----- Boot -----
 
 async function boot() {
+  // Global crash guards — any unhandled exception must become an in-app error, never a terminated window.
+  window.addEventListener("error", (e) => {
+    console.error("window error", e.error ?? e.message);
+    try {
+      const s = current();
+      s.blocks.push({ id: newId(s), kind: "error", text: `Application error: ${String(e.message ?? e.error ?? e).slice(0, 400)}\nThe app remains open. Check Settings or try again.` });
+      renderAll();
+    } catch {}
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    console.error("unhandledrejection", e.reason);
+    try {
+      const s = current();
+      s.blocks.push({ id: newId(s), kind: "error", text: `Unexpected error: ${String(e.reason ?? e).slice(0, 400)}\nThe app remains open.` });
+      renderAll();
+    } catch {}
+    e.preventDefault();
+  });
+
   app.tabs.push(createSession("Welcome"));
   renderAll();
+  initSidebar();
 
   // Apply background on launch (spec §16): we don't wait for the Settings modal.
   try {
@@ -1076,6 +1587,14 @@ async function boot() {
   document.querySelector("#modal")!.addEventListener("click", (e) => {
     if (e.target === document.querySelector("#modal")) closeModal();
   });
+  document.querySelector("#provider-modal")?.addEventListener("click", (e) => {
+    if (e.target === document.querySelector("#provider-modal")) closeProviderModal();
+  });
+  document.querySelector("#model-modal")?.addEventListener("click", (e) => {
+    if (e.target === document.querySelector("#model-modal")) closeModelModal();
+  });
+  document.querySelector("#provider-modal-close")?.addEventListener("click", closeProviderModal);
+  document.querySelector("#model-modal-close")?.addEventListener("click", closeModelModal);
 
   // Input.
   const input = document.querySelector<HTMLTextAreaElement>("#prompt-input")!;
@@ -1137,6 +1656,7 @@ function showWorkspaceHome(recent: WorkspaceDto[]): void {
   const sidebar = document.querySelector<HTMLDivElement>("#workspace-sidebar")!;
   home.style.display = "flex";
   sidebar.style.display = "none";
+  updateMainMargins();
 
   const subtitle = document.querySelector("#ws-home-subtitle")!;
   subtitle.textContent = recent.length > 0
@@ -1178,7 +1698,15 @@ async function pickFolder(): Promise<void> {
       await openWorkspaceByPath(selected);
     }
   } catch (e) {
-    alert(`Folder picker failed: ${String(e)}`);
+    const msg = `Folder picker failed: ${String(e).slice(0,200)}`;
+    const sub = document.querySelector("#ws-home-subtitle") as HTMLElement | null;
+    if (sub) sub.textContent = msg;
+    console.error(msg);
+    try {
+      const s = current();
+      s.blocks.push({ id: newId(s), kind: "error", text: msg });
+      renderAll();
+    } catch {}
   }
 }
 
@@ -1189,7 +1717,15 @@ async function openWorkspaceByPath(path: string): Promise<void> {
     await loadWorkspaceSessions();
     showWorkspaceUi();
   } catch (e) {
-    alert(`Failed to open workspace: ${String(e)}`);
+    const msg = `Failed to open workspace: ${String(e).slice(0,200)}`;
+    const sub = document.querySelector("#ws-home-subtitle") as HTMLElement | null;
+    if (sub) { sub.textContent = msg; sub.classList.add("text-app-error"); }
+    console.error(msg);
+    try {
+      const s = current();
+      s.blocks.push({ id: newId(s), kind: "error", text: msg });
+      renderAll();
+    } catch {}
   }
 }
 
@@ -1205,6 +1741,9 @@ function showWorkspaceUi(): void {
   const sidebar = document.querySelector<HTMLDivElement>("#workspace-sidebar")!;
   home.style.display = "none";
   sidebar.style.display = "flex";
+  if (isSidebarCollapsed()) sidebar.classList.add("collapsed");
+  else sidebar.classList.remove("collapsed");
+  updateMainMargins();
 
   if (app.workspace) {
     document.querySelector("#ws-sidebar-name")!.textContent = app.workspace.name;
@@ -1244,7 +1783,12 @@ async function createNewSession(): Promise<void> {
     app.roleAssignments = null;
     renderAll();
   } catch (e) {
-    alert(`Failed to create session: ${String(e)}`);
+    const msg = `Failed to create session: ${String(e).slice(0,200)}`;
+    try {
+      const s = current();
+      s.blocks.push({ id: newId(s), kind: "error", text: msg });
+      renderAll();
+    } catch { console.error(msg); }
   }
 }
 
@@ -1304,6 +1848,24 @@ function openRolePanel(): void {
   const s = current();
   const opts = allModelOptions();
   const ra = app.roleAssignments ?? { executor: null, controller: null, reviewer: null };
+  const bodyPre = document.querySelector<HTMLDivElement>("#modal-body")!;
+  const modalPre = document.querySelector<HTMLDivElement>("#modal")!;
+  if (opts.length === 0) {
+    document.querySelector("#modal-title")!.textContent = "LLM Configuration";
+    modalPre.classList.remove("hidden");
+    modalPre.classList.add("flex");
+    const hasProviders = app.providers.length > 0;
+    bodyPre.innerHTML = `
+      <div class="space-y-4 max-w-xl">
+        <p class="text-sm text-app-textSecondary">${hasProviders ? "Providers exist but no models are configured. Add a model to one of your providers in Settings to enable chat." : "No providers or models configured. Add a provider and a model in Settings to enable chat."}</p>
+        <button id="role-open-settings" type="button" class="text-xs px-4 py-1.5 bg-app-brand text-app-bg rounded font-semibold">Open Settings</button>
+      </div>`;
+    bodyPre.querySelector<HTMLButtonElement>("#role-open-settings")?.addEventListener("click", () => {
+      closeModal();
+      openModal("settings");
+    });
+    return;
+  }
 
   const selectHtml = (role: "executor" | "controller" | "reviewer", requireVision: boolean) => {
     const cur = ra[role];

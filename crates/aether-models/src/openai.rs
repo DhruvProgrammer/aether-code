@@ -14,6 +14,7 @@ pub struct OpenAICompatibleProvider {
     client: reqwest::Client,
     default_temperature: f32,
     default_max_tokens: u32,
+    headers: Option<Value>,
     extra_body: Option<Value>,
 }
 
@@ -24,8 +25,32 @@ impl OpenAICompatibleProvider {
         default_model: &str,
         extra_body: Option<Value>,
     ) -> Result<Self, ProviderError> {
-        let api_key = std::env::var(api_key_env)
-            .map_err(|_| ProviderError::MissingEnv(api_key_env.to_string()))?;
+        Self::new_with_headers(base_url, api_key_env, default_model, None, extra_body)
+    }
+
+    pub fn new_with_headers(
+        base_url: &str,
+        api_key_env: &str,
+        default_model: &str,
+        headers: Option<Value>,
+        extra_body: Option<Value>,
+    ) -> Result<Self, ProviderError> {
+        let api_key = match std::env::var(api_key_env) {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                // Fallback: treat api_key_env itself as raw key if it doesn't look like an env var name.
+                // Env var names are typically UPPER_SNAKE_CASE (A-Z, 0-9, _). Raw keys contain sk-, hyphens, lowercases etc.
+                let is_env_name = api_key_env.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && api_key_env.len() >= 2 && api_key_env.len() <= 64;
+                if is_env_name {
+                    return Err(ProviderError::MissingEnv(api_key_env.to_string()));
+                } else if !api_key_env.is_empty() {
+                    // Use raw value directly (supports direct API key storage while keeping env var mechanism for existing configs)
+                    api_key_env.to_string()
+                } else {
+                    return Err(ProviderError::MissingEnv(api_key_env.to_string()));
+                }
+            }
+        };
         // Bound the network call so a hung upstream cannot stall the CLI indefinitely. Without
         // these, `reqwest::Client::new()` has no timeout and a dropped connection can hang
         // until the OS TCP timeout (minutes), tying up the LLM loop and the visual loop.
@@ -41,12 +66,13 @@ impl OpenAICompatibleProvider {
             client,
             default_temperature: 0.2,
             default_max_tokens: 4096,
+            headers,
             extra_body,
         })
     }
 
     pub fn from_config(cfg: &aether_config::ModelConfig) -> Result<Self, ProviderError> {
-        Self::new(&cfg.base_url, &cfg.api_key_env, &cfg.model, cfg.extra_body.clone())
+        Self::new_with_headers(&cfg.base_url, &cfg.api_key_env, &cfg.model, cfg.headers.clone(), cfg.extra_body.clone())
     }
 
     fn build_body(&self, req: &CompletionRequest) -> Value {
@@ -92,6 +118,21 @@ impl OpenAICompatibleProvider {
         }
         body
     }
+
+    fn with_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(hdrs) = &self.headers {
+            if let Some(obj) = hdrs.as_object() {
+                let mut b = builder;
+                for (k, v) in obj {
+                    if let Some(s) = v.as_str() {
+                        b = b.header(k.as_str(), s);
+                    }
+                }
+                return b;
+            }
+        }
+        builder
+    }
 }
 
 #[async_trait]
@@ -107,10 +148,12 @@ impl ModelProvider for OpenAICompatibleProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         let body = self.build_body(&req);
         let resp = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
+            .with_headers(
+                self.client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .json(&body),
+            )
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -126,10 +169,12 @@ impl ModelProvider for OpenAICompatibleProvider {
         let mut body = self.build_body(&req);
         body["stream"] = serde_json::Value::Bool(true);
         let resp = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
+            .with_headers(
+                self.client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .json(&body),
+            )
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -147,10 +192,12 @@ impl ModelProvider for OpenAICompatibleProvider {
     async fn embeddings(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, ProviderError> {
         let body = serde_json::json!({ "model": self.default_model, "input": input });
         let resp = self
-            .client
-            .post(format!("{}/embeddings", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
+            .with_headers(
+                self.client
+                    .post(format!("{}/embeddings", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .json(&body),
+            )
             .send()
             .await?;
         if !resp.status().is_success() {

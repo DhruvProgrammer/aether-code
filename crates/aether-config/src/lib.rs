@@ -226,6 +226,8 @@ pub struct ModelConfig {
     pub model: String,
     pub api_key_env: String,
     #[serde(default)]
+    pub headers: Option<serde_json::Value>,
+    #[serde(default)]
     pub extra_body: Option<serde_json::Value>,
 }
 
@@ -320,6 +322,7 @@ impl ProviderEntry {
             base_url: self.base_url.clone(),
             model: model_id.to_string(),
             api_key_env: self.api_key_env.clone(),
+            headers: self.headers.clone(),
             extra_body: self.extra_body.clone(),
         })
     }

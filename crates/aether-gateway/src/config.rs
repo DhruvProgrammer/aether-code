@@ -253,6 +253,7 @@ impl GatewayBundle {
             base_url: mc.base_url.clone(),
             model_id: mc.model.clone(),
             api_key_env: mc.api_key_env.clone(),
+            headers: mc.headers.clone(),
             extra_body: mc.extra_body.clone(),
         })
     }
@@ -289,6 +290,7 @@ mod tests {
                     base_url: url.into(),
                     model: key.into(),
                     api_key_env: format!("GW_BUNDLE_{key}"),
+                    headers: None,
                     extra_body: None,
                 },
             );

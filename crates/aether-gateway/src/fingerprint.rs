@@ -30,8 +30,12 @@ pub fn fingerprint_binding(
     base_url: &str,
     model_id: &str,
     api_key_env: &str,
+    headers: Option<&serde_json::Value>,
     extra_body: Option<&serde_json::Value>,
 ) -> String {
+    let canon_headers = headers
+        .map(|v| serde_json::to_string(v).unwrap_or_default())
+        .unwrap_or_default();
     let canon_extra = extra_body
         .map(|v| serde_json::to_string(v).unwrap_or_default())
         .unwrap_or_default();
@@ -39,12 +43,13 @@ pub fn fingerprint_binding(
     // user-supplied URLs/models so superficial edits don't chum the hash
     // while real changes always do.
     let canonical = format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}",
         role.as_str(),
         provider_id.trim(),
         base_url.trim(),
         model_id.trim(),
         api_key_env.trim(),
+        canon_headers,
         canon_extra,
     );
     sha256_hex(&canonical)
@@ -80,20 +85,20 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable() {
-        let a = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "KEY", None);
-        let b = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "KEY", None);
+        let a = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "KEY", None, None);
+        let b = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "KEY", None, None);
         assert_eq!(a, b);
         assert_eq!(a.len(), 16);
     }
 
     #[test]
     fn fingerprint_changes_with_relevant_fields() {
-        let base = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "KEY", None);
-        let diff_url = fingerprint_binding(Role::Executor, "openai_compatible", "https://y/v1", "gpt", "KEY", None);
-        let diff_model = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "other", "KEY", None);
-        let diff_provider = fingerprint_binding(Role::Executor, "custom", "https://x/v1", "gpt", "KEY", None);
-        let diff_key_env = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "OTHER", None);
-        let diff_role = fingerprint_binding(Role::Controller, "openai_compatible", "https://x/v1", "gpt", "KEY", None);
+        let base = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "KEY", None, None);
+        let diff_url = fingerprint_binding(Role::Executor, "openai_compatible", "https://y/v1", "gpt", "KEY", None, None);
+        let diff_model = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "other", "KEY", None, None);
+        let diff_provider = fingerprint_binding(Role::Executor, "custom", "https://x/v1", "gpt", "KEY", None, None);
+        let diff_key_env = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "OTHER", None, None);
+        let diff_role = fingerprint_binding(Role::Controller, "openai_compatible", "https://x/v1", "gpt", "KEY", None, None);
         assert_ne!(base, diff_url);
         assert_ne!(base, diff_model);
         assert_ne!(base, diff_provider);
@@ -103,16 +108,16 @@ mod tests {
 
     #[test]
     fn fingerprint_normalizes_whitespace() {
-        let a = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1 ", "gpt ", "KEY", None);
-        let b = fingerprint_binding(Role::Executor, "openai_compatible", " https://x/v1", "gpt", "KEY", None);
+        let a = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1 ", "gpt ", "KEY", None, None);
+        let b = fingerprint_binding(Role::Executor, "openai_compatible", " https://x/v1", "gpt", "KEY", None, None);
         assert_eq!(a, b);
     }
 
     #[test]
     fn extra_body_participates() {
         let eb = serde_json::json!({"api_version": "2024-02"});
-        let a = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "KEY", None);
-        let b = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "KEY", Some(&eb));
+        let a = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "KEY", None, None);
+        let b = fingerprint_binding(Role::Executor, "openai_compatible", "https://x/v1", "gpt", "KEY", None, Some(&eb));
         assert_ne!(a, b);
     }
 

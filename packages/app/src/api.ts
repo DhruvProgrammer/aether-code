@@ -413,6 +413,8 @@ export const api = {
     invoke<void>("providers_save", { providers }),
   providersValidate: (providerId: string, modelId: string) =>
     invoke<ProviderValidationOutcome>("providers_validate", { providerId, modelId }),
+  providerCheckConnection: (providerId: string) =>
+    invoke<HealthOutcome>("provider_check_connection", { providerId }),
   migrateLegacyModels: () => invoke<number>("migrate_legacy_models"),
   compactSession: (sessionId: string) =>
     invoke<CompactResultDto>("compact_session", { sessionId }),
