@@ -24,6 +24,8 @@ use tokio::sync::Mutex;
 
 mod background;
 
+use aether_changes::ChangeWatcherManager;
+
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
@@ -1228,7 +1230,8 @@ fn pick_folder() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn workspace_remove(id: String) -> Result<(), String> {
+fn workspace_remove(changes: State<'_, Arc<ChangeWatcherManager>>, id: String) -> Result<(), String> {
+    changes.stop(&id);
     let store = workspace_store()?;
     store.remove(&id).map_err(|e| e.to_string())
 }
@@ -1626,13 +1629,71 @@ async fn get_task_state(session_id: String) -> Result<Option<TaskStateDto>, Stri
 }
 
 // ---------------------------------------------------------------------------
+// Workspace Changes — realtime tracker (OpenCode-style)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn get_workspace_changes(workspace_id: String) -> Result<aether_changes::WorkspaceChanges, String> {
+    let ws_store = workspace_store()?;
+    let ws = ws_store.get(&workspace_id).map_err(|e| e.to_string())?.ok_or_else(|| format!("workspace {workspace_id} not found"))?;
+    let path = PathBuf::from(ws.path);
+    if !path.exists() {
+        return Err(format!("workspace path does not exist: {}", path.display()));
+    }
+    Ok(aether_changes::compute_changes(&path, &workspace_id))
+}
+
+#[tauri::command]
+fn get_file_diff(workspace_id: String, file_path: String) -> Result<aether_changes::FileDiff, String> {
+    let ws_store = workspace_store()?;
+    let ws = ws_store.get(&workspace_id).map_err(|e| e.to_string())?.ok_or_else(|| format!("workspace {workspace_id} not found"))?;
+    let path = PathBuf::from(ws.path);
+    aether_changes::get_file_diff(&path, &file_path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn watch_workspace(
+    app: AppHandle,
+    changes: State<'_, Arc<ChangeWatcherManager>>,
+    workspace_id: String,
+) -> Result<(), String> {
+    let ws_store = workspace_store()?;
+    let ws = ws_store.get(&workspace_id).map_err(|e| e.to_string())?.ok_or_else(|| format!("workspace {workspace_id} not found"))?;
+    let path = PathBuf::from(ws.path);
+    if !path.exists() {
+        return Err(format!("workspace path does not exist: {}", path.display()));
+    }
+    let app_clone = app.clone();
+    let wid_clone = workspace_id.clone();
+    changes
+        .watch(path, workspace_id, move |ch| {
+            let _ = app_clone.emit("workspace_changes_updated", ch);
+        })
+        .map_err(|e| e.to_string())?;
+    // Also emit initial state is done inside watch; ensure frontend gets it.
+    let _ = wid_clone;
+    Ok(())
+}
+
+#[tauri::command]
+async fn unwatch_workspace(
+    changes: State<'_, Arc<ChangeWatcherManager>>,
+    workspace_id: String,
+) -> Result<(), String> {
+    changes.stop(&workspace_id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 fn main() {
     let state = Arc::new(RunState::default());
+    let changes_state = Arc::new(ChangeWatcherManager::new());
     tauri::Builder::default()
         .manage(state)
+        .manage(changes_state)
         .setup(|_app| Ok(()))
         .invoke_handler(tauri::generate_handler![
             read_config,
@@ -1675,6 +1736,10 @@ fn main() {
             migrate_legacy_models,
             compact_session,
             get_task_state,
+            get_workspace_changes,
+            get_file_diff,
+            watch_workspace,
+            unwatch_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running aether-desktop");

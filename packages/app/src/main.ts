@@ -9,6 +9,7 @@ import {
   type SessionRowDto,
   type ProviderEntryDto,
   type RoleAssignmentsDto,
+  type WorkspaceChangesDto,
 } from "./api";
 
 // ----- State -----
@@ -40,6 +41,10 @@ const app = {
   workspaceSessions: [] as SessionRowDto[],
   providers: [] as ProviderEntryDto[],
   roleAssignments: null as RoleAssignmentsDto | null,
+  // realtime changes
+  workspaceChanges: null as WorkspaceChangesDto | null,
+  changesUnlisten: null as (() => void) | null,
+  lastWatchedWorkspaceId: null as string | null,
 };
 
 function current(): Session {
@@ -1595,6 +1600,14 @@ async function boot() {
   });
   document.querySelector("#provider-modal-close")?.addEventListener("click", closeProviderModal);
   document.querySelector("#model-modal-close")?.addEventListener("click", closeModelModal);
+  document.querySelector("#diff-modal")?.addEventListener("click", (e) => {
+    if (e.target === document.querySelector("#diff-modal")) closeDiffModal();
+  });
+  document.querySelector("#diff-modal-close")?.addEventListener("click", closeDiffModal);
+  document.querySelector("#changes-list")?.addEventListener("click", (e) => {
+    const row = (e.target as HTMLElement).closest<HTMLElement>("[data-file-path]");
+    if (row?.dataset.filePath) void openDiffViewer(row.dataset.filePath);
+  });
 
   // Input.
   const input = document.querySelector<HTMLTextAreaElement>("#prompt-input")!;
@@ -1657,6 +1670,7 @@ function showWorkspaceHome(recent: WorkspaceDto[]): void {
   home.style.display = "flex";
   sidebar.style.display = "none";
   updateMainMargins();
+  void unwatchCurrentWorkspace();
 
   const subtitle = document.querySelector("#ws-home-subtitle")!;
   subtitle.textContent = recent.length > 0
@@ -1750,6 +1764,7 @@ function showWorkspaceUi(): void {
     document.querySelector("#ws-sidebar-path")!.textContent = app.workspace.path;
   }
   renderSessionList();
+  void watchCurrentWorkspace();
 }
 
 function renderSessionList(): void {
@@ -1768,6 +1783,148 @@ function renderSessionList(): void {
         <div class="text-[10px] text-app-textSecondary">${escapeHtml(date)}</div>
       </button>`;
   }).join("");
+}
+
+function renderChangesPanel(): void {
+  const panel = document.querySelector<HTMLDivElement>("#changes-panel");
+  const listEl = document.querySelector<HTMLDivElement>("#changes-list");
+  const emptyEl = document.querySelector<HTMLDivElement>("#changes-empty");
+  const summaryEl = document.querySelector<HTMLSpanElement>("#changes-summary");
+  if (!panel || !listEl || !emptyEl || !summaryEl) return;
+  const ch = app.workspaceChanges;
+  if (!ch || ch.total_files === 0) {
+    summaryEl.textContent = ch ? "No changes" : "No changes";
+    listEl.innerHTML = "";
+    emptyEl.style.display = "block";
+    listEl.style.display = "none";
+    return;
+  }
+  emptyEl.style.display = "none";
+  listEl.style.display = "block";
+  summaryEl.textContent = `${ch.total_files} files · +${ch.additions} -${ch.deletions}`;
+  // Reuse existing diff viewer style: status pill + path + +/-
+  listEl.innerHTML = ch.files.map((f) => {
+    const statusClass = f.status === "M" ? "M" : f.status === "A" ? "A" : f.status === "D" ? "D" : f.status === "R" ? "R" : "U";
+    const counts = (f.additions || f.deletions) ? `<span class="text-[10px] font-mono"><span class="text-green-400">+${f.additions}</span> <span class="text-red-400">-${f.deletions}</span></span>` : "";
+    const renamed = f.renamed_from ? `<span class="text-[10px] text-app-textSecondary">→ ${escapeHtml(f.renamed_from)} →</span>` : "";
+    return `<div class="changes-file" data-file-path="${escapeAttr(f.path)}" title="${escapeAttr(f.path)}">
+      <div class="flex items-center space-x-2 min-w-0">
+        <span class="status ${statusClass}">${escapeHtml(f.status)}</span>
+        <span class="text-xs font-mono truncate text-app-textPrimary">${escapeHtml(f.path)}</span>
+      </div>
+      <div class="flex items-center space-x-2 shrink-0 ml-2">${renamed}${counts}</div>
+    </div>`;
+  }).join("");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
+}
+
+async function loadWorkspaceChanges(): Promise<void> {
+  if (!app.workspace) return;
+  try {
+    const ch = await api.getWorkspaceChanges(app.workspace.id);
+    // Only apply if still same workspace (session isolation)
+    if (app.workspace && ch.workspace_id === app.workspace.id) {
+      app.workspaceChanges = ch;
+      renderChangesPanel();
+    }
+  } catch (e) {
+    console.warn("getWorkspaceChanges failed", e);
+  }
+}
+
+async function watchCurrentWorkspace(): Promise<void> {
+  if (!app.workspace) return;
+  const wid = app.workspace.id;
+  const prevWid = app.lastWatchedWorkspaceId;
+  if (prevWid && prevWid !== wid) {
+    try { await api.unwatchWorkspace(prevWid); } catch {}
+  }
+  app.lastWatchedWorkspaceId = wid;
+  if (app.changesUnlisten) {
+    try { app.changesUnlisten(); } catch {}
+    app.changesUnlisten = null;
+  }
+  try {
+    await api.watchWorkspace(wid);
+  } catch (e) {
+    console.warn("watchWorkspace failed", e);
+    // Gracefully degrade: still try to load once
+  }
+  try {
+    const unlisten = await events.onWorkspaceChanges((ch) => {
+      try {
+        if (!app.workspace || ch.workspace_id !== app.workspace.id) return;
+        app.workspaceChanges = ch;
+        renderChangesPanel();
+      } catch (err) {
+        console.error("workspace_changes handler failed", err);
+      }
+    });
+    app.changesUnlisten = unlisten;
+  } catch (e) {
+    console.warn("onWorkspaceChanges listen failed", e);
+  }
+  await loadWorkspaceChanges();
+}
+
+async function unwatchCurrentWorkspace(): Promise<void> {
+  const wid = app.lastWatchedWorkspaceId ?? app.workspace?.id;
+  if (app.changesUnlisten) {
+    try { app.changesUnlisten(); } catch {}
+    app.changesUnlisten = null;
+  }
+  if (wid) {
+    try { await api.unwatchWorkspace(wid); } catch {}
+  }
+  app.lastWatchedWorkspaceId = null;
+  app.workspaceChanges = null;
+  renderChangesPanel();
+}
+
+async function openDiffViewer(filePath: string): Promise<void> {
+  if (!app.workspace) return;
+  const modal = document.querySelector<HTMLDivElement>("#diff-modal")!;
+  const title = document.querySelector<HTMLHeadingElement>("#diff-modal-title")!;
+  const stats = document.querySelector<HTMLSpanElement>("#diff-modal-stats")!;
+  const body = document.querySelector<HTMLDivElement>("#diff-modal-body")!;
+  title.textContent = filePath;
+  stats.textContent = "Loading…";
+  body.innerHTML = `<div class="p-6 text-app-textSecondary text-sm">Loading diff…</div>`;
+  modal.classList.add("open");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
+  try {
+    const diff = await api.getFileDiff(app.workspace.id, filePath);
+    stats.textContent = `+${diff.additions} -${diff.deletions}`;
+    if (!diff.diff || diff.diff.trim() === "") {
+      body.innerHTML = `<div class="p-6 text-app-textSecondary text-sm">No diff available for ${escapeHtml(filePath)}.</div>`;
+      return;
+    }
+    const lines = diff.diff.split("\n");
+    body.innerHTML = lines.map((line) => {
+      const esc = escapeHtml(line);
+      if (line.startsWith("+++") || line.startsWith("---")) {
+        return `<div class="diff-line hunk">${esc}</div>`;
+      } else if (line.startsWith("@@")) {
+        return `<div class="diff-line hunk">${esc}</div>`;
+      } else if (line.startsWith("+")) {
+        return `<div class="diff-line add">${esc}</div>`;
+      } else if (line.startsWith("-")) {
+        return `<div class="diff-line del">${esc}</div>`;
+      } else {
+        return `<div class="diff-line ctx">${esc}</div>`;
+      }
+    }).join("");
+  } catch (e) {
+    stats.textContent = "error";
+    body.innerHTML = `<div class="p-6 text-app-error text-sm">Failed to load diff: ${escapeHtml(String(e).slice(0,300))}</div>`;
+  }
+}
+
+function closeDiffModal(): void {
+  const modal = document.querySelector<HTMLDivElement>("#diff-modal")!;
+  modal.classList.remove("open");
 }
 
 async function createNewSession(): Promise<void> {

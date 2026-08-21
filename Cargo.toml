@@ -17,10 +17,11 @@ members = [
     "crates/aether-analysis",
     "crates/aether-gateway",
     "crates/aether-workspace",
+    "crates/aether-changes",
 ]
 
 [workspace.package]
-  version = "0.20.0"
+  version = "0.21.0"
 edition = "2021"
 license = "MIT"
 authors = ["aether contributors"]

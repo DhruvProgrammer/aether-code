@@ -105,6 +105,21 @@
       .modal-overlay { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,.55); backdrop-filter: blur(4px); display:none; align-items:center; justify-content:center; padding: 20px; }
       .modal-overlay.open { display:flex; }
       .modal-card { background:#161922; border:1px solid #2a2f3d; border-radius: 12px; width: 100%; max-width: 560px; max-height: 85vh; overflow: hidden; display:flex; flex-direction:column; }
+      /* ---- Changes panel (OpenCode-style) ---- */
+      .changes-file { display:flex; align-items:center; justify-content:space-between; padding:6px 8px; border-radius:6px; background:#0f1115; border:1px solid #2a2f3d; cursor:pointer; }
+      .changes-file:hover { border-color:#7ca6b4; }
+      .changes-file .status { font-size:10px; font-weight:700; width:22px; height:22px; display:flex; align-items:center; justify-content:center; border-radius:4px; flex-shrink:0; }
+      .changes-file .status.M { background:#1a3329; color:#4ade80; }
+      .changes-file .status.A { background:#1e293b; color:#60a5fa; }
+      .changes-file .status.D { background:#3f1d1d; color:#f87171; }
+      .changes-file .status.R { background:#2a2438; color:#a78bfa; }
+      .changes-file .status.U { background:#2a2a1a; color:#facc15; }
+      /* ---- Diff viewer ---- */
+      .diff-line { white-space:pre-wrap; font-family:'JetBrains Mono', monospace; padding:1px 12px; line-height:1.6; }
+      .diff-line.add { background:#0f2a1a; color:#86efac; }
+      .diff-line.del { background:#2a1212; color:#fca5a5; }
+      .diff-line.hunk { color:#7ca6b4; background:#1d2230; font-weight:600; }
+      .diff-line.ctx { color:#8c9296; }
     </style>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
@@ -158,6 +173,15 @@
         </button>
       </div>
       <div id="ws-session-list" class="flex-1 overflow-y-auto px-3 pb-3 space-y-1 collapse-hide"></div>
+      <!-- Changes Panel (OpenCode-style, realtime) -->
+      <div id="changes-panel" class="border-t border-app-border mt-2 pt-3 px-3 pb-3 collapse-hide">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-[11px] font-semibold tracking-widest text-app-textSecondary uppercase">Changes</h3>
+          <span id="changes-summary" class="text-[10px] font-mono text-app-textSecondary">No changes</span>
+        </div>
+        <div id="changes-list" class="space-y-1 max-h-64 overflow-y-auto"></div>
+        <div id="changes-empty" class="text-xs text-app-textSecondary italic py-2">No changes</div>
+      </div>
       <div class="collapse-show hidden items-center justify-center p-3">
         <button id="sidebar-expand" class="sidebar-toggle" title="Expand sidebar">
           <i class="w-3.5 h-3.5" data-lucide="panel-left-open"></i>
@@ -275,6 +299,19 @@
           <button id="model-modal-close" class="text-app-textSecondary hover:text-app-textPrimary"><i class="w-5 h-5" data-lucide="x"></i></button>
         </div>
         <div id="model-modal-body" class="p-5 overflow-y-auto space-y-4"></div>
+      </div>
+    </div>
+    <!-- Diff Viewer Modal (reuses existing diff renderer) -->
+    <div id="diff-modal" class="modal-overlay">
+      <div class="modal-card" style="max-width: 900px; width: 95%;">
+        <div class="flex items-center justify-between px-5 py-3 border-b border-app-border">
+          <h2 id="diff-modal-title" class="text-sm font-mono text-app-textPrimary truncate">Diff</h2>
+          <div class="flex items-center space-x-2">
+            <span id="diff-modal-stats" class="text-xs font-mono text-app-textSecondary"></span>
+            <button id="diff-modal-close" class="text-app-textSecondary hover:text-app-textPrimary"><i class="w-5 h-5" data-lucide="x"></i></button>
+          </div>
+        </div>
+        <div id="diff-modal-body" class="p-0 overflow-auto max-h-[70vh] font-mono text-xs"></div>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

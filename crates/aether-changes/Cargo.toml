@@ -1,0 +1,16 @@
+[package]
+name = "aether-changes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AETHER realtime workspace change tracker — filesystem watcher + Git-aware diff"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+anyhow = "1"
+notify = "6"
+parking_lot = "0.12"
+tokio = { version = "1", features = ["process", "rt", "sync", "time"] }

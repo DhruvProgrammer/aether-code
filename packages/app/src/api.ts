@@ -329,6 +329,37 @@ export interface TaskStateEvent {
   payload: string;
 }
 
+// ---------------------------------------------------------------------------
+// Realtime Changes (OpenCode-style)
+// ---------------------------------------------------------------------------
+
+export interface FileChangeDto {
+  path: string;
+  status: "M" | "A" | "D" | "R" | "U";
+  additions: number;
+  deletions: number;
+  staged: boolean;
+  renamed_from?: string | null;
+}
+
+export interface WorkspaceChangesDto {
+  workspace_id: string;
+  workspace_path: string;
+  total_files: number;
+  additions: number;
+  deletions: number;
+  files: FileChangeDto[];
+  timestamp: string;
+  is_git: boolean;
+}
+
+export interface FileDiffDto {
+  path: string;
+  diff: string;
+  additions: number;
+  deletions: number;
+}
+
 export const api = {
   readConfig: () => invoke<ConfigResponse>("read_config"),
   writeConfig: (config: DesktopConfig) => invoke<string>("write_config", { config }),
@@ -420,6 +451,14 @@ export const api = {
     invoke<CompactResultDto>("compact_session", { sessionId }),
   getTaskState: (sessionId: string) =>
     invoke<TaskStateDto | null>("get_task_state", { sessionId }),
+  getWorkspaceChanges: (workspaceId: string) =>
+    invoke<WorkspaceChangesDto>("get_workspace_changes", { workspaceId }),
+  getFileDiff: (workspaceId: string, filePath: string) =>
+    invoke<FileDiffDto>("get_file_diff", { workspaceId, filePath }),
+  watchWorkspace: (workspaceId: string) =>
+    invoke<void>("watch_workspace", { workspaceId }),
+  unwatchWorkspace: (workspaceId: string) =>
+    invoke<void>("unwatch_workspace", { workspaceId }),
 };
 
 export const events = {
@@ -431,4 +470,6 @@ export const events = {
     listen<TaskStateEvent>("task-state", (e) => cb(e.payload)),
   onAnalysisProgress: (cb: (e: AnalysisProgress) => void): Promise<UnlistenFn> =>
     listen<AnalysisProgress>("analysis-progress", (e) => cb(e.payload)),
+  onWorkspaceChanges: (cb: (e: WorkspaceChangesDto) => void): Promise<UnlistenFn> =>
+    listen<WorkspaceChangesDto>("workspace_changes_updated", (e) => cb(e.payload)),
 };
