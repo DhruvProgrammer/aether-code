@@ -1036,7 +1036,8 @@ function openProviderModal(editIdx: number | null): void {
     try {
       const out = await api.checkProvider(base, key, []);
       if (out.models_discovered && out.models_discovered.length > 0) {
-        discEl.innerHTML = out.models_discovered.map(m => `<label class="flex items-center space-x-2 py-1"><input type="checkbox" value="${escapeAttr(m)}" class="pm-disc-check" /> <span class="font-mono text-xs">${escapeHtml(m)}</span></label>`).join("") + `<button type="button" id="pm-add-selected" class="mt-2 text-xs px-2 py-1 bg-app-brand text-app-bg rounded">Add Selected</button>`;
+        const existingIds2 = new Set((existing?.models ?? []).map(m => m.id));
+        discEl.innerHTML = out.models_discovered.map(m => `<label class="flex items-center space-x-2 py-1"><input type="checkbox" value="${escapeAttr(m)}" class="pm-disc-check" ${existingIds2.has(m) ? "checked" : ""} /> <span class="font-mono text-xs">${escapeHtml(m)}</span></label>`).join("") + `<button type="button" id="pm-add-selected" class="mt-2 text-xs px-2 py-1 bg-app-brand text-app-bg rounded">Add Selected</button>`;
         discEl.querySelector<HTMLButtonElement>("#pm-add-selected")?.addEventListener("click", () => {
           const checks = discEl.querySelectorAll<HTMLInputElement>(".pm-disc-check:checked");
           let added = 0;
@@ -1085,12 +1086,36 @@ function openProviderModal(editIdx: number | null): void {
     if (!base) { statusEl.textContent="✗ Base URL required"; return; }
     if (auth !== "none" && !(keyEnv || rawKey)) { statusEl.textContent="✗ API Key required"; return; }
     if (auth === "env_var" && keyEnv && !/^[A-Z0-9_]{2,64}$/.test(keyEnv)) { statusEl.textContent="✗ Invalid env var name"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
+    // Collect selected discovered models (if any) — fixes “MODELS (0)” bug
+    const discEl2 = body.querySelector<HTMLDivElement>("#pm-discovered");
+    const selectedIds = discEl2 ? Array.from(discEl2.querySelectorAll<HTMLInputElement>(".pm-disc-check:checked")).map(cb => cb.value) : [];
+    const discoveredAll = discEl2 ? Array.from(discEl2.querySelectorAll<HTMLInputElement>(".pm-disc-check")).map(cb => cb.value) : [];
+    const existingModels = existing?.models ?? [];
+    let mergedModels = [...existingModels];
+    for (const mid of selectedIds) {
+      if (!mergedModels.some(m => m.id === mid)) {
+        mergedModels.push({ id: mid, display_name: mid, vision: false, tool_calling: true, streaming: true, context_window: null, max_output_tokens: null });
+      }
+    }
+    for (const mid of discoveredAll) {
+      const wasInExisting = existingModels.some(m => m.id === mid);
+      const isChecked = selectedIds.includes(mid);
+      if (wasInExisting && !isChecked) {
+        mergedModels = mergedModels.filter(m => m.id !== mid);
+      }
+    }
+    const seenIds = new Set<string>();
+    mergedModels = mergedModels.filter(m => {
+      if (seenIds.has(m.id)) return false;
+      seenIds.add(m.id);
+      return true;
+    });
     const entry: ProviderEntryDto = {
       id, display_name: name, protocol, base_url: base, api_key_env: auth === "env_var" ? keyEnv : "",
       auth_type: auth, api_key: auth === "raw" ? rawKey : null,
       headers: Object.keys(hd).length ? hd as unknown as ProviderEntryDto["headers"] : null,
       extra_body: existing?.extra_body ?? null,
-      models: existing?.models ?? []
+      models: mergedModels
     };
     if (isEdit) {
       app.providers[editIdx!] = entry;
