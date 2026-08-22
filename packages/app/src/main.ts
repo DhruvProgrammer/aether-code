@@ -228,16 +228,34 @@ function newTab() {
 
 // ----- Run / send -----
 
-let activeUnlistens: (() => void)[] = [];
+// Per-session listener registry — one tab's task must never detach another's handlers.
+const sessionUnlistens = new Map<string, (() => void)[]>();
+
+function redactSecrets(msg: string): string {
+  return msg
+    .replace(/\bsk-[a-zA-Z0-9_\-]{8,}/g, "[REDACTED]")
+    .replace(/\bnvapi-[a-zA-Z0-9_\-]{8,}/g, "[REDACTED]")
+    .replace(/\bvenice-[a-zA-Z0-9_\-]{8,}/g, "[REDACTED]")
+    .replace(/\bBearer\s+[a-zA-Z0-9_\-\.]{12,}/g, "Bearer [REDACTED]")
+    .replace(/\b(api[_-]?key|authorization|x-api-key)\s*[:=]\s*\S+/gi, "$1: [REDACTED]");
+}
 
 async function send() {
   const input = document.querySelector<HTMLTextAreaElement>("#prompt-input")!;
   const text = input.value.trim();
   if (!text) return;
 
+  const s = current();
+
+  // Running guard: never double-fire a task in the same session.
+  if (s.running) {
+    s.blocks.push({ id: newId(s), kind: "info", text: "A task is already running in this tab. Use /cancel to stop it first." });
+    renderAll();
+    return;
+  }
+
   // NO_WORKSPACE guard (v0.17): coding tasks require an active workspace.
   if (!app.workspace) {
-    const s = current();
     s.blocks.push({
       id: newId(s),
       kind: "info",
@@ -245,11 +263,21 @@ async function send() {
     });
     renderAll();
     void pickFolder();
-    return;
+    return; // input preserved so user doesn't lose their message
   }
 
-  const s = current();
-  s.title = text.slice(0, 40);
+  // Validate BEFORE consuming the user's message (fixes lost-input papercut).
+  const precheck = validateBeforeSend();
+  if (precheck) {
+    s.blocks.push({ id: newId(s), kind: "error", text: precheck });
+    renderAll();
+    return; // input preserved
+  }
+
+  // Only now consume the message.
+  if (!text.startsWith("/")) {
+    s.title = text.slice(0, 40);
+  }
   s.blocks.push({ id: newId(s), kind: "user", text });
   input.value = "";
   input.style.height = "auto";
@@ -292,34 +320,28 @@ async function send() {
         text: `${r.message} (${r.tokens_before} → ${r.tokens_after} tokens)`,
       });
     } catch (e) {
-      s.blocks.push({ id: newId(s), kind: "error", text: `Compact failed: ${String(e)}` });
+      s.blocks.push({ id: newId(s), kind: "error", text: `Compact failed: ${redactSecrets(String(e))}` });
     }
     renderAll();
     return;
   }
   if (text === "/cancel") {
-    if (s.running) {
-      await api.cancelTask(s.id);
-      s.blocks.push({ id: newId(s), kind: "info", text: "Cancel requested." });
-      renderAll();
+    try {
+      const ok = await api.cancelTask(s.id);
+      s.blocks.push({ id: newId(s), kind: "info", text: ok ? "Cancel requested — stopping at the next safe boundary…" : "No running task found for this session." });
+    } catch (e) {
+      s.blocks.push({ id: newId(s), kind: "error", text: `Cancel failed: ${redactSecrets(String(e))}` });
     }
+    renderAll();
     return;
   }
   if (text === "/status") {
     try {
       const r = await api.backendStatus();
-      s.blocks.push({ id: newId(s), kind: "info", text: `Backend: ${r.mode} (${r.ready ? "ready" : "not ready"})` });
+      s.blocks.push({ id: newId(s), kind: "info", text: `Backend: ${r.backend}\nConfig: ${r.config_path} (${r.config_exists ? "found" : "missing"})\nVersion: v${r.version}` });
     } catch (e) {
-      s.blocks.push({ id: newId(s), kind: "error", text: `status failed: ${String(e)}` });
+      s.blocks.push({ id: newId(s), kind: "error", text: `status failed: ${redactSecrets(String(e))}` });
     }
-    renderAll();
-    return;
-  }
-
-  // Validate session state before execution (critical crash guard).
-  const precheck = validateBeforeSend();
-  if (precheck) {
-    s.blocks.push({ id: newId(s), kind: "error", text: precheck });
     renderAll();
     return;
   }
@@ -329,6 +351,10 @@ async function send() {
   renderAll();
   attachListeners(s);
 
+  // Send button disabled state while running.
+  const sendBtn = document.querySelector<HTMLButtonElement>("#send-btn");
+  sendBtn?.setAttribute("disabled", "true");
+
   try {
     const handle = await api.runTask(text, app.mode === "plan", {
       sessionId: s.id,
@@ -336,66 +362,87 @@ async function send() {
       roleAssignmentsJson: app.roleAssignments ? JSON.stringify(app.roleAssignments) : undefined,
     });
     s.id = handle.session_id;
+    // Re-key listeners under the backend-assigned session id.
+    rekeyListeners(s);
   } catch (e) {
     s.running = false;
-    s.blocks.push({ id: newId(s), kind: "error", text: `Failed to start: ${String(e)}` });
+    s.blocks.push({ id: newId(s), kind: "error", text: `Failed to start: ${redactSecrets(String(e))}` });
     renderAll();
-    detachListeners();
+    detachListeners(s.id);
+    sendBtn?.removeAttribute("disabled");
+  }
+}
+
+function rekeyListeners(s: Session): void {
+  const fns = sessionUnlistens.get("__pending__");
+  if (fns) {
+    sessionUnlistens.delete("__pending__");
+    sessionUnlistens.set(s.id, fns);
   }
 }
 
 function attachListeners(s: Session) {
-  detachListeners();
+  detachListeners(s.id);
+  const unlistens: (() => void)[] = [];
+  sessionUnlistens.set("__pending__", unlistens);
+  let sid = s.id;
   events.onTaskOutput((o: TaskOutput) => {
     try {
-      if (o.session_id !== s.id) return;
+      if (o.session_id !== sid && o.session_id !== "__pending__") return;
       if (o.stream === "stderr") {
-        // Provider/gateway errors are already human-readable and must never terminate the app.
-        // Render as error block; include actionable hint when recognizable.
-        let msg = o.line || "";
-        // Defensive: never expose raw keys/headers
-        if (/sk-[a-zA-Z0-9]{10,}/.test(msg)) msg = msg.replace(/sk-[a-zA-Z0-9_\-]+/g, "[REDACTED]");
-        s.blocks.push({ id: newId(s), kind: "error", text: msg });
+        // Provider/gateway errors are human-readable; redact any leaked secrets.
+        s.blocks.push({ id: newId(s), kind: "error", text: redactSecrets(o.line || "") });
       } else {
         appendLine(s, o.line);
       }
-      renderStream();
+      // Only re-render when this session is the visible tab (fixes scroll-yank).
+      if (current() === s) renderStream();
     } catch (e) {
       console.error("task-output handler failed", e);
-      try { s.blocks.push({ id: newId(s), kind: "error", text: `Rendering error: ${String(e)}` }); renderStream(); } catch {}
+      try { s.blocks.push({ id: newId(s), kind: "error", text: `Rendering error: ${String(e)}` }); if (current() === s) renderStream(); } catch {}
     }
-  }).then((u) => activeUnlistens.push(u));
+  }).then((u) => unlistens.push(u));
   events.onTaskExit((e: TaskExit) => {
     try {
-      if (e.session_id !== s.id) return;
+      if (e.session_id !== sid) return;
       s.running = false;
       if (!e.success) {
         const code = e.code ?? "?";
-        // Keep exit reason user-friendly; task-output already contains the typed provider error.
-        if (!s.blocks.some((b) => b.kind === "error" && b.text.includes("Exit code"))) {
-          s.blocks.push({ id: newId(s), kind: "error", text: `Task finished with exit code: ${code}. Check provider errors above. [Settings: /settings] [Model selector: click — not set —]` });
+        if (!s.blocks.some((b) => b.kind === "error" && b.text.includes("exit code"))) {
+          s.blocks.push({ id: newId(s), kind: "error", text: `Task finished with exit code: ${code}. Check provider errors above.` });
         }
       }
-      renderAll();
+      if (current() === s) renderAll();
     } catch (err) {
       console.error("task-exit handler failed", err);
     } finally {
-      detachListeners();
+      detachListeners(e.session_id);
+      document.querySelector<HTMLButtonElement>("#send-btn")?.removeAttribute("disabled");
     }
-  }).then((u) => activeUnlistens.push(u));
-  // Also listen for task-state updates if available (render in status pill or console)
+  }).then((u) => unlistens.push(u));
   events.onTaskState?.((st) => {
     try {
-      if (st.session_id !== s.id) return;
-      // Keep task state for debugging; not rendered as block to avoid clutter.
+      if (st.session_id !== sid) return;
       console.debug("task-state", st.payload);
     } catch {}
-  }).then((u) => { if (u) activeUnlistens.push(u); }).catch(()=>{});
+  }).then((u) => { if (u) unlistens.push(u); }).catch(()=>{});
+  // After runTask resolves with a real session id, re-key under it.
+  const origId = sid;
+  void Promise.resolve().then(() => { if (s.id !== origId) { sid = s.id; rekeyListeners(s); } });
 }
 
-function detachListeners() {
-  for (const u of activeUnlistens) try { u(); } catch {}
-  activeUnlistens = [];
+function detachListeners(sessionId?: string) {
+  if (sessionId === undefined) {
+    for (const fns of sessionUnlistens.values()) for (const u of fns) try { u(); } catch {}
+    sessionUnlistens.clear();
+    return;
+  }
+  const fns = sessionUnlistens.get(sessionId) ?? sessionUnlistens.get("__pending__");
+  if (fns) {
+    for (const u of fns) try { u(); } catch {}
+    sessionUnlistens.delete(sessionId);
+    sessionUnlistens.delete("__pending__");
+  }
 }
 
 // ----- Modal (settings + history) -----
@@ -441,6 +488,16 @@ function closeModal() {
   const modal = document.querySelector<HTMLDivElement>("#modal")!;
   modal.classList.add("hidden");
   modal.classList.remove("flex");
+}
+
+// Dirty-check guard: warn before discarding typed form data in provider/model modals.
+let providerModalDirty = false;
+let modelModalDirty = false;
+
+function confirmDiscard(kind: "provider" | "model"): boolean {
+  const dirty = kind === "provider" ? providerModalDirty : modelModalDirty;
+  if (!dirty) return true;
+  return window.confirm(`You have unsaved changes in this ${kind} form. Discard them?`);
 }
 
 // ---------------------------------------------------------------------------
@@ -766,7 +823,17 @@ function wireProviderCatalog(body: HTMLElement): void {
       const [pi, mi] = btn.dataset.modelDel!.split("|").map((n) => parseInt(n, 10));
       const prov = app.providers[pi];
       prov.models.splice(mi, 1);
-      modelValidation.delete(`${pi}:${mi}`);
+      // Reindex validation map so badges don't shift onto wrong models.
+      const reindexed = new Map<string, { checking: boolean; ok?: boolean; detail: string }>();
+      modelValidation.forEach((v, k) => {
+        const [kpi, kmi] = k.split(":").map((n) => parseInt(n, 10));
+        if (kpi !== pi) { reindexed.set(k, v); return; }
+        if (kmi === mi) return; // deleted
+        if (kmi > mi) { reindexed.set(`${kpi}:${kmi - 1}`, v); return; }
+        reindexed.set(k, v);
+      });
+      modelValidation.clear();
+      reindexed.forEach((v, k) => modelValidation.set(k, v));
       refreshProviderCatalog(body);
     });
   });
@@ -929,10 +996,10 @@ function openProviderModal(editIdx: number | null): void {
   };
 
   body.querySelectorAll<HTMLInputElement>('input[name="pm-auth"]').forEach(r => r.addEventListener("change", updateAuthVisibility));
-  body.querySelector<HTMLInputElement>("#pm-id")?.addEventListener("input", () => { _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
-  body.querySelector<HTMLInputElement>("#pm-base")?.addEventListener("input", () => { _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
-  body.querySelector<HTMLInputElement>("#pm-key-env")?.addEventListener("input", () => { _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
-  body.querySelector<HTMLInputElement>("#pm-key-raw")?.addEventListener("input", () => { _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  body.querySelector<HTMLInputElement>("#pm-id")?.addEventListener("input", () => { _providerChecked = false; providerModalDirty = true; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  body.querySelector<HTMLInputElement>("#pm-base")?.addEventListener("input", () => { _providerChecked = false; providerModalDirty = true; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  body.querySelector<HTMLInputElement>("#pm-key-env")?.addEventListener("input", () => { _providerChecked = false; providerModalDirty = true; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
+  body.querySelector<HTMLInputElement>("#pm-key-raw")?.addEventListener("input", () => { _providerChecked = false; providerModalDirty = true; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave(); });
   body.querySelector<HTMLButtonElement>("#pm-key-toggle")?.addEventListener("click", () => {
     const inp = body.querySelector<HTMLInputElement>("#pm-key-raw")!;
     inp.type = inp.type === "password" ? "text" : "password";
@@ -953,14 +1020,14 @@ function openProviderModal(editIdx: number | null): void {
       el.addEventListener("input", () => {
         const i = parseInt(el.dataset.headerKey!,10);
         headersData[i][0]=el.value;
-        _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave();
+        _providerChecked = false; providerModalDirty = true; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave();
       });
     });
     body.querySelectorAll<HTMLInputElement>("[data-header-val]").forEach(el => {
       el.addEventListener("input", () => {
         const i = parseInt(el.dataset.headerVal!,10);
         headersData[i][1]=el.value;
-        _providerChecked = false; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave();
+        _providerChecked = false; providerModalDirty = true; (body.querySelector("#pm-status") as HTMLElement).textContent=""; updateSave();
       });
     });
     body.querySelectorAll<HTMLButtonElement>("[data-header-remove]").forEach(btn=>{
@@ -1039,15 +1106,15 @@ function openProviderModal(editIdx: number | null): void {
         const existingIds2 = new Set((existing?.models ?? []).map(m => m.id));
         discEl.innerHTML = out.models_discovered.map(m => `<label class="flex items-center space-x-2 py-1"><input type="checkbox" value="${escapeAttr(m)}" class="pm-disc-check" ${existingIds2.has(m) ? "checked" : ""} /> <span class="font-mono text-xs">${escapeHtml(m)}</span></label>`).join("") + `<button type="button" id="pm-add-selected" class="mt-2 text-xs px-2 py-1 bg-app-brand text-app-bg rounded">Add Selected</button>`;
         discEl.querySelector<HTMLButtonElement>("#pm-add-selected")?.addEventListener("click", () => {
-          const checks = discEl.querySelectorAll<HTMLInputElement>(".pm-disc-check:checked");
-          let added = 0;
-          const provIdx = isEdit ? editIdx! : app.providers.length; // for new provider, not yet saved, use temp
-          // For new provider, we need to handle that provider not yet in app.providers; for now just show message
+          // Checked boxes are merged into the saved provider by the Save handler.
+          const n = discEl.querySelectorAll<HTMLInputElement>(".pm-disc-check:checked").length;
           if (!isEdit) {
-            discEl.innerHTML += `<div class="text-xs text-app-warning mt-1">Save provider first, then add models via provider card.</div>`;
+            discEl.innerHTML += `<div class="text-xs text-app-warning mt-1">${n} model(s) checked — they will be saved when you click "Save Provider".</div>`;
             return;
           }
-          checks.forEach(ch => {
+          const provIdx = editIdx!;
+          let added = 0;
+          discEl.querySelectorAll<HTMLInputElement>(".pm-disc-check:checked").forEach(ch => {
             const mid = ch.value;
             if (!app.providers[provIdx].models.some(m=>m.id===mid)) {
               app.providers[provIdx].models.push({ id: mid, display_name: mid, vision: false, tool_calling: true, streaming: true, context_window: null, max_output_tokens: null });
@@ -1055,10 +1122,13 @@ function openProviderModal(editIdx: number | null): void {
             }
           });
           if (added > 0) {
-            void api.providersSave(app.providers).catch(()=>{});
-            const settingsBody = document.querySelector<HTMLElement>("#modal-body");
-            if (settingsBody) refreshProviderCatalog(settingsBody);
-            discEl.innerHTML = `<div class="text-xs text-green-400">Added ${added} model(s). Save provider to persist.</div>` + discEl.innerHTML;
+            void api.providersSave(app.providers).then(() => {
+              const settingsBody = document.querySelector<HTMLElement>("#modal-body");
+              if (settingsBody) refreshProviderCatalog(settingsBody);
+            }).catch(e => {
+              discEl.innerHTML = `<div class="text-xs text-app-error">Save failed: ${escapeHtml(String(e).slice(0,150))}</div>` + discEl.innerHTML;
+            });
+            discEl.innerHTML = `<div class="text-xs text-green-400">Added ${added} model(s) — click "Save Provider" to persist.</div>` + discEl.innerHTML;
           }
         });
       } else {
@@ -1069,7 +1139,7 @@ function openProviderModal(editIdx: number | null): void {
     }
   });
 
-  body.querySelector<HTMLButtonElement>("#pm-cancel")?.addEventListener("click", closeProviderModal);
+  body.querySelector<HTMLButtonElement>("#pm-cancel")?.addEventListener("click", () => closeProviderModal());
   body.querySelector<HTMLButtonElement>("#pm-save")?.addEventListener("click", async () => {
     const id = (body.querySelector<HTMLInputElement>("#pm-id")!.value.trim());
     const name = (body.querySelector<HTMLInputElement>("#pm-name")!.value.trim() || id);
@@ -1127,7 +1197,7 @@ function openProviderModal(editIdx: number | null): void {
     try {
       await api.providersSave(app.providers);
       if (isEdit) providerValidation.set(editIdx!, { checking:false, ok: true, detail:"saved" });
-      closeProviderModal();
+      closeProviderModal(true);
       const settingsBody = document.querySelector<HTMLElement>("#modal-body");
       if (settingsBody) refreshProviderCatalog(settingsBody);
     } catch(e){
@@ -1139,7 +1209,9 @@ function openProviderModal(editIdx: number | null): void {
   updateSave();
 }
 
-function closeProviderModal(): void {
+function closeProviderModal(force = false): void {
+  if (!force && !confirmDiscard("provider")) return;
+  providerModalDirty = false;
   const modal = document.querySelector<HTMLDivElement>("#provider-modal")!;
   modal.classList.remove("open");
 }
@@ -1191,7 +1263,7 @@ function openModelModal(providerIdx: number, modelIdx: number | null): void {
     btn.disabled = !can;
     btn.style.opacity = can ? "1" : "0.5";
   };
-  body.querySelector<HTMLInputElement>("#mm-id")?.addEventListener("input", ()=>{ modelChecked=false; statusEl.textContent=""; updateSave(); });
+  body.querySelector<HTMLInputElement>("#mm-id")?.addEventListener("input", ()=>{ modelChecked=false; modelModalDirty=true; statusEl.textContent=""; updateSave(); });
   body.querySelector<HTMLButtonElement>("#mm-check")?.addEventListener("click", async () => {
     const mid = (body.querySelector<HTMLInputElement>("#mm-id")!.value.trim());
     if (!mid) { statusEl.textContent="✗ Model ID required"; statusEl.className="text-xs font-mono mt-2 text-app-error"; return; }
@@ -1245,7 +1317,7 @@ function openModelModal(providerIdx: number, modelIdx: number | null): void {
       await api.providersSave(app.providers);
       const key = `${providerIdx}:${isEdit? modelIdx! : prov.models.findIndex(m=>m.id===mid)}`;
       modelValidation.set(key, { checking:false, ok:true, detail:"validated" });
-      closeModelModal();
+      closeModelModal(true);
       const settingsBody = document.querySelector<HTMLElement>("#modal-body");
       if (settingsBody) refreshProviderCatalog(settingsBody);
     } catch(e){
@@ -1256,7 +1328,9 @@ function openModelModal(providerIdx: number, modelIdx: number | null): void {
   updateSave();
 }
 
-function closeModelModal(): void {
+function closeModelModal(force = false): void {
+  if (!force && !confirmDiscard("model")) return;
+  modelModalDirty = false;
   const modal = document.querySelector<HTMLDivElement>("#model-modal")!;
   modal.classList.remove("open");
 }
@@ -1745,6 +1819,11 @@ async function boot() {
     if (closeBtn) {
       const idx = parseInt(closeBtn.dataset.closeTab!, 10);
       if (app.tabs.length > 1) {
+        const closing = app.tabs[idx];
+        if (closing.running) {
+          const proceed = window.confirm("A task is still running in this tab. Close it? The agent will keep running until it finishes or you cancel it via /cancel before closing.");
+          if (!proceed) return;
+        }
         app.tabs.splice(idx, 1);
         if (app.active >= app.tabs.length) app.active = app.tabs.length - 1;
         renderAll();
@@ -1768,12 +1847,21 @@ async function boot() {
   document.querySelector("#model-modal")?.addEventListener("click", (e) => {
     if (e.target === document.querySelector("#model-modal")) closeModelModal();
   });
-  document.querySelector("#provider-modal-close")?.addEventListener("click", closeProviderModal);
-  document.querySelector("#model-modal-close")?.addEventListener("click", closeModelModal);
+  document.querySelector("#provider-modal-close")?.addEventListener("click", () => closeProviderModal());
+  document.querySelector("#model-modal-close")?.addEventListener("click", () => closeModelModal());
   document.querySelector("#diff-modal")?.addEventListener("click", (e) => {
     if (e.target === document.querySelector("#diff-modal")) closeDiffModal();
   });
   document.querySelector("#diff-modal-close")?.addEventListener("click", closeDiffModal);
+  // Escape closes topmost modal (with dirty-check for forms).
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (document.querySelector("#diff-modal")?.classList.contains("open")) { closeDiffModal(); return; }
+    if (document.querySelector("#model-modal")?.classList.contains("open")) { closeModelModal(); return; }
+    if (document.querySelector("#provider-modal")?.classList.contains("open")) { closeProviderModal(); return; }
+    const settingsModal = document.querySelector("#modal");
+    if (settingsModal && !settingsModal.classList.contains("hidden")) closeModal();
+  });
   document.querySelector("#changes-list")?.addEventListener("click", (e) => {
     const row = (e.target as HTMLElement).closest<HTMLElement>("[data-file-path]");
     if (row?.dataset.filePath) void openDiffViewer(row.dataset.filePath);
@@ -1863,6 +1951,7 @@ function showWorkspaceHome(recent: WorkspaceDto[]): void {
 
 function wireWorkspaceHome(): void {
   document.querySelector("#ws-select-folder-btn")!.addEventListener("click", () => void pickFolder());
+  document.querySelector("#ws-home-settings-link")?.addEventListener("click", () => openModal("settings"));
   document.querySelector("#ws-recent-list")!.addEventListener("click", (e) => {
     const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-ws-path]");
     if (btn) void openWorkspaceByPath(btn.dataset.wsPath!);
@@ -1997,6 +2086,14 @@ async function loadWorkspaceChanges(): Promise<void> {
     if (app.workspace && ch.workspace_id === app.workspace.id) {
       app.workspaceChanges = ch;
       renderChangesPanel();
+      // Non-Git workspace: tell the user why counts are unavailable.
+      const emptyEl = document.querySelector<HTMLDivElement>("#changes-empty");
+      if (emptyEl && !ch.is_git && ch.total_files === 0) {
+        emptyEl.textContent = "Not a git repository — only files changed during this session are listed.";
+        emptyEl.style.display = "block";
+      } else if (emptyEl) {
+        emptyEl.textContent = "No changes";
+      }
     }
   } catch (e) {
     console.warn("getWorkspaceChanges failed", e);
@@ -2071,7 +2168,7 @@ async function openDiffViewer(filePath: string): Promise<void> {
       body.innerHTML = `<div class="p-6 text-app-textSecondary text-sm">No diff available for ${escapeHtml(filePath)}.</div>`;
       return;
     }
-    const lines = diff.diff.split("\n");
+    const lines = diff.diff.replace(/\r\n/g, "\n").split("\n");
     body.innerHTML = lines.map((line) => {
       const esc = escapeHtml(line);
       if (line.startsWith("+++") || line.startsWith("---")) {
@@ -2136,6 +2233,40 @@ async function openSessionById(sessionId: string): Promise<void> {
   await loadSessionRoles(sessionId);
   if (app.workspace) void api.workspaceSetLastSession(app.workspace.id, sessionId).catch(() => {});
   renderAll();
+  // Hydrate chat history from SQLite so past sessions aren't blank.
+  try {
+    const msgs = await api.getSessionMessages(sessionId);
+    for (const m of msgs) {
+      if (m.role === "user") {
+        appendLine(s, m.content);
+        // Mark the trailing user block visually by re-classifying is unnecessary; user blocks render right-aligned.
+      } else if (m.role === "assistant") {
+        appendLine(s, m.content);
+      } else if (m.content && m.content.trim()) {
+        appendLine(s, m.content);
+      }
+    }
+    // Convert plain appended lines into role-tagged blocks: rebuild simply.
+    if (msgs.length > 0) {
+      s.blocks = [];
+      s.nextId = 1;
+      let lastRole = "";
+      for (const m of msgs) {
+        if (!m.content || !m.content.trim()) continue;
+        const kind: BlockKind = m.role === "user" ? "user" : m.role === "tool" ? "tool" : "assistant";
+        if (kind === "assistant" && lastRole === "assistant" && s.blocks.length > 0 && s.blocks[s.blocks.length-1].kind === "assistant") {
+          const prev = s.blocks[s.blocks.length-1];
+          prev.text += (prev.text ? "\n" : "") + m.content;
+        } else {
+          s.blocks.push({ id: newId(s), kind, text: m.content });
+        }
+        lastRole = kind;
+      }
+    }
+    if (current() === s) renderAll();
+  } catch (e) {
+    console.warn("history hydration failed", e);
+  }
 }
 
 async function loadSessionRoles(sessionId: string): Promise<void> {
@@ -2253,12 +2384,20 @@ function openRolePanel(): void {
       return;
     }
     try {
+      // Welcome tab uses a client-generated UUID that may not exist in sessions.db yet.
+      // Create the session row lazily so role-save doesn't fail with a raw DB error.
+      const known = app.workspaceSessions.some(ws => ws.id === s.id);
+      if (!known && app.workspace) {
+        try {
+          await api.workspaceSetLastSession(app.workspace.id, s.id);
+        } catch { /* best-effort; set_roles will surface a real error if the row truly can't be created */ }
+      }
       await api.sessionSetRoles(s.id, JSON.stringify(next));
       app.roleAssignments = next;
       status.textContent = "Saved.";
       renderHeader();
     } catch (e) {
-      status.textContent = `Save failed: ${String(e)}`;
+      status.textContent = `Save failed: ${redactSecrets(String(e))}`;
     }
   });
 }

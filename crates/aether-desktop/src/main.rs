@@ -375,35 +375,45 @@ async fn run_task(
     // the channel and emits Tauri events on this runtime.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TaskEventBridge>(64);
     let tx_for_sink = tx.clone();
+    let tx_for_body = tx.clone();
+    let tx_for_panic = tx.clone();
     let cancel_for_thread = cancel.clone();
     let app_for_bridge = app.clone();
     let sid_for_bridge = session_id.clone();
     let state_for_bridge = state.inner().clone();
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx_for_sink.blocking_send(TaskEventBridge::Failed(format!(
-                    "backend runtime init failed: {e}"
-                )));
-                return;
-            }
-        };
-        let sink: Arc<dyn Fn(aether_cli::run_task::TaskEvent) + Send + Sync> =
-            Arc::new(move |e| {
-                let _ = tx_for_sink.blocking_send(TaskEventBridge::Agent(e));
+        // Always deliver a terminal event to the frontend, even if the agent
+        // thread panics — otherwise the UI spinner spins forever.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx_for_sink.blocking_send(TaskEventBridge::Failed(format!(
+                        "backend runtime init failed: {e}"
+                    )));
+                    return;
+                }
+            };
+            let sink: Arc<dyn Fn(aether_cli::run_task::TaskEvent) + Send + Sync> =
+                Arc::new(move |e| {
+                    let _ = tx_for_sink.blocking_send(TaskEventBridge::Agent(e));
+                });
+            let outcome = rt.block_on(async move {
+                aether_cli::run_task::run(opts, cancel_for_thread, sink).await
             });
-        let outcome = rt.block_on(async move {
-            aether_cli::run_task::run(opts, cancel_for_thread, sink).await
-        });
-        let exit = match outcome {
-            Ok(()) => TaskEventBridge::Exit { code: 0, success: true },
-            Err(e) => TaskEventBridge::Failed(format!("backend failed: {e}")),
-        };
-        let _ = tx.blocking_send(exit);
+            match outcome {
+                Ok(()) => { let _ = tx_for_body.blocking_send(TaskEventBridge::Exit { code: 0, success: true }); }
+                Err(e) => { let _ = tx_for_body.blocking_send(TaskEventBridge::Failed(format!("backend failed: {}", redact_secrets(&e.to_string())))); }
+            }
+        }));
+        if result.is_err() {
+            let _ = tx_for_panic.blocking_send(TaskEventBridge::Failed(
+                "backend crashed unexpectedly. The workspace may have partial changes — check the Changes panel.".into(),
+            ));
+        }
     });
 
     // Drain events on the Tauri runtime and emit Tauri events.
@@ -1293,7 +1303,8 @@ fn workspace_sessions(workspace_id: String, limit: Option<usize>) -> Result<Vec<
     ).map_err(|e| e.to_string())?;
     let sessions = store.list_by_workspace(&workspace_id, limit.unwrap_or(50)).map_err(|e| e.to_string())?;
     Ok(sessions.into_iter().map(|s| SessionRowDto {
-        id: s.id, created_at: s.created_at, task: s.task, title: None,
+        title: s.title.clone().or_else(|| s.task.clone()),
+        id: s.id, created_at: s.created_at, task: s.task,
     }).collect())
 }
 
@@ -1360,6 +1371,31 @@ struct ModelEntryDto {
 }
 
 fn default_true() -> bool { true }
+
+/// Redact secret-shaped strings before any error text reaches the frontend.
+fn redact_secrets(s: &str) -> String {
+    let mut out = s.to_string();
+    for pat in ["sk-", "nvapi-", "venice-"] {
+        // Redact <prefix><8+ chars>
+        let mut result = String::new();
+        let mut rest = out.as_str();
+        while let Some(idx) = rest.find(pat) {
+            let after = &rest[idx + pat.len()..];
+            let token_len = after.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').count();
+            if token_len >= 8 {
+                result.push_str(&rest[..idx + pat.len()]);
+                result.push_str("[REDACTED]");
+                rest = &after[token_len..];
+            } else {
+                result.push_str(&rest[..idx + pat.len() + token_len]);
+                rest = &after[token_len..];
+            }
+        }
+        result.push_str(rest);
+        out = result;
+    }
+    out
+}
 
 fn providers_path() -> std::path::PathBuf {
     aether_config::Config::default_dir().join("providers.json")
@@ -1745,11 +1781,30 @@ fn resolve_session_controller(
         }
     }
 
-    // Fall back to the global controller model.
+    // Fall back to the first provider with a controller-capable model in providers.json
+    // (provider-only users have no [models] in config.toml).
+    let providers = providers_list()?;
+    if let Some(prov) = providers.iter().find(|p| !p.models.is_empty()) {
+        if let Some(m) = prov.models.first() {
+            let mc = aether_config::ModelConfig {
+                provider: prov.protocol.clone(),
+                base_url: prov.base_url.clone(),
+                model: m.id.clone(),
+                api_key_env: effective_credential(prov),
+                headers: prov.headers.clone(),
+                extra_body: prov.extra_body.clone(),
+            };
+            let window = m.context_window.unwrap_or(context_window);
+            let provider = aether_models::build_provider(&mc).map_err(|e| e.to_string())?;
+            return Ok((Arc::from(provider), mc.model.clone(), window));
+        }
+    }
+
+    // Last resort: global controller model from config.toml.
     let key = cfg.agent.model2.clone().unwrap_or_else(|| cfg.agent.controller_model.clone());
     let mc = cfg
         .model(&key)
-        .ok_or_else(|| format!("controller model '{key}' not found in config"))?;
+        .ok_or_else(|| format!("controller model '{key}' not found. Add a provider with at least one model in Settings."))?;
     let provider = aether_models::build_provider(mc).map_err(|e| e.to_string())?;
     Ok((Arc::from(provider), mc.model.clone(), context_window))
 }

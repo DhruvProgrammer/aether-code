@@ -131,12 +131,14 @@
       <div id="bg-fade"></div>
     </div>
 
-    <!-- BEGIN: Workspace Home Screen (shown when no workspace is active) -->
-    <div id="workspace-home" class="fixed inset-0 z-40 flex items-center justify-center" style="display:none">
+    <!-- BEGIN: Workspace Home Screen (shown when no workspace is active).
+         Does NOT cover the top bar (top-10) so Settings/History stay reachable on first run. -->
+    <div id="workspace-home" class="fixed left-0 right-0 top-10 bottom-0 z-40 flex items-center justify-center" style="display:none">
       <div class="max-w-lg w-full mx-4">
         <div class="text-center mb-8">
           <h1 class="text-2xl font-semibold text-app-brand mb-2">AETHER</h1>
           <p class="text-app-textSecondary text-sm" id="ws-home-subtitle">Select a folder to start working.</p>
+          <p class="text-app-textSecondary text-xs mt-3">Tip: configure a provider in <button id="ws-home-settings-link" class="text-app-brand underline">Settings</button> first, then pick a folder.</p>
         </div>
         <div id="ws-recent-list" class="space-y-2 mb-6"></div>
         <div class="text-center">

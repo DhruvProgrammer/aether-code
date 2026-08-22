@@ -20,6 +20,8 @@ pub struct SessionMeta {
     pub task: Option<String>,
     pub plan: Option<String>,
     pub result: Option<String>,
+    /// Session display title (v0.17+ column; None for legacy rows).
+    pub title: Option<String>,
 }
 
 /// A row from the `messages` table, used to seed the Executor's conversation transcript
@@ -127,7 +129,7 @@ impl SessionStore {
     /// List sessions for a specific workspace, newest-first.
     pub fn list_by_workspace(&self, workspace_id: &str, limit: usize) -> Result<Vec<SessionMeta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, task, plan, result FROM sessions WHERE workspace_id = ?1 ORDER BY COALESCE(updated_at, created_at) DESC LIMIT ?2",
+            "SELECT id, created_at, task, plan, result, title FROM sessions WHERE workspace_id = ?1 ORDER BY COALESCE(updated_at, created_at) DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![workspace_id, limit as i64], |r| {
             Ok(SessionMeta {
@@ -136,6 +138,7 @@ impl SessionStore {
                 task: r.get(2)?,
                 plan: r.get(3)?,
                 result: r.get(4)?,
+                title: r.get(5)?,
             })
         })?;
         let mut out = Vec::new();
@@ -236,7 +239,7 @@ impl SessionStore {
     /// List sessions newest-first (id, created_at). Used by `/sessions`.
     pub fn list(&self, limit: usize) -> Result<Vec<SessionMeta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, task, plan, result FROM sessions ORDER BY created_at DESC LIMIT ?1",
+            "SELECT id, created_at, task, plan, result, title FROM sessions ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map((limit as i64,), |r| {
             Ok(SessionMeta {
@@ -245,6 +248,7 @@ impl SessionStore {
                 task: r.get(2)?,
                 plan: r.get(3)?,
                 result: r.get(4)?,
+                title: r.get(5)?,
             })
         })?;
         let mut out = Vec::new();
@@ -257,7 +261,7 @@ impl SessionStore {
     /// Fetch a single session's metadata by id (used for resume).
     pub fn get(&self, session_id: &str) -> Result<Option<SessionMeta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, task, plan, result FROM sessions WHERE id = ?1",
+            "SELECT id, created_at, task, plan, result, title FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map((session_id,), |r| {
             Ok(SessionMeta {
@@ -266,6 +270,7 @@ impl SessionStore {
                 task: r.get(2)?,
                 plan: r.get(3)?,
                 result: r.get(4)?,
+                title: r.get(5)?,
             })
         })?;
         match rows.next() {

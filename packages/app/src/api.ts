@@ -379,7 +379,7 @@ export const api = {
   cancelTask: (session_id: string) => invoke<boolean>("cancel_task", { sessionId: session_id }),
   aetherDir: () => invoke<string>("aether_dir_str"),
   version: () => invoke<string>("version"),
-  backendStatus: () => invoke<{ mode: string; ready: boolean }>("backend_status"),
+  backendStatus: () => invoke<{ config_path: string; config_exists: boolean; version: string; backend: string }>("backend_status"),
   getBackground: () => invoke<BackgroundPayload>("get_background"),
   setBackgroundImage: (bytes: number[]) =>
     invoke<BackgroundValidation>("set_background_image", { bytes }),
