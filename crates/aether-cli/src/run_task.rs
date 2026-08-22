@@ -133,14 +133,23 @@ pub async fn run(
     // v0.17: per-session role assignments take precedence over the global
     // [agent]/[models] config. When a provider registry + role assignments
     // are supplied, the gateway is assembled from those explicit bindings.
-    let use_session_bindings = opts.providers.is_some() && opts.role_assignments.is_some();
+    // Canonical store is providers.json, not config.toml — Settings and runtime must agree (split-brain fix).
+    let has_providers = opts.providers.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+    let has_assignments = opts.role_assignments.is_some();
+    let use_session_bindings = has_providers && has_assignments;
 
-    if !use_session_bindings
-        && (cfg.model(&cfg.agent.controller_model).is_none() || cfg.model(&cfg.agent.executor_model).is_none())
-    {
-        emit(&sink, "stderr", "AETHER: no controller or executor model configured. Open the desktop Settings and configure at least Model 1.");
-        (sink)(TaskEvent::Exit { code: 2, success: false });
-        return Ok(());
+    if !use_session_bindings {
+        if has_providers && !has_assignments {
+            emit(&sink, "stderr", "AETHER: no model selected for LLM 1. Open the model selector and assign a provider/model for LLM 1 and LLM 2. LLM 3 is optional.");
+            (sink)(TaskEvent::Exit { code: 2, success: false });
+            return Ok(());
+        }
+        // Only fallback to config.toml when no providers exist at all (legacy CLI without session)
+        if cfg.model(&cfg.agent.controller_model).is_none() || cfg.model(&cfg.agent.executor_model).is_none() {
+            emit(&sink, "stderr", "AETHER: no controller or executor model configured. Open the desktop Settings and configure at least Model 1.");
+            (sink)(TaskEvent::Exit { code: 2, success: false });
+            return Ok(());
+        }
     }
 
     let mut policy = aether_permissions::Policy::from_config(&cfg.permissions);
