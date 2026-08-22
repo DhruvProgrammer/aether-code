@@ -1,8 +1,8 @@
 # AETHER
 
-**An open-source, multi-LLM AI coding agent built around specialized planning, execution, and independent review.**
+**An open-source, multi-LLM AI coding agent built around specialized planning, execution, and independent review — with persistent task intelligence and realtime workspace awareness.**
 
-AETHER is an autonomous AI software engineering agent that separates the three hardest problems of AI-assisted coding into three dedicated LLM roles: one model understands and reviews, one model plans and orchestrates, and one model executes and builds. The result is a controlled Understand → Plan → Execute → Review → Verify engineering loop with persistent task state, context compaction, and long-running session support.
+AETHER is an autonomous AI software engineering agent that separates the three hardest problems of AI-assisted coding into three dedicated LLM roles: one model understands and reviews, one model plans and orchestrates, and one model executes and builds. The result is a controlled Understand → Plan → Execute → Review → Verify engineering loop with persistent task state, context compaction, realtime Git-aware changes, and explicit provider isolation for any OpenAI-compatible model.
 
 <p align="center">
   <a href="https://github.com/DhruvProgrammer/aether-code/releases/latest"><img src="https://img.shields.io/github/v/release/DhruvProgrammer/aether-code?style=flat-square" alt="Latest release"></a>
@@ -153,7 +153,7 @@ Only LLM 3 may conclude task completion, and only with actual verification evide
 
 ### Extensibility
 
-- Provider registry — register any OpenAI-compatible provider with multiple models
+- Provider registry — register any OpenAI-compatible provider with multiple models (provider owns connection, model owns identity)
 - Per-session role assignment — bind different providers/models per role per session
 - Skills system — auto-discovered instruction files
 - Plugin hooks (session start/end, agent spawn/complete)
@@ -166,8 +166,72 @@ Only LLM 3 may conclude task completion, and only with actual verification evide
 - Per-category allow / ask / deny policy
 - Hard-denied dangerous commands (cannot be overridden)
 - Workspace boundaries
-- API keys stored as environment variable references only — never in config files, logs, or LLM context
+- Credentials isolated per provider (env var or raw key, never in logs/events, fingerprint gates validation)
 - Secret sanitization in analysis output
+
+---
+
+## Realtime Workspace Changes (OpenCode-style)
+
+AETHER continuously detects and displays workspace changes **while the agent is working**, not only after the task finishes. The filesystem is the source of truth — not LLM claims.
+
+```
+Agent Tools → create/modify/delete/rename → Filesystem Watcher (notify, 280ms debounce, ignores .git/target/node_modules)
+                                              ↓
+                                        Git status --porcelain + diff --numstat HEAD
+                                              ↓
+                                        WorkspaceChanges { total_files, additions, deletions, files[] }
+                                              ↓
+                                        Tauri event workspace_changes_updated (workspace_id scoped)
+                                              ↓
+                                        Changes Panel (no refresh needed)
+```
+
+**What you see:**
+
+```
+Changes
+
+3 files changed
++87  -24
+
+M  src/openai.rs        +21 -4
+M  src/gateway.rs       +42 -12
+A  src/checkpoint.rs    +24
+```
+
+- `M` Modified, `A` Added, `D` Deleted, `R` Renamed, `U` Untracked — with accurate `+add -del` from Git.
+- Clicking a file opens the existing diff viewer (`+` green, `-` red, `@@` hunk).
+- Works for Git and non-Git workspaces; watcher degrades gracefully, never crashes the agent.
+- Session-isolated: `Session A` changes never appear in `Session B`; switching workspaces restarts the watcher for the new workspace.
+
+---
+
+## Provider Hierarchy (Connection vs Model)
+
+**Provider owns the connection. Model owns the identity. Session owns the assignment.**
+
+```
+Provider (id: nvidia)
+├── Connection
+│   ├── Protocol: openai_compatible
+│   ├── Base URL: https://integrate.api.nvidia.com/v1  (once, not per model)
+│   ├── Authentication: ( ) Env Var [NVIDIA_API_KEY]  ( ) API Key [••••]  ( ) None
+│   └── Headers: X-Title: AETHER (optional, not model)
+└── Models (many, no re-entering key)
+    ├── nvidia/nemotron-3-nano-omni-30b-a3b-reasoning  (Display: Nemotron 3 Nano)
+    ├── nvidia/llama-3.1-405b
+    └── ...
+
+Session selects:
+  LLM 1 → nvidia / nemotron-3-nano  (Executor)
+  LLM 2 → openrouter / claude-3.5   (Controller)
+  LLM 3 → tokenrouter / gemini      (Reviewer)
+```
+
+- No duplication of Base URL or API key per model.
+- Model ID vs Display Name are separate; API uses `model` field, UI shows display name.
+- Validation is truthful: Base URL → Connectivity (`GET /models`) → Authentication (real bearer) → Model availability → API response (`POST /chat/completions` via same gateway as chat). `Can save` is not conflated with `health`.
 
 ---
 
@@ -225,7 +289,7 @@ Every AETHER task is governed by an authoritative state machine:
 
 <p align="center">
   <img src="assets/aether.jpg" alt="AETHER desktop application" width="720" />
-  <br><em>AETHER desktop — workspace-based sessions with per-role model assignment</em>
+  <br><em>AETHER desktop — workspace-based sessions, Changes panel, and per-role model assignment</em>
 </p>
 
 ---
@@ -281,55 +345,29 @@ cargo tauri build --bundles nsis
 
 ## Quick Start
 
-1. **Configure a model.** Open the desktop Settings tab and add a provider (any OpenAI-compatible endpoint), or create `~/.aether/config.toml`:
+1. **Add providers.** Open Settings → LLM Providers → Add Provider. Use the radio for **Environment Variable** (e.g. `NVIDIA_API_KEY`) or **API Key** (raw `nvapi-...`) — they are distinct. Set Base URL once per provider, then add multiple models (e.g. `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`) without re-entering the key. `Check Connection` validates base URL + auth + `GET /models`.
 
-```toml
-[agent]
-controller_model = "controller"
-executor_model   = "executor"
+2. **Set credentials securely:** For env var mode, `export NVIDIA_API_KEY="nvapi-..."` — frontend never receives the secret, health shows `env NVIDIA_API_KEY resolved`, not the value.
 
-[models.controller]
-provider    = "openai_compatible"
-base_url    = "https://api.openai.com/v1"
-model       = "gpt-4o-mini"
-api_key_env = "OPENAI_API_KEY"
+3. **Open a project folder** in the desktop app. The sidebar shows `Changes` in realtime and collapses smoothly (state persists).
 
-[models.executor]
-provider    = "openai_compatible"
-base_url    = "https://api.openai.com/v1"
-model       = "gpt-4o"
-api_key_env = "OPENAI_API_KEY"
-```
+4. **Assign models per session:** Click the model selector (bottom bar `— not set —` → LLM Configuration). Choose Provider/Model for LLM 1 (Executor) and LLM 2 (Controller); LLM 3 is optional. No routing — your choice is authoritative.
 
-2. **Set your API key:**
+5. **Send `hello`:** Even with no model, invalid key, or offline network, the app shows a recoverable in-app error (`No model configured` / `Authentication failed` / `Network error`) and never crashes.
 
-```bash
-export OPENAI_API_KEY="sk-..."
-```
-
-3. **Open a project folder** in the desktop app, or run from the terminal:
+6. **Or run from terminal:**
 
 ```bash
 aether "add a /login endpoint to the FastAPI app using JWTs and add tests"
 ```
 
-AETHER will understand the task, plan the implementation, execute it, review the result, and verify before reporting completion.
-
 ---
 
 ## Models & Providers
 
-AETHER works with any OpenAI-compatible API endpoint. Each of the three roles is bound to a specific provider + model:
+### Hierarchy
 
-```
-LLM 1 (Executor)  → configured Executor model
-LLM 2 (Planner)   → configured Planner model
-LLM 3 (Reviewer)  → configured Reviewer model (optional)
-```
-
-### Provider Registry
-
-The desktop app includes a provider catalog where you register providers with their base URL, API key environment variable, and available models. Per-session role assignment lets you bind different models to different roles for each session.
+AETHER enforces: `Provider { base_url, auth, headers }` → `Models[]` → `Session { LLM 1/2/3 → provider_id/model_id }`. Request resolves as `Session → Role → Provider ID → Model ID → Provider config → Secure credential → HTTP` (`crates/aether-gateway/src/config.rs:146`).
 
 ### Supported Endpoints
 
@@ -340,37 +378,35 @@ The desktop app includes a provider catalog where you register providers with th
 | DeepSeek | `https://api.deepseek.com/v1` |
 | NVIDIA NIM | `https://integrate.api.nvidia.com/v1` |
 | Ollama | `http://localhost:11434/v1` |
-| LM Studio | `http://localhost:1234/v1` |
-| vLLM | `http://localhost:8000/v1` |
-| llama.cpp | `http://localhost:8080/v1` |
 | Any OpenAI-compatible | your endpoint |
 
 ### Model Gateway
 
-All LLM calls pass through AETHER's Model Gateway:
+All LLM calls pass through the gateway (`crates/aether-gateway/src/gateway.rs:144`):
 
-- Explicit per-role bindings — no routing, no fallback, no auto-switching
+- Explicit per-role bindings — no routing, no fallback
 - Capability pre-checks (vision, tool calling, streaming)
-- Typed failure classification (invalid key, rate limited, model not found, etc.)
-- Per-role provider isolation — one provider's failure never breaks another role
-- Live API validation with configuration fingerprinting
+- Typed failure classification (`invalid_api_key`, `rate_limited`, `model_not_found` — `crates/aether-gateway/src/error.rs:1`)
+- Per-role provider isolation — one provider's failure never breaks another
+- Fingerprinting (`crates/aether-gateway/src/fingerprint.rs:27` hashes `role|provider_id|base_url|model_id|api_key_env|headers|extra_body`) gates Save
 
 ---
 
 ## Configuration
 
-Default config path: `~/.aether/config.toml`. Override with `--config` or `AETHER_CONFIG`.
+Default paths: `~/.aether/config.toml`, `~/.aether/providers.json`, `~/.aether/sessions.db`, `~/.aether/workspaces.db`.
 
 | Section | Purpose |
 |---|---|
 | `[agent]` | Model role bindings, max iterations, loop budget |
-| `[models.<key>]` | Provider, base URL, model, API key env var |
-| `[permissions]` | Per-category allow/ask/deny |
+| `[models.<key>]` | Legacy: provider, base_url, model, api_key_env (migrated to providers.json) |
+| `[providers.<id>]` | `display_name`, `protocol`, `base_url`, `auth_type`, `api_key`/`api_key_env`, `headers` |
+| `[permissions]` | allow/ask/deny per category |
 | `[memory]` | Embedding provider, retrieval settings |
-| `[context]` | Max token budget for context management |
+| `[context]` | Max token budget |
 | `[mcp.servers]` | External MCP tool servers |
-| `[frontend]` | Visual review capture/preview commands |
-| `[appearance]` | Desktop background, opacity, display mode |
+| `[frontend]` | Visual review commands |
+| `[appearance]` | Background, opacity, display mode |
 
 Full annotated example: [`config.example.toml`](./config.example.toml)
 
@@ -381,27 +417,26 @@ Full annotated example: [`config.example.toml`](./config.example.toml)
 ```
 AETHER
 │
-├── Desktop (Tauri 2) / CLI / TUI
-├── Workspace Manager
-├── Session Manager (SQLite)
-├── Task State Machine
-├── Context Manager + Compaction
+├── Desktop (Tauri 2) / CLI / TUI (shared run_task)
+├── Workspace Manager (aether-workspace)
+├── Session Manager (SQLite, aether-sessions)
+├── Change Tracker (aether-changes: watcher + Git)
+├── Task State Machine (aether-core/task_state)
+├── Context Manager + Compaction (aether-context)
 ├── 3-LLM Orchestrator
 │   ├── LLM 1 — Executor (tool-calling loop)
 │   ├── LLM 2 — Planner (plan generation)
-│   └── LLM 3 — Reviewer (verification + visual review)
+│   └── LLM 3 — Reviewer (verification + visual)
 ├── Multi-Agent Pipeline (Explorer, Tester, Reviewer, Security)
 ├── Loop Engine (circuit breaker)
 ├── Tool System (filesystem, shell, git, MCP, analysis)
-├── Permission Engine
+├── Permission Engine (aether-permissions)
 ├── Model Gateway (explicit role bindings)
-├── Evidence Engine
-├── Persistent Memory (graph + vector + kv + skills)
-├── Plugin System
+├── Evidence Engine (aether-evidence)
+├── Persistent Memory (graph + vector + kv + skills, aether-mind)
+├── Plugin System (aether-plugin)
 └── Snapshot Manager
 ```
-
-The desktop app embeds the AETHER engine in-process — no subprocess, no visible console window, no PATH dependency.
 
 ---
 
@@ -410,21 +445,22 @@ The desktop app embeds the AETHER engine in-process — no subprocess, no visibl
 ```
 aether/
 ├── crates/
-│   ├── aether-core/        # Agent loop, executor, controller, task state machine
+│   ├── aether-core/        # Agent loop, executor, task state machine
 │   ├── aether-cli/         # CLI binary + shared task runner
 │   ├── aether-desktop/     # Tauri desktop app
-│   ├── aether-gateway/     # Model gateway (role bindings, validation)
+│   ├── aether-gateway/     # Model gateway
 │   ├── aether-config/      # Configuration + provider registry types
 │   ├── aether-sessions/    # Session store (SQLite) + snapshots
 │   ├── aether-context/     # Context management + compaction
+│   ├── aether-changes/     # Realtime workspace changes
 │   ├── aether-workspace/   # Workspace store
 │   ├── aether-models/      # Provider adapters (OpenAI-compatible)
 │   ├── aether-tools/       # Tool implementations + MCP client
 │   ├── aether-permissions/ # Permission engine
-│   ├── aether-mind/        # Persistent memory (graph + vector + skills)
+│   ├── aether-mind/        # Persistent memory
 │   ├── aether-evidence/    # Structured evidence engine
-│   ├── aether-plugin/      # Plugin registry + hook bus
-│   ├── aether-analysis/    # Code analysis (SonarQube)
+│   ├── aether-plugin/      # Plugin registry
+│   ├── aether-analysis/    # SonarQube
 │   └── aether-registry/    # Provider health checks
 ├── packages/app/           # Desktop frontend (TypeScript + Vite)
 ├── agents/                 # Subagent TOML definitions
@@ -461,61 +497,43 @@ cargo tauri dev --config crates/aether-desktop/tauri.conf.json
 
 ## Testing
 
-AETHER uses automated tests across the workspace:
-
-- Task state transitions (valid lifecycle, invalid transitions rejected)
-- Completion integrity (no COMPLETED without evidence, only LLM 3 concludes)
-- Session isolation (independent state per session)
-- Repair and replan limits (bounded loops)
-- Doom-loop detection (repeated fingerprint detection)
-- Cancellation from every active state
-- Crash recovery (safe resume from persisted state)
-- Serialization roundtrip (state survives restart)
-- Context compaction (checkpoint generation, atomic rebuild)
-- Provider validation (fingerprint gating, error classification)
-- Permission enforcement (policy checks, dangerous command denial)
+- Task state transitions and completion integrity
+- Session isolation and crash recovery
+- Context compaction and serialization roundtrip
+- Provider validation (fingerprint, error classification, secret redaction)
+- Realtime changes: file create/modify/delete/rename, Git modified/untracked/deleted, non-Git fallback, watcher debouncing, session isolation
 - Gateway behavior (no routing, role isolation)
+- Sidebar collapse/persistence, chat error handling (no-model, invalid key, network, timeout)
 
 ```bash
 cargo test --workspace   # all tests
+cargo test -p aether-changes # realtime changes 10 tests
 ```
 
 ---
 
 ## Roadmap
 
-### Implemented
+### Implemented (0.22.0)
 
-- 3-LLM architecture with explicit role binding
-- Authoritative task state machine with typed states
-- Model Gateway (no routing, no fallback)
-- Provider registry with per-session role assignment
-- Workspace-based session management
-- Context compaction with structured checkpoints
-- Multi-agent verification pipeline
-- Loop engineering circuit breaker
-- Doom-loop detection
-- Permission engine with hard denials
-- Persistent memory (graph + vector + kv)
-- MCP client + server
-- Visual review loop (optional)
-- SonarQube code analysis
-- Desktop app (Tauri 2, in-process engine)
-- CLI + TUI
-- Session resume, rollback, snapshots
-- Background mode, git worktree mode
+- 3-LLM architecture with explicit role binding and task state machine
+- Model Gateway with provider isolation and fingerprinting
+- Provider registry (provider owns connection, model owns identity) with env_var/raw distinction, headers, and migration
+- Truthful validation (base URL, connectivity, auth, model, API response via same gateway)
+- Realtime Git-aware Changes (watcher + diff, session-isolated, non-Git fallback)
+- Workspace-based sessions with collapsible sidebar (state persists, smooth transition)
+- Chat crash hardening (hello never crashes, all config/network errors are in-app)
+- Context compaction, loop engineering, doom-loop detection, permission engine, MCP, SonarQube, desktop/CLI/TUI
 
 ### In Development
 
-- Frontend task-state panel (real-time state display from backend)
-- Extended crash recovery for mid-tool operations
+- Model discovery UI polish (fetch and add selected)
+- Native Anthropic / Gemini adapters
 
 ### Planned
 
 - VS Code extension
-- Native Anthropic / Gemini adapters (no proxy required)
-- Signed macOS `.dmg` installer
-- Linux `.deb` / `.rpm` packages
+- Signed macOS `.dmg` and Linux `.deb`/`.rpm`
 - Cross-project memory sharing (opt-in)
 
 ---
@@ -523,46 +541,28 @@ cargo test --workspace   # all tests
 ## FAQ
 
 ### What is AETHER?
-
-AETHER is an open-source AI coding agent built in Rust. It uses three specialized LLM roles — a planner, an executor, and an independent reviewer — to perform software engineering tasks with persistent state, bounded repair loops, and verification-driven completion.
-
-### Is AETHER open source?
-
-Yes. MIT-licensed, fully auditable source. No telemetry, no subscription, no cloud lock-in.
+An open-source autonomous AI coding agent in Rust with three specialized LLMs, persistent task state, and realtime workspace awareness.
 
 ### What is a multi-LLM coding agent?
+One that separates planning, execution, and independent verification across models instead of one model self-grading. AETHER enforces `Planner ≠ Executor ≠ Reviewer`.
 
-A coding agent that distributes responsibilities across multiple LLM roles rather than asking one model to plan, implement, and judge its own work. AETHER's three roles (Planner, Executor, Reviewer) are each bound to a user-configured model.
+### Can it use local models?
+Yes. Point any role at Ollama, LM Studio, vLLM, or llama.cpp — fully offline.
 
-### How does AETHER's 3-LLM architecture work?
+### Can it use different providers?
+Yes. Example: `LLM 1 → NVIDIA / nemotron`, `LLM 2 → OpenRouter / claude`, `LLM 3 → TokenRouter / gemini` — per-session, no routing.
 
-LLM 3 understands the task and reviews results. LLM 2 creates plans and replans on failure. LLM 1 implements changes and runs tools. The state machine coordinates handoffs between them. LLM 1 cannot declare completion; only LLM 3 can, with actual evidence.
-
-### Can AETHER use local models?
-
-Yes. Point any role at Ollama, LM Studio, vLLM, or llama.cpp. AETHER works fully offline with local endpoints.
-
-### Can AETHER use different AI providers?
-
-Yes. Each role can use a different provider and model. Register providers in the desktop Settings or in `config.toml`. Per-session role assignment lets you change bindings without editing config files.
-
-### How does AETHER handle long coding sessions?
-
-Task state persists in SQLite. Context compaction creates structured checkpoints that preserve objective, plan, decisions, and verification state while reducing active context. Sessions survive restarts via `--resume`.
+### How are changes tracked?
+Filesystem watcher → debounce → `git status` + `diff --numstat` → `workspace_changes_updated` event → Changes panel `+add -del` per file, click to diff. Works while agent is running.
 
 ### What is context compaction?
-
-When the conversation approaches the model's context limit, AETHER generates a structured checkpoint (via LLM 2) capturing the essential task state, then rebuilds the active context as: system prompt + checkpoint + recent messages. The full history is never deleted.
-
-### Does AETHER send my code anywhere?
-
-Only to the API endpoints you configure. With a local model endpoint, nothing leaves your machine.
+Structured checkpoint (objective, plan, decisions, tool results) generated by LLM 2, then `system + checkpoint + recent tail` rebuilds context; history never deleted.
 
 ---
 
 ## Contributing
 
-Bug reports, feature requests, and PRs are welcome. Open an issue first for non-trivial changes.
+Bug reports, feature requests, and PRs welcome. Open an issue first for non-trivial changes.
 
 ```bash
 git clone https://github.com/DhruvProgrammer/aether-code
