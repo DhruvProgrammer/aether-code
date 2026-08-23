@@ -35,6 +35,11 @@ pub struct Executor {
     /// preflight context estimation + automatic compaction + overflow recovery
     /// replace the legacy `compact_messages` heuristic.
     pub(crate) compactor: Option<Arc<aether_context::SessionCompactor>>,
+    /// Optional runtime event sink (spec §4): typed events for tools, files,
+    /// context health, and compaction lifecycle. Never required.
+    pub(crate) runtime_events: Option<Arc<dyn Fn(crate::task_state::TaskEventKind) + Send + Sync>>,
+    /// Task id used for runtime event correlation.
+    pub(crate) task_id: Option<String>,
 }
 
 impl Executor {
@@ -68,6 +73,8 @@ impl Executor {
             permission_engine: None,
             context_manager: None,
             compactor: None,
+            runtime_events: None,
+            task_id: None,
         }
     }
 
@@ -75,6 +82,25 @@ impl Executor {
     pub fn with_permission_engine(mut self, e: Arc<aether_permissions::PermissionEngine>) -> Self { self.permission_engine = Some(e); self }
     pub fn with_context_manager(mut self, c: Arc<aether_context::ContextManager>) -> Self { self.context_manager = Some(c); self }
     pub fn with_compactor(mut self, c: Arc<aether_context::SessionCompactor>) -> Self { self.compactor = Some(c); self }
+
+    /// Inject a typed runtime-event sink (spec §4). Events are best-effort;
+    /// a missing sink simply means no events.
+    pub fn with_runtime_events(
+        mut self,
+        sink: Arc<dyn Fn(crate::task_state::TaskEventKind) + Send + Sync>,
+        task_id: impl Into<String>,
+    ) -> Self {
+        self.runtime_events = Some(sink);
+        self.task_id = Some(task_id.into());
+        self
+    }
+
+    /// Emit a tool lifecycle event with the stored task id.
+    fn emit_tool(&self, ev: impl FnOnce(&str) -> crate::task_state::TaskEventKind) {
+        if let (Some(sink), Some(task_id)) = (&self.runtime_events, &self.task_id) {
+            sink(ev(task_id));
+        }
+    }
 
     pub async fn run(&self, task: &str) -> Result<String> {
         let system_content = crate::prompt::system_for(&self.system_prompt);
@@ -183,9 +209,61 @@ impl Executor {
             });
 
             for tc in &resp.tool_calls {
+                self.emit_tool(|tid| crate::task_state::TaskEventKind::ToolStarted {
+                    task_id: tid.into(),
+                    tool: tc.name.clone(),
+                    operation: tc.arguments.to_string().chars().take(120).collect(),
+                });
                 let out = match self.execute_tool(tc).await {
-                    Ok(r) => r.output,
-                    Err(e) => format!("ERROR: {e}"),
+                    Ok(r) => {
+                        // File-lifecycle events from actual tool results (spec §4 GOOD path).
+                        let path = tc
+                            .arguments
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        match tc.name.as_str() {
+                            "write_file" => {
+                                if let Some(p) = &path {
+                                    let ev = if std::path::Path::new(p).exists() {
+                                        crate::task_state::TaskEventKind::FileModified {
+                                            task_id: String::new(),
+                                            path: p.clone(),
+                                        }
+                                    } else {
+                                        crate::task_state::TaskEventKind::FileCreated {
+                                            task_id: String::new(),
+                                            path: p.clone(),
+                                        }
+                                    };
+                                    self.emit_tool(|tid| match ev {
+                                        crate::task_state::TaskEventKind::FileModified { path, .. } => {
+                                            crate::task_state::TaskEventKind::FileModified { task_id: tid.into(), path }
+                                        }
+                                        crate::task_state::TaskEventKind::FileCreated { path, .. } => {
+                                            crate::task_state::TaskEventKind::FileCreated { task_id: tid.into(), path }
+                                        }
+                                        other => other,
+                                    });
+                                }
+                            }
+                            "read_file" => {}
+                            _ => {}
+                        }
+                        self.emit_tool(|tid| crate::task_state::TaskEventKind::ToolCompleted {
+                            task_id: tid.into(),
+                            tool: tc.name.clone(),
+                        });
+                        r.output
+                    }
+                    Err(e) => {
+                        self.emit_tool(|tid| crate::task_state::TaskEventKind::ToolFailed {
+                            task_id: tid.into(),
+                            tool: tc.name.clone(),
+                            error: e.to_string().chars().take(200).collect(),
+                        });
+                        format!("ERROR: {e}")
+                    }
                 };
                 messages.push(Message {
                     role: "tool".into(),
@@ -220,15 +298,50 @@ impl Executor {
             tool_schemas,
             &messages,
         );
+        // Context health warning (spec §12): safe / warning / critical vs the
+        // model's real window. Emitted every preflight when not safe.
+        let health = aether_context::checkpoint::context_health(estimated, window);
+        if health != aether_context::checkpoint::ContextHealth::Safe {
+            let health_str = format!("{health:?}").to_lowercase();
+            self.emit_tool(|tid| crate::task_state::TaskEventKind::ContextWarning {
+                task_id: tid.into(),
+                estimated_tokens: estimated,
+                context_window: window,
+                health: health_str,
+            });
+        }
         if !aether_context::checkpoint::should_compact(estimated, window) {
             return messages;
         }
+        self.emit_tool(|tid| crate::task_state::TaskEventKind::CompactionStarted {
+            task_id: tid.into(),
+            trigger: "automatic".into(),
+        });
         match compactor
             .compact(&self.session_id, system_content, &messages, aether_context::CompactTrigger::Automatic)
             .await
         {
-            Ok(rebuilt) => rebuilt,
-            Err(_) => messages, // keep previous state on failure
+            Ok(rebuilt) => {
+                let after = aether_context::checkpoint::estimate_request_tokens(
+                    system_content,
+                    tool_schemas,
+                    &rebuilt,
+                );
+                self.emit_tool(|tid| crate::task_state::TaskEventKind::CompactionCompleted {
+                    task_id: tid.into(),
+                    tokens_before: estimated,
+                    tokens_after: after,
+                });
+                rebuilt
+            }
+            Err(e) => {
+                // Transactional failure: old state kept (spec §16).
+                self.emit_tool(|tid| crate::task_state::TaskEventKind::CompactionFailed {
+                    task_id: tid.into(),
+                    error: e.to_string().chars().take(200).collect(),
+                });
+                messages
+            }
         }
     }
 

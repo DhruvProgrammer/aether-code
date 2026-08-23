@@ -55,21 +55,48 @@ pub struct ReadFileTool;
 #[async_trait]
 impl Tool for ReadFileTool {
     fn name(&self) -> &str { "read_file" }
-    fn description(&self) -> &str { "Read a UTF-8 file from disk." }
+    fn description(&self) -> &str { "Read a UTF-8 file from disk. Supports offset/limit for large files; rejects binary files." }
     fn category(&self) -> &'static str { "read" }
     fn required_permission(&self) -> Permission { Permission::Allow }
     fn json_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
-            "properties": { "path": { "type": "string", "description": "Path relative to cwd" } },
+            "properties": {
+                "path": { "type": "string", "description": "Path relative to cwd" },
+                "offset": { "type": "integer", "description": "Line offset (0-based, for large files)" },
+                "limit": { "type": "integer", "description": "Max lines to return" }
+            },
             "required": ["path"]
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
         let path = arg_str(&args, "path").ok_or_else(|| ToolError::Other("missing 'path'".into()))?;
-        let full = ctx.cwd.join(path);
-        let content = std::fs::read_to_string(&full)?;
-        Ok(ToolResult { output: content, is_error: false })
+        let full = ctx.cwd.join(&path);
+        // Binary guard: reject files with null bytes in first 8k
+        let bytes = std::fs::read(&full).map_err(|e| ToolError::Io(e))?;
+        if bytes.iter().take(8192).any(|&b| b == 0) {
+            return Err(ToolError::Other(format!("binary file detected: {path}")));
+        }
+        let content = String::from_utf8(bytes).map_err(|_| ToolError::Other(format!("file is not valid UTF-8: {path}")))?;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let lines: Vec<&str> = content.lines().collect();
+        if offset >= lines.len() && !lines.is_empty() {
+            return Ok(ToolResult { output: String::new(), is_error: false });
+        }
+        let end = limit.map(|l| (offset + l).min(lines.len())).unwrap_or(lines.len());
+        let slice = &lines[offset.min(lines.len())..end];
+        // Safety cap: never return more than 2000 lines / 100k chars in one call
+        let out_lines = if slice.len() > 2000 { &slice[..2000] } else { slice };
+        let mut out = out_lines.join("\n");
+        if slice.len() > 2000 {
+            out.push_str(&format!("\n[truncated: {} more lines]", slice.len() - 2000));
+        }
+        if out.len() > 100_000 {
+            out.truncate(100_000);
+            out.push_str("\n[truncated: output too large]");
+        }
+        Ok(ToolResult { output: out, is_error: false })
     }
 }
 

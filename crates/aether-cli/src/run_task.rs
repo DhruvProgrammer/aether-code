@@ -193,6 +193,37 @@ pub async fn run(
     let controller: Arc<dyn ModelProvider> = gateway_bundle.controller.clone();
     emit(&sink, "stdout", "model gateway: explicit per-role bindings (no routing, no fallback)");
 
+    // ---- Model-aware context budget (spec §12) ----
+    // The context limit must come from the currently configured model, not a
+    // global default. Resolve the executor's declared context_window from the
+    // provider registry; fall back to cfg.context.max_tokens when the model
+    // does not declare one.
+    let executor_context_window: u32 = if use_session_bindings {
+        let assignments = opts.role_assignments.clone().unwrap_or_default();
+        let registry = opts.providers.clone().unwrap_or_default();
+        assignments
+            .executor
+            .as_ref()
+            .and_then(|b| {
+                registry
+                    .iter()
+                    .find(|p| p.id == b.provider_id)
+                    .and_then(|p| p.model(&b.model_id))
+                    .and_then(|m| m.context_window)
+            })
+            .filter(|w| *w > 0)
+            .unwrap_or(cfg.context.max_tokens)
+    } else {
+        cfg.context
+            .max_tokens
+    };
+    if executor_context_window != cfg.context.max_tokens {
+        emit(&sink, "stdout", &format!(
+            "context budget: {} tokens (from configured model, overriding global {})",
+            executor_context_window, cfg.context.max_tokens
+        ));
+    }
+
     let reviewer: Option<Arc<dyn ModelProvider>> = gateway_bundle
         .gateway
         .provider_for(aether_gateway::Role::Reviewer)
@@ -315,7 +346,7 @@ pub async fn run(
         aether_context::ContextManagerConfig::new(
             "main",
             cfg.agent.executor_model.clone(),
-            cfg.context.max_tokens,
+            executor_context_window,
         ),
     ));
     let snapshots_root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
@@ -337,7 +368,7 @@ pub async fn run(
     let compactor = Arc::new(aether_context::SessionCompactor::new(
         controller.clone(),
         cfg.agent.controller_model.clone(),
-        cfg.context.max_tokens,
+        executor_context_window,
         Arc::new(aether_core::compaction_store::SessionCheckpointStore::new(
             aether_config::Config::default_dir().join("sessions.db"),
         )),
@@ -359,7 +390,7 @@ pub async fn run(
         subagent_tools,
         cfg.subagents.enabled,
         cfg.agent.max_iterations,
-        cfg.context.max_tokens,
+        executor_context_window,
         cfg.agent.loop_budget,
         reviewer,
         cfg.agent.reviewer_model.clone(),
@@ -401,8 +432,50 @@ pub async fn run(
         }
     };
 
+    // Resolve @file references (e.g., "@src/main.rs") to actual workspace file content.
+    // Injected as system context, not duplicated massive files.
+    let task_with_refs = {
+        let mut extra = String::new();
+        for token in task.split_whitespace() {
+            if let Some(raw) = token.strip_prefix('@') {
+                let clean = raw.trim_matches(|c| c == ',' || c == '.' || c == ')' || c == '(' || c == '"' || c == '\'' );
+                if clean.is_empty() {
+                    continue;
+                }
+                let full = run_cwd.join(clean);
+                if let Ok(canon) = full.canonicalize() {
+                    if let Ok(cwd_canon) = run_cwd.canonicalize() {
+                        if !canon.starts_with(&cwd_canon) {
+                            continue;
+                        }
+                    }
+                }
+                if full.exists() && full.is_file() {
+                    if let Ok(bytes) = std::fs::read(&full) {
+                        if bytes.iter().take(8192).any(|&b| b == 0) {
+                            continue;
+                        }
+                        if let Ok(content) = String::from_utf8(bytes) {
+                            let truncated = if content.len() > 8000 {
+                                format!("{}...[truncated {} chars]", &content[..8000], content.len() - 8000)
+                            } else {
+                                content
+                            };
+                            extra.push_str(&format!("\n\n[File: {}]\n{}", clean, truncated));
+                        }
+                    }
+                }
+            }
+        }
+        if extra.is_empty() {
+            task.clone()
+        } else {
+            format!("{}{}", task, extra)
+        }
+    };
+
     let outcome = agent
-        .run(&format(&task), current_mode, resume_plan.as_deref(), opts.resume.as_deref())
+        .run(&format(&task_with_refs), current_mode, resume_plan.as_deref(), opts.resume.as_deref())
         .await;
 
     match outcome {

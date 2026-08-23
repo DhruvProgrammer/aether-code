@@ -219,6 +219,36 @@ pub fn should_compact(estimated_tokens: u32, context_window: u32) -> bool {
     estimated_tokens >= limit
 }
 
+/// Context budget health (spec §12): safe / warning / critical, computed as a
+/// percentage of the configured model's actual window so it is portable across
+/// models with different limits (grok-build-style percentage trigger).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextHealth {
+    Safe,
+    Warning,
+    Critical,
+}
+
+/// Percentage thresholds (grok-build-style): warning at 70%, critical at 85%.
+pub const CONTEXT_WARNING_RATIO: f32 = 0.70;
+pub const CONTEXT_CRITICAL_RATIO: f32 = 0.85;
+
+/// Classify current context usage against the model's real window.
+pub fn context_health(estimated_tokens: u32, context_window: u32) -> ContextHealth {
+    if context_window == 0 {
+        return ContextHealth::Safe;
+    }
+    let ratio = estimated_tokens as f32 / context_window as f32;
+    if ratio >= CONTEXT_CRITICAL_RATIO {
+        ContextHealth::Critical
+    } else if ratio >= CONTEXT_WARNING_RATIO {
+        ContextHealth::Warning
+    } else {
+        ContextHealth::Safe
+    }
+}
+
 /// The session compactor. Uses the session's configured Model 2 (controller)
 /// to generate structured checkpoints. No routing, no model switching.
 pub struct SessionCompactor {

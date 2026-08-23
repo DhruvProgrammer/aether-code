@@ -539,6 +539,13 @@ impl Agent {
             if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
             if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
             if let Some(cp) = &self.compactor { coder = coder.with_compactor(cp.clone()); }
+            {
+                let sink2 = self.task_event_sink.clone();
+                let tid2 = task_id.clone();
+                if let Some(sink2) = sink2 {
+                    coder = coder.with_runtime_events(sink2, tid2);
+                }
+            }
             let result = coder.run(&cycle_task).await?;
             eng.record_action(&format!("execute plan (iter {})", iter + 1));
             eng.observe("executor", &summarize(&result), None, None);
@@ -769,6 +776,17 @@ impl Agent {
                 let sec_ok = security.as_ref().map_or(true, |s| s.status == "ok");
                 review_ok && test_ok && sec_ok
             };
+
+            // Enrich with actual tool output (spec §19): never record PASS without evidence.
+            if let Some((passed, failed)) = parse_test_counts(&result) {
+                let detail = format!("{passed} passed, {failed} failed (from tool output)");
+                tsm.add_verification_evidence("tests", if failed == 0 { "pass" } else { "fail" }, &detail, None);
+            } else if let Some(t) = &test {
+                // Fallback: tester subagent summary may contain counts
+                if let Some((p, f)) = parse_test_counts(&t.summary) {
+                    tsm.add_verification_evidence("tests", if f == 0 { "pass" } else { "fail" }, &format!("{p} passed, {f} failed (from tester)"), None);
+                }
+            }
 
             if verification_passed {
                 tsm.add_verification_evidence("review", "pass", "reviewer approved", None);
@@ -1075,6 +1093,13 @@ impl CorrectionExecutor for Agent {
         if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
         if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
         if let Some(cp) = &self.compactor { coder = coder.with_compactor(cp.clone()); }
+        {
+            // Correction executor has no task_id in scope; use the session-scoped id.
+            let sink2 = self.task_event_sink.clone();
+            if let Some(sink2) = sink2 {
+                coder = coder.with_runtime_events(sink2, format!("correction-{}", self.session_id));
+            }
+        }
         coder.run(plan).await
     }
 }
@@ -1085,6 +1110,42 @@ fn persist_trace(store: &Option<Arc<SessionStore>>, session_id: &str, kind: &str
     if let Some(s) = store {
         let _ = s.record_trace(session_id, kind, agent, None, summary, "");
     }
+}
+
+/// Parse actual test counts from tool output (e.g., "27 passed, 2 failed", "ok 3 passed").
+fn parse_test_counts(s: &str) -> Option<(u32, u32)> {
+    let lower = s.to_lowercase();
+    // Look for "X passed" and "Y failed" in the same output.
+    let passed = ["passed", "ok"]
+        .iter()
+        .find_map(|kw| {
+            let idx = lower.find(kw)?;
+            let before = &lower[..idx];
+            // Find last number before keyword.
+            before
+                .rsplit(|c: char| !c.is_ascii_digit())
+                .find(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+                .and_then(|n| n.parse::<u32>().ok())
+        })
+        .unwrap_or(0);
+    let failed = if lower.contains("failed") || lower.contains("fail") {
+        lower
+            .split("failed")
+            .next()
+            .and_then(|before| {
+                before
+                    .rsplit(|c: char| !c.is_ascii_digit())
+                    .find(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+                    .and_then(|n| n.parse::<u32>().ok())
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if passed == 0 && failed == 0 && !lower.contains("pass") && !lower.contains("ok") {
+        return None;
+    }
+    Some((passed, failed))
 }
 
 #[derive(Debug, Clone, Default)]
