@@ -163,24 +163,44 @@ pub struct ListDirectoryTool;
 #[async_trait]
 impl Tool for ListDirectoryTool {
     fn name(&self) -> &str { "list_directory" }
-    fn description(&self) -> &str { "List entries in a directory." }
+    fn description(&self) -> &str { "List entries in a directory with size and type. Skips hidden and large dirs." }
     fn category(&self) -> &'static str { "read" }
     fn required_permission(&self) -> Permission { Permission::Allow }
     fn json_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
-            "properties": { "path": { "type": "string" } },
+            "properties": {
+                "path": { "type": "string", "description": "Directory relative to cwd; default '.'" },
+                "max_entries": { "type": "integer", "description": "Cap on entries returned (default 200)" }
+            },
             "required": []
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
         let path = arg_str(&args, "path").unwrap_or_else(|| ".".into());
-        let full = ctx.cwd.join(path);
+        let full = ctx.cwd.join(&path);
+        sandbox_check(&full, &ctx.cwd)?;
+        let max = args.get("max_entries").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(200);
         let mut out = String::new();
+        out.push_str(&format!("Listing {} (max {} entries):\n", full.display(), max));
+        let mut count = 0;
         for e in std::fs::read_dir(&full)? {
             let e = e?;
-            let kind = if e.path().is_dir() { "dir  " } else { "file " };
-            out.push_str(&format!("{}{}\n", kind, e.file_name().to_string_lossy()));
+            if count >= max { out.push_str("…(truncated)\n"); break; }
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') && name != "." && name != ".." { continue; }
+            let (kind, size) = match e.file_type() {
+                Ok(t) if t.is_dir() => ("dir", String::new()),
+                Ok(t) if t.is_file() => {
+                    let s = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    ("file", format!(" {s}b"))
+                }
+                Ok(_) => ("?", String::new()),
+                Err(_) => ("?", String::new()),
+            };
+            out.push_str(&format!("  {kind:>4}  {name}{size}\n"));
+            count += 1;
         }
         Ok(ToolResult { output: out, is_error: false })
     }
@@ -203,13 +223,16 @@ impl Tool for GrepTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
         let pattern = arg_str(&args, "pattern").ok_or_else(|| ToolError::Other("missing 'pattern'".into()))?;
         let root = ctx.cwd.join(arg_str(&args, "path").unwrap_or_else(|| ".".into()));
+        if let Err(_) = sandbox_check(&root, &ctx.cwd) {
+            return Err(ToolError::Other(format!("path '{}' is outside cwd", root.display())));
+        }
         let mut out = String::new();
-        grep_walk(&root, &pattern, &mut out, 0);
+        grep_walk(&root, &pattern, &ctx.cwd, &mut out, 0);
         Ok(ToolResult { output: out, is_error: false })
     }
 }
 
-fn grep_walk(root: &Path, pattern: &str, out: &mut String, depth: usize) {
+fn grep_walk(root: &Path, pattern: &str, cwd: &Path, out: &mut String, depth: usize) {
     if depth > 8 {
         return;
     }
@@ -221,16 +244,28 @@ fn grep_walk(root: &Path, pattern: &str, out: &mut String, depth: usize) {
     for entry in entries.flatten() {
         let p = entry.path();
         if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            if matches!(name, ".git" | "node_modules" | "target") {
+            if matches!(name, ".git" | "node_modules" | "target" | ".aether" | "dist" | "build") {
+                continue;
+            }
+            if name.starts_with('.') {
                 continue;
             }
         }
+        if let Err(_) = sandbox_check(&p, cwd) {
+            continue;
+        }
         if p.is_dir() {
-            grep_walk(&p, pattern, out, depth + 1);
-        } else if let Ok(content) = std::fs::read_to_string(&p) {
-            for (i, line) in content.lines().enumerate() {
-                if line.to_ascii_lowercase().contains(&pat) {
-                    out.push_str(&format!("{}:{}: {}\n", p.display(), i + 1, line));
+            grep_walk(&p, pattern, cwd, out, depth + 1);
+        } else if let Ok(content) = std::fs::read(&p) {
+            // Binary guard: skip files containing NUL in first 8 KiB.
+            if content.iter().take(8192).any(|&b| b == 0) {
+                continue;
+            }
+            if let Ok(text) = std::str::from_utf8(&content) {
+                for (i, line) in text.lines().enumerate() {
+                    if line.to_ascii_lowercase().contains(&pat) {
+                        out.push_str(&format!("{}:{}: {}\n", p.display(), i + 1, line));
+                    }
                 }
             }
         }

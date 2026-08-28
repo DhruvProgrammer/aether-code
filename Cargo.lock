@@ -193,6 +193,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "parking_lot",
  "redb",
  "serde",
  "serde_json",

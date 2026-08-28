@@ -13,7 +13,7 @@ use std::sync::Arc;
 use aether_core::agent_loop::Agent;
 use aether_core::mode::Mode;
 use aether_models::ModelProvider;
-use aether_mind::{skills::SkillIndex, Mind};
+use aether_mind::{skills::SkillIndex, Mind, memory::{MemoryManager, BuiltinMemoryProvider, MemoryTurn}};
 use aether_permissions::Permission;
 use aether_sessions::SessionStore;
 use aether_tools::Tool;
@@ -244,6 +244,11 @@ pub async fn run(
         s => s,
     };
 
+    // Memory manager: single integration point for the agent loop (Hermes-style).
+    // Built-in Mind provider is always registered; external providers can be added later.
+    let memory_manager = Arc::new(MemoryManager::new());
+    memory_manager.add_provider(Arc::new(BuiltinMemoryProvider));
+
     let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
     for tool in aether_tools::default_tools() {
         tools.insert(tool.name().to_string(), tool);
@@ -405,12 +410,15 @@ pub async fn run(
     .with_compactor(compactor)
     .with_task_event_sink({
         let sink2 = sink.clone();
+        let session_id2 = session_id.clone();
         Arc::new(move |ev: aether_core::task_state::TaskEventKind| {
             if let Ok(json) = serde_json::to_string(&ev) {
                 (sink2)(TaskEvent::TaskState { json });
             }
+            let _ = session_id2; // (kept for future per-session routing)
         })
     })
+    .with_memory_manager(memory_manager.clone())
     .with_cancel(cancel);
 
     let format = |task: &str| -> String {
@@ -435,6 +443,7 @@ pub async fn run(
     // Resolve @file references (e.g., "@src/main.rs") to actual workspace file content.
     // Injected as system context, not duplicated massive files.
     let task_with_refs = {
+        let run_cwd = opts.workspace_path.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let mut extra = String::new();
         for token in task.split_whitespace() {
             if let Some(raw) = token.strip_prefix('@') {

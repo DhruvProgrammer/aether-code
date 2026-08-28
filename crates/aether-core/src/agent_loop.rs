@@ -82,6 +82,9 @@ pub struct Agent {
     /// Optional sink for authoritative task-state events. The desktop bridges
     /// these to the frontend so the UI reflects real backend state.
     task_event_sink: Option<Arc<dyn Fn(TaskEventKind) + Send + Sync>>,
+    /// Memory manager: single integration point for memory/context retrieval.
+    /// Always present; the built-in `Mind` provider is registered by default.
+    memory_manager: Arc<aether_mind::memory::MemoryManager>,
 }
 
 impl Agent {
@@ -138,6 +141,7 @@ impl Agent {
             cancel: None,
             compactor: None,
             task_event_sink: None,
+            memory_manager: Arc::new(aether_mind::memory::MemoryManager::new()),
         }
     }
 
@@ -186,6 +190,17 @@ impl Agent {
     pub fn with_task_event_sink(mut self, sink: Arc<dyn Fn(TaskEventKind) + Send + Sync>) -> Self {
         self.task_event_sink = Some(sink);
         self
+    }
+
+    /// Inject a memory manager. Replaces the default (built-in only).
+    pub fn with_memory_manager(mut self, m: Arc<aether_mind::memory::MemoryManager>) -> Self {
+        self.memory_manager = m;
+        self
+    }
+
+    /// Access the memory manager (read-only at runtime; providers sync via `sync_all`).
+    pub fn memory_manager(&self) -> &Arc<aether_mind::memory::MemoryManager> {
+        &self.memory_manager
     }
 
     fn emit_task_event(&self, event: TaskEventKind) {
@@ -247,6 +262,16 @@ impl Agent {
         existing_plan: Option<&str>,
         resume_session: Option<&str>,
     ) -> anyhow::Result<AgentOutcome> {
+        // v0.21: selective context retrieval from the memory manager before the
+        // agent starts. The built-in `Mind` provider may recall relevant graph
+        // nodes; external providers contribute additional context.
+        let mem_ctx = self.memory_manager.prefetch_all(task);
+        let initial_prompt = if mem_ctx.is_empty() {
+            task.to_string()
+        } else {
+            format!("{task}\n\n---\n[Memory context]\n{mem_ctx}")
+        };
+
         // When resuming, all persistence (messages / kv / traces / run record) targets the
         // resumed session so the continuation is recorded under the same id.
         let sid: &str = resume_session.unwrap_or(&self.session_id);
@@ -313,16 +338,16 @@ impl Agent {
 
         // PLAN MODE: read-only investigate -> plan. Never modify the project (spec §13-§21).
         if mode.is_plan() {
-            return self.run_plan(task, &context).await;
+            return self.run_plan(&initial_prompt, &context).await;
         }
 
         // BUILD MODE may be asked to implement an existing plan; load + validate it (§22).
         let plan_context: String = if let Some(p) = existing_plan {
             format!(
-                "{task}\n\n# Existing plan to implement\nValidate it is still fresh (files/requirements may have changed) before editing. Do not follow a stale plan blindly.\n{p}"
+                "{initial_prompt}\n\n# Existing plan to implement\nValidate it is still fresh (files/requirements may have changed) before editing. Do not follow a stale plan blindly.\n{p}"
             )
         } else {
-            task.to_string()
+            initial_prompt.clone()
         };
 
         // Multi-agent: Explorer (SMALL LLM) gathers repo findings before the Controller plans.
@@ -922,6 +947,15 @@ impl Agent {
                 let _ = aether_mind::extract::extract(mind, &transcript, prov.as_ref(), &self.controller_model).await;
             }
         }
+
+        // v0.21: fan out post-turn persistence to all memory providers.
+        // External providers run their own sync logic; built-in Mind persists via its own API.
+        self.memory_manager.sync_all(&aether_mind::memory::MemoryTurn {
+            user: task,
+            assistant: &final_result,
+            session_id: sid,
+            workspace: Some(&self.cwd.display().to_string()),
+        });
 
         // --- Visual engineering loop (LLM 3): the 3-LLM frontend QA stage (spec §10) -------
         // Runs only for frontend tasks when LLM 3 (reviewer) is configured. LLM 1 (executor)

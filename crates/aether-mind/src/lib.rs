@@ -73,6 +73,8 @@ struct KvRow {
     value: String,
 }
 
+pub mod memory;
+
 pub struct Mind {
     db: Database,
 }
