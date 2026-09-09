@@ -12,6 +12,11 @@ import {
   type WorkspaceChangesDto,
 } from "./api";
 
+// v0.29.1: styles (tailwind, compiled locally) and icons (lucide, npm)
+// are bundled — the desktop UI no longer depends on runtime CDNs.
+import "./main.css";
+import { createIcons, icons } from "lucide";
+
 // ----- State -----
 
 type BlockKind = "user" | "assistant" | "info" | "error" | "edit" | "tool" | "status" | "system";
@@ -57,6 +62,12 @@ const escapeHtml = (s: string): string =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
 const escapeAttr = (s: string): string => escapeHtml(s);
+
+// Display-only path prettifier: the backend canonicalizes workspace
+// paths, which on Windows yields the `\\?\C:\...` UNC form. Strip that
+// prefix for humans; never use the result for logic or round-trips.
+const displayPath = (p: string): string =>
+  p.startsWith("\\\\?\\") ? p.slice(4) : p;
 
 function newId(s: Session): number {
   return s.nextId++;
@@ -202,9 +213,17 @@ function renderAll() {
   renderHeader();
   renderStream();
   // Re-render lucide icons after any innerHTML swap.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const lucide = (window as any).lucide;
-  if (lucide?.createIcons) lucide.createIcons();
+  refreshIcons();
+}
+
+// Re-render lucide icons after any innerHTML swap. Icons are bundled
+// via npm (v0.29.1) — no runtime CDN. Failures must never break UI.
+function refreshIcons(): void {
+  try {
+    createIcons({ icons });
+  } catch {
+    /* icons are decorative; ignore */
+  }
 }
 
 // ----- Sessions -----
@@ -463,9 +482,7 @@ async function openModal(kind: "settings" | "history") {
       wireSettings(body, r.config);
       await refreshBackgroundPreview(body);
       applyBackgroundFromSettings(body);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const lucide = (window as any).lucide;
-      if (lucide?.createIcons) lucide.createIcons();
+      refreshIcons();
     } catch (e) {
       body.innerHTML = `<div class="text-app-error text-sm">Failed: ${escapeHtml(redactSecrets(String(e)).slice(0,300))}</div>`;
     }
@@ -479,9 +496,7 @@ async function openModal(kind: "settings" | "history") {
       body.innerHTML = `<div class="text-app-error text-sm">Failed: ${escapeHtml(redactSecrets(String(e)).slice(0,300))}</div>`;
     }
   }
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const lucide = (window as any).lucide;
-  if (lucide?.createIcons) lucide.createIcons();
+  refreshIcons();
 }
 
 function closeModal() {
@@ -754,9 +769,7 @@ function refreshProviderCatalog(body: HTMLElement): void {
   const catalog = body.querySelector<HTMLDivElement>("#provider-catalog");
   if (!catalog) return;
   catalog.innerHTML = renderProviderCatalog();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const lucide = (window as any).lucide;
-  if (lucide?.createIcons) lucide.createIcons();
+  refreshIcons();
   wireProviderCatalog(body);
 }
 
@@ -970,7 +983,7 @@ function openProviderModal(editIdx: number | null): void {
     try { first?.focus(); } catch {}
   }, 30);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
+  refreshIcons();
 
   let headersData: [string,string][] = [...headers];
   let _providerChecked = false; void _providerChecked;
@@ -1293,7 +1306,7 @@ function openModelModal(providerIdx: number, modelIdx: number | null): void {
     try { first?.focus(); } catch {}
   }, 30);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
+  refreshIcons();
 
   let modelChecked = false;
   const statusEl = body.querySelector<HTMLDivElement>("#mm-status")!;
@@ -1391,7 +1404,7 @@ function setSidebarCollapsed(collapsed: boolean): void {
   else sidebar.classList.remove("collapsed");
   updateMainMargins();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
+  refreshIcons();
 }
 
 function updateMainMargins(): void {
@@ -1582,9 +1595,7 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
       });
       status.textContent = `Saved to ${path}`;
       await refreshBackgroundPreview(body);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const lucide = (window as any).lucide;
-      if (lucide?.createIcons) lucide.createIcons();
+      refreshIcons();
     } catch (e) {
       status.textContent = `Save failed: ${String(e)}`;
     }
@@ -1704,9 +1715,7 @@ function wireAnalysisPanel(body: HTMLElement): void {
       if (r.success && r.report) {
         statusEl.textContent = `${r.message}`;
         reportEl.innerHTML = renderReportCard(r.report);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const lucide = (window as any).lucide;
-        if (lucide?.createIcons) lucide.createIcons();
+        refreshIcons();
       } else {
         statusEl.textContent = r.message;
         reportEl.innerHTML = "";
@@ -1986,7 +1995,7 @@ function showWorkspaceHome(recent: WorkspaceDto[]): void {
     <button data-ws-open="${escapeAttr(w.id)}" data-ws-path="${escapeAttr(w.path)}"
       class="w-full text-left bg-app-surface border border-app-border rounded-lg px-4 py-3 hover:border-app-brand transition-colors">
       <div class="text-sm font-medium text-app-textPrimary">${escapeHtml(w.name)}</div>
-      <div class="text-xs text-app-textSecondary font-mono truncate">${escapeHtml(w.path)}</div>
+      <div class="text-xs text-app-textSecondary font-mono truncate">${escapeHtml(displayPath(w.path))}</div>
     </button>
   `).join("");
 }
@@ -2062,7 +2071,7 @@ function showWorkspaceUi(): void {
 
   if (app.workspace) {
     document.querySelector("#ws-sidebar-name")!.textContent = app.workspace.name;
-    document.querySelector("#ws-sidebar-path")!.textContent = app.workspace.path;
+    document.querySelector("#ws-sidebar-path")!.textContent = displayPath(app.workspace.path);
   }
   renderSessionList();
   void watchCurrentWorkspace();
@@ -2117,7 +2126,7 @@ function renderChangesPanel(): void {
     </div>`;
   }).join("");
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
+  refreshIcons();
 }
 
 async function loadWorkspaceChanges(): Promise<void> {
@@ -2207,7 +2216,7 @@ async function openDiffViewer(filePath: string): Promise<void> {
     try { first?.focus(); } catch {}
   }, 30);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
+  refreshIcons();
   try {
     const diff = await api.getFileDiff(app.workspace.id, filePath);
     stats.textContent = `+${diff.additions} -${diff.deletions}`;

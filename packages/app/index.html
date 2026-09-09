@@ -4,35 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>aether</title>
-    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
-    <script>
-      tailwind.config = {
-        darkMode: 'class',
-        theme: {
-          extend: {
-            colors: {
-              app: {
-                bg: '#0f1115',
-                topbar: '#161922',
-                surface: '#161922',
-                hover: '#1d2230',
-                border: '#2a2f3d',
-                textPrimary: '#e8e8e8',
-                textSecondary: '#8c9296',
-                brand: '#7ca6b4',
-                warning: '#e8a94c',
-                error: '#bc484a',
-                inputBg: '#161922',
-              },
-            },
-            fontFamily: {
-              sans: ['Inter', 'ui-sans-serif', 'system-ui', '-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'Roboto', '"Helvetica Neue"', 'Arial', 'sans-serif'],
-              mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', '"Liberation Mono"', '"Courier New"', 'monospace'],
-            },
-          },
-        },
-      };
-    </script>
+    <!-- v0.29.1: Tailwind is compiled locally at build time
+         (tailwind.config.js + src/main.css). No runtime CDN, so the
+         desktop UI renders fully offline and behind a tight CSP. -->
     <style>
       ::-webkit-scrollbar { width: 8px; height: 8px; }
       ::-webkit-scrollbar-track { background: transparent; }
@@ -122,7 +96,9 @@
       .diff-line.ctx { color:#8c9296; }
     </style>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <!-- v0.29.1: lucide icons are bundled via npm (see main.ts
+         refreshIcons). No unpkg dependency. Fonts stay remote with
+         system-font fallbacks when offline. -->
   </head>
   <body class="font-sans h-screen flex flex-col overflow-hidden antialiased">
     <!-- Background layer (spec §16). Always rendered; fades to solid bg when off. -->

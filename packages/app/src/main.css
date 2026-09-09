@@ -1,0 +1,6 @@
+/* AETHER application styles — Tailwind utilities are compiled locally
+ * at build time (see tailwind.config.js). The component CSS that used
+ * to live in index.html's <style> block is unchanged below. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
