@@ -379,6 +379,13 @@ pub async fn run(
         )),
     ));
 
+    // Dynamic skill loading: locate the bundled software-engineering skill
+    // index (best-effort). When absent the agent keeps the legacy prompt.
+    let skill_index: Option<Arc<aether_skills::SkillIndex>> =
+        aether_skills::SkillIndex::locate_bundled()
+            .and_then(|dir| aether_skills::SkillIndex::load(&dir).ok())
+            .map(Arc::new);
+
     let agent = Agent::new(
         controller,
         cfg.agent.controller_model.clone(),
@@ -420,6 +427,12 @@ pub async fn run(
     })
     .with_memory_manager(memory_manager.clone())
     .with_cancel(cancel);
+
+    // Skill wiring: builders consume self, so re-wrap when an index exists.
+    let agent = match skill_index {
+        Some(idx) => agent.with_skill_index(idx),
+        None => agent,
+    };
 
     let format = |task: &str| -> String {
         if opts.plan {

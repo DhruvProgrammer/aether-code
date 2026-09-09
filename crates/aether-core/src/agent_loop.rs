@@ -85,6 +85,10 @@ pub struct Agent {
     /// Memory manager: single integration point for memory/context retrieval.
     /// Always present; the built-in `Mind` provider is registered by default.
     memory_manager: Arc<aether_mind::memory::MemoryManager>,
+    /// Optional skill index for dynamic per-task skill loading. When present,
+    /// the coder system prompt is compiled via PromptCompiler within the
+    /// executor's context budget; otherwise the legacy static prompt is used.
+    skill_index: Option<Arc<aether_skills::SkillIndex>>,
 }
 
 impl Agent {
@@ -142,6 +146,7 @@ impl Agent {
             compactor: None,
             task_event_sink: None,
             memory_manager: Arc::new(aether_mind::memory::MemoryManager::new()),
+            skill_index: None,
         }
     }
 
@@ -198,9 +203,52 @@ impl Agent {
         self
     }
 
+    /// Inject a skill index for dynamic per-task skill loading.
+    pub fn with_skill_index(mut self, idx: Arc<aether_skills::SkillIndex>) -> Self {
+        self.skill_index = Some(idx);
+        self
+    }
+
     /// Access the memory manager (read-only at runtime; providers sync via `sync_all`).
     pub fn memory_manager(&self) -> &Arc<aether_mind::memory::MemoryManager> {
         &self.memory_manager
+    }
+
+    /// Build the coder (LLM 1) system prompt for a task. When a skill index
+    /// is wired, relevant skill sections are retrieved and compiled within
+    /// the executor's context budget; otherwise the legacy static prompt.
+    fn build_coder_system(&self, task: &str) -> String {
+        let legacy = format!("{CODER_SYSTEM}\n{}", crate::mode::KARPATHY_POLICY);
+        let idx = match &self.skill_index {
+            Some(i) => i,
+            None => return legacy,
+        };
+        let retriever = aether_skills::SkillRetriever::new(idx);
+        let retrieved = retriever.retrieve(task, 6, true);
+        if retrieved.is_empty() {
+            return legacy;
+        }
+        let compiler = aether_skills::PromptCompiler::new(self.context_max_tokens, 2_000);
+        let skills: Vec<aether_skills::compile::ContextCandidate> = retrieved
+            .iter()
+            .map(|s| {
+                aether_skills::compile::ContextCandidate::new(
+                    "skill",
+                    &s.id,
+                    s.text.clone(),
+                    0.7,
+                    5,
+                )
+            })
+            .collect();
+        let mut input = aether_skills::PromptCompilerInput::default();
+        input.system_kernel = aether_skills::SYSTEM_KERNEL.to_string();
+        input.role_prompt = aether_skills::role_prompt(aether_skills::Role::Executor).to_string();
+        input.task = task.to_string();
+        input.skills = skills;
+        let compiled = compiler.compile(input);
+        // Preserve the legacy Karpathy policy trailer for behavior parity.
+        format!("{}\n\n{}", compiled.system, crate::mode::KARPATHY_POLICY)
     }
 
     fn emit_task_event(&self, event: TaskEventKind) {
@@ -311,6 +359,11 @@ impl Agent {
         if let Some(store) = &self.session {
             let _ = store.set_kv(sid, "task_state", &tsm.serialize());
         }
+
+        // --- Dynamic skill loading: compile the coder system prompt once per
+        // task within the executor's budget. Falls back to the legacy static
+        // prompt when no skill index is wired.
+        let coder_system = self.build_coder_system(task);
 
         // --- Loop engineering: establish the EngineeringModel -------------------
         let mut eng = LoopEngine::new(task);
@@ -557,7 +610,7 @@ impl Agent {
                 self.context_max_tokens,
                 self.session.clone(),
                 sid.to_string(),
-                format!("{CODER_SYSTEM}\n{}", crate::mode::KARPATHY_POLICY),
+                coder_system.clone(),
                 None,
             )
             .with_agent_id("coder");

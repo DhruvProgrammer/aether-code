@@ -1,0 +1,277 @@
+{
+  "id": "software-engineering",
+  "version": "1.0.0",
+  "source": "source/AI_Software_Engineering_Master_SKILL.md",
+  "sections": [
+    {
+      "id": "core",
+      "file": "core.md",
+      "compact": "core.compact.md",
+      "description": "Core engineering behavior: think before coding, evidence over guessing, simplicity, surgical changes, goal-driven execution, decision policy, golden rules",
+      "keywords": ["inspect", "evidence", "simplicity", "surgical", "verify", "assumption", "think", "goal", "decision", "golden"],
+      "always": true,
+      "priority": 100,
+      "requires": []
+    },
+    {
+      "id": "context",
+      "file": "context.md",
+      "compact": "context.compact.md",
+      "description": "Project instruction files (AGENTS.md, CLAUDE.md, README) and their priority",
+      "keywords": ["agents.md", "claude.md", "instructions", "contributing", "readme", "project context"],
+      "always": true,
+      "priority": 90,
+      "requires": ["core"]
+    },
+    {
+      "id": "modes",
+      "file": "modes.md",
+      "compact": "modes.compact.md",
+      "description": "Process modes (fast/standard/full) and change/risk classification",
+      "keywords": ["fast", "standard", "full mode", "risk", "low risk", "high risk", "process", "scope"],
+      "always": false,
+      "priority": 60,
+      "requires": ["core"]
+    },
+    {
+      "id": "requirements",
+      "file": "requirements.md",
+      "compact": "requirements.compact.md",
+      "description": "Requirements and PRD: problem, goal, scope, functional/non-functional requirements, assumptions",
+      "keywords": ["prd", "requirements", "scope", "goal", "users", "functional", "assumption", "unknown", "non-goal"],
+      "always": false,
+      "priority": 50,
+      "requires": ["core"]
+    },
+    {
+      "id": "research",
+      "file": "research.md",
+      "compact": "research.compact.md",
+      "description": "Research discipline: when to research, authoritative sources, finding/source/impact records",
+      "keywords": ["research", "documentation", "framework", "api contract", "investigate", "source"],
+      "always": false,
+      "priority": 40,
+      "requires": ["core"]
+    },
+    {
+      "id": "reconnaissance",
+      "file": "reconnaissance.md",
+      "compact": "reconnaissance.compact.md",
+      "description": "Repository reconnaissance: tree, entry points, modules, tracing execution paths",
+      "keywords": ["reconnaissance", "repository", "explore", "entry point", "structure", "trace", "inspect repo"],
+      "always": false,
+      "priority": 70,
+      "requires": ["core"]
+    },
+    {
+      "id": "architecture",
+      "file": "architecture.md",
+      "compact": "architecture.compact.md",
+      "description": "Architecture documents: components, responsibilities, data flow, alternatives",
+      "keywords": ["architecture", "components", "design doc", "data flow", "system", "alternatives"],
+      "always": false,
+      "priority": 55,
+      "requires": ["core", "reconnaissance"]
+    },
+    {
+      "id": "technical-design",
+      "file": "technical-design.md",
+      "compact": "technical-design.compact.md",
+      "description": "Technical design: modules, interfaces, contracts, data models, failure behavior",
+      "keywords": ["technical design", "interface", "contract", "schema", "endpoint", "data model", "failure"],
+      "always": false,
+      "priority": 55,
+      "requires": ["core", "architecture"]
+    },
+    {
+      "id": "acceptance",
+      "file": "acceptance.md",
+      "compact": "acceptance.compact.md",
+      "description": "Acceptance criteria in Given/When/Then form, observable and measurable",
+      "keywords": ["acceptance", "given", "when", "then", "criteria", "verify", "observable"],
+      "always": false,
+      "priority": 65,
+      "requires": ["core"]
+    },
+    {
+      "id": "tasks",
+      "file": "tasks.md",
+      "compact": "tasks.compact.md",
+      "description": "Task breakdown into small independently verifiable tasks with validation commands",
+      "keywords": ["task", "breakdown", "plan", "steps", "milestone", "validation command"],
+      "always": false,
+      "priority": 60,
+      "requires": ["core", "acceptance"]
+    },
+    {
+      "id": "implementation",
+      "file": "implementation.md",
+      "compact": "implementation.compact.md",
+      "description": "Implementation workflow: inspect, reproduce, plan, implement, validate, review diff, document",
+      "keywords": ["implement", "code", "fix", "bug", "edit", "write", "build", "reproduce", "baseline", "diff"],
+      "always": false,
+      "priority": 75,
+      "requires": ["core"]
+    },
+    {
+      "id": "testing",
+      "file": "testing.md",
+      "compact": "testing.compact.md",
+      "description": "Test strategy: layered tests, regression tests for bugs, behavior-oriented tests",
+      "keywords": ["test", "testing", "regression", "pytest", "cargo test", "unit", "integration", "e2e", "validation", "build", "typecheck"],
+      "always": false,
+      "priority": 75,
+      "requires": ["core"]
+    },
+    {
+      "id": "done",
+      "file": "done.md",
+      "compact": "done.compact.md",
+      "description": "Definition of done: requirements met, tests pass, docs updated, diff reviewed",
+      "keywords": ["done", "complete", "definition of done", "finish", "verify completion"],
+      "always": false,
+      "priority": 50,
+      "requires": ["core", "testing"]
+    },
+    {
+      "id": "security",
+      "file": "security.md",
+      "compact": "security.compact.md",
+      "description": "Security engineering: auth, secrets, injection, traversal, SSRF, XSS, command execution",
+      "keywords": ["security", "auth", "secret", "permission", "injection", "traversal", "ssrf", "xss", "vulnerability", "audit"],
+      "always": false,
+      "priority": 70,
+      "requires": ["core"]
+    },
+    {
+      "id": "database",
+      "file": "database.md",
+      "compact": "database.compact.md",
+      "description": "Database change rules: schema inspection, migrations, backward compatibility",
+      "keywords": ["database", "schema", "migration", "sql", "table", "index", "postgres", "sqlite"],
+      "always": false,
+      "priority": 45,
+      "requires": ["core"]
+    },
+    {
+      "id": "api",
+      "file": "api.md",
+      "compact": "api.compact.md",
+      "description": "API change rules: contracts, status codes, compatibility, idempotency",
+      "keywords": ["api", "endpoint", "rest", "contract", "status code", "idempotency", "pagination"],
+      "always": false,
+      "priority": 45,
+      "requires": ["core"]
+    },
+    {
+      "id": "dependencies",
+      "file": "dependencies.md",
+      "compact": "dependencies.compact.md",
+      "description": "Dependency rules: check existing equivalents, minimal footprint, security review",
+      "keywords": ["dependency", "package", "crate", "npm", "library", "vendor"],
+      "always": false,
+      "priority": 35,
+      "requires": ["core"]
+    },
+    {
+      "id": "errors",
+      "file": "errors.md",
+      "compact": "errors.compact.md",
+      "description": "Error handling: predictable, observable, safe, actionable errors for important operations",
+      "keywords": ["error", "exception", "fail", "timeout", "retry", "handling", "bug", "crash"],
+      "always": false,
+      "priority": 65,
+      "requires": ["core"]
+    },
+    {
+      "id": "observability",
+      "file": "observability.md",
+      "compact": "observability.compact.md",
+      "description": "Observability: structured logs, request IDs, metrics, health checks, no secret logging",
+      "keywords": ["observability", "logging", "metrics", "tracing", "health", "monitor"],
+      "always": false,
+      "priority": 30,
+      "requires": ["core"]
+    },
+    {
+      "id": "adr",
+      "file": "adr.md",
+      "compact": "adr.compact.md",
+      "description": "Architecture decision records: context, decision, alternatives, consequences",
+      "keywords": ["adr", "decision", "architecture decision", "alternatives", "consequences"],
+      "always": false,
+      "priority": 25,
+      "requires": ["core", "architecture"]
+    },
+    {
+      "id": "documentation",
+      "file": "documentation.md",
+      "compact": "documentation.compact.md",
+      "description": "Documentation synchronization: keep PRD, architecture, API docs, README in sync with code",
+      "keywords": ["documentation", "docs", "readme", "sync", "changelog", "comment"],
+      "always": false,
+      "priority": 35,
+      "requires": ["core"]
+    },
+    {
+      "id": "ambiguity",
+      "file": "ambiguity.md",
+      "compact": "ambiguity.compact.md",
+      "description": "Handling ambiguity: evidence first, least-surprising interpretation, record assumptions, ask only when blocked",
+      "keywords": ["ambiguity", "ambiguous", "unclear", "assumption", "clarify", "interpretation"],
+      "always": false,
+      "priority": 55,
+      "requires": ["core"]
+    },
+    {
+      "id": "existing-project",
+      "file": "existing-project.md",
+      "compact": "existing-project.compact.md",
+      "description": "Working in existing projects: inspect, trace, conventions, surgical change, root-cause fixes",
+      "keywords": ["existing", "legacy", "codebase", "refactor", "convention", "root cause", "trace"],
+      "always": false,
+      "priority": 65,
+      "requires": ["core", "reconnaissance"]
+    },
+    {
+      "id": "refactoring",
+      "file": "refactoring.md",
+      "compact": "refactoring.compact.md",
+      "description": "Refactoring rules: preserve behavior, separate unrelated refactors, validate incrementally",
+      "keywords": ["refactor", "refactoring", "cleanup", "restructure", "preserve behavior"],
+      "always": false,
+      "priority": 50,
+      "requires": ["core", "testing"]
+    },
+    {
+      "id": "vertical-slice",
+      "file": "vertical-slice.md",
+      "compact": "vertical-slice.compact.md",
+      "description": "Vertical slice strategy: end-to-end working increment exposing architecture problems early",
+      "keywords": ["vertical slice", "end-to-end", "slice", "increment", "mvp"],
+      "always": false,
+      "priority": 40,
+      "requires": ["core", "tasks"]
+    },
+    {
+      "id": "project-start",
+      "file": "project-start.md",
+      "compact": "project-start.compact.md",
+      "description": "New project workflow: PRD, constraints, simplest architecture, vertical slice first",
+      "keywords": ["new project", "greenfield", "start", "scaffold", "init", "from scratch"],
+      "always": false,
+      "priority": 40,
+      "requires": ["core", "requirements", "architecture"]
+    },
+    {
+      "id": "communication",
+      "file": "communication.md",
+      "compact": "communication.compact.md",
+      "description": "AI communication protocol (confirmed/assumed/unknown/blocked/completed), completion reports, final review checklist",
+      "keywords": ["report", "communicate", "status", "review checklist", "progress", "complete", "blocked"],
+      "always": false,
+      "priority": 45,
+      "requires": ["core"]
+    }
+  ]
+}
