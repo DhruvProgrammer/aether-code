@@ -17,7 +17,8 @@ aether-plugin = { path = "../aether-plugin" }
 async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"
-tokio = { version = "1", features = ["process", "rt", "time", "io-util", "macros"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["process", "rt", "time", "io-util", "macros", "sync", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

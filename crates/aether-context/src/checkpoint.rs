@@ -345,6 +345,7 @@ impl SessionCompactor {
     /// failure the previous state is retained and `Err` is returned.
     ///
     /// Returns the rebuilt message list (system + checkpoint + recent tail).
+    /// Prefer [`SessionCompactor::compact_detailed`] for token accounting.
     pub async fn compact(
         &self,
         session_id: &str,
@@ -352,17 +353,45 @@ impl SessionCompactor {
         messages: &[Message],
         trigger: CompactTrigger,
     ) -> Result<Vec<Message>, CompactionError> {
+        Ok(self.compact_detailed(session_id, system_prompt, messages, trigger).await?.rebuilt)
+    }
+
+    /// Full compaction cycle with a typed result (tokens, counts, timing).
+    pub async fn compact_detailed(
+        &self,
+        session_id: &str,
+        system_prompt: &str,
+        messages: &[Message],
+        trigger: CompactTrigger,
+    ) -> Result<CompactionResult, CompactionError> {
         *self.status.lock() = CompactionStatus::Running;
+        let started = std::time::Instant::now();
+
+        if messages.is_empty() {
+            *self.status.lock() = CompactionStatus::Failed;
+            return Err(CompactionError::NothingToCompact);
+        }
+
+        let tokens_before = estimate_message_tokens(messages);
+        if tokens_before < MIN_COMPACTABLE_TOKENS {
+            // Too small to be worth an LLM call.
+            *self.status.lock() = CompactionStatus::Failed;
+            return Err(CompactionError::NothingToCompact);
+        }
 
         let checkpoint = self
             .generate_checkpoint(session_id, messages)
             .await
-            .ok_or(CompactionError::GenerationFailed)?;
+            .ok_or_else(|| {
+                *self.status.lock() = CompactionStatus::Failed;
+                CompactionError::GenerationFailed
+            })?;
 
         // Persist before rebuilding (atomic: never half-compacted).
-        self.store
-            .save_checkpoint(session_id, &checkpoint)
-            .map_err(|e| CompactionError::PersistFailed(e))?;
+        if let Err(e) = self.store.save_checkpoint(session_id, &checkpoint) {
+            *self.status.lock() = CompactionStatus::Failed;
+            return Err(CompactionError::PersistFailed(e));
+        }
 
         let rebuilt = rebuild_context(
             system_prompt,
@@ -371,26 +400,78 @@ impl SessionCompactor {
             self.context_window,
         );
 
+        let tokens_after = estimate_message_tokens(&rebuilt);
+        if tokens_after as f32 > tokens_before as f32 * MIN_REDUCTION_RATIO && tokens_before > 0 {
+            // Not enough reduction to justify the cycle — keep old state.
+            *self.status.lock() = CompactionStatus::Failed;
+            return Err(CompactionError::InsufficientReduction {
+                before: tokens_before,
+                after: tokens_after,
+                ratio: MIN_REDUCTION_RATIO,
+            });
+        }
+
+        let messages_compacted = messages.len().saturating_sub(rebuilt.len()) as u32;
+
         *self.status.lock() = CompactionStatus::Completed;
         tracing::info!(
             session = session_id,
             trigger = ?trigger,
             "context compacted: {} -> {} tokens",
-            estimate_message_tokens(messages),
-            estimate_message_tokens(&rebuilt),
+            tokens_before,
+            tokens_after,
         );
-        Ok(rebuilt)
+        Ok(CompactionResult {
+            rebuilt,
+            tokens_before,
+            tokens_after,
+            messages_compacted,
+            trigger,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
     }
 }
 
-/// Errors from a compaction cycle.
+/// Errors from a compaction cycle. All non-fatal: the caller must log and
+/// continue with the previous state (Grok-build style).
 #[derive(Debug, thiserror::Error)]
 pub enum CompactionError {
     #[error("checkpoint generation failed or produced an invalid checkpoint")]
     GenerationFailed,
     #[error("checkpoint persistence failed: {0}")]
     PersistFailed(String),
+    #[error("nothing to compact")]
+    NothingToCompact,
+    #[error("compaction LLM call timed out")]
+    Timeout,
+    #[error("compaction produced an empty checkpoint")]
+    EmptyCheckpoint,
+    #[error("insufficient reduction: {after} > {before} * {ratio}")]
+    InsufficientReduction { before: u32, after: u32, ratio: f32 },
 }
+
+/// Result of a successful compaction cycle. Carries the token accounting the
+/// caller needs for telemetry, events, and the UI — without re-estimating.
+#[derive(Debug, Clone)]
+pub struct CompactionResult {
+    pub rebuilt: Vec<Message>,
+    /// Tokens in the messages that were compacted.
+    pub tokens_before: u32,
+    /// Tokens in the rebuilt context (system + checkpoint + recent tail).
+    pub tokens_after: u32,
+    /// Number of messages replaced by the checkpoint tail cut.
+    pub messages_compacted: u32,
+    pub trigger: CompactTrigger,
+    pub elapsed_ms: u64,
+}
+
+/// Minimum reduction ratio: rebuilt context must be smaller than the
+/// original by this factor, else the cycle is wasted work.
+pub const MIN_REDUCTION_RATIO: f32 = 0.90;
+
+/// Minimum input size worth compacting. Below this floor the LLM call costs
+/// more than it saves — return `NothingToCompact` without calling the model.
+pub const MIN_COMPACTABLE_TOKENS: u32 = 200;
 
 /// Rebuild the active context: system prompt + checkpoint (as memory) + as
 /// many recent messages as fit the remaining budget. The recent-tail size is
@@ -418,6 +499,7 @@ pub fn rebuild_context(
     let budget = context_window.saturating_sub(base_tokens).saturating_sub(reserve);
 
     // Walk backwards, keeping recent messages until the budget is exhausted.
+    // The first MIN_RECENT_MESSAGES are always kept; beyond that the budget binds.
     let mut kept: Vec<Message> = Vec::new();
     let mut used = 0u32;
     for m in messages.iter().rev() {
@@ -425,7 +507,7 @@ pub fn rebuild_context(
             continue;
         }
         let t = (m.content.chars().count() as u32) / 4 + 16;
-        if kept.len() >= MIN_RECENT_MESSAGES || used + t <= budget {
+        if kept.len() < MIN_RECENT_MESSAGES || used + t <= budget {
             used += t;
             kept.push(m.clone());
         } else {
@@ -533,12 +615,18 @@ mod tests {
     }
 
     fn mock_compactor(response: Result<String, ProviderError>) -> (SessionCompactor, Arc<MemoryCheckpointStore>) {
+        mock_compactor_with_window(response, 100_000)
+    }
+
+    /// Mock compactor with an explicit window. A small window (e.g. 2_000)
+    /// makes the reduction gate meaningful for modest fixtures.
+    fn mock_compactor_with_window(response: Result<String, ProviderError>, window: u32) -> (SessionCompactor, Arc<MemoryCheckpointStore>) {
         let store = Arc::new(MemoryCheckpointStore::default());
         let provider = Arc::new(MockController { response });
         let compactor = SessionCompactor::new(
             provider,
             "mock-model".into(),
-            100_000,
+            window,
             store.clone(),
         );
         (compactor, store)
@@ -607,7 +695,8 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_compaction_generates_and_persists_checkpoint() {
-        let (compactor, store) = mock_compactor(Ok(valid_checkpoint_json()));
+        // Small window so the reduction gate is meaningful for the fixture.
+        let (compactor, store) = mock_compactor_with_window(Ok(valid_checkpoint_json()), 2_000);
         let msgs: Vec<Message> = (0..30)
             .map(|i| msg("user", &format!("message {i} {}", "y".repeat(200))))
             .collect();
@@ -628,12 +717,21 @@ mod tests {
 
     #[tokio::test]
     async fn manual_compaction_uses_manual_trigger() {
-        let (compactor, store) = mock_compactor(Ok(valid_checkpoint_json()));
-        let msgs = vec![msg("user", "do the thing")];
-        let _ = compactor
-            .compact("sess-m", "SYS", &msgs, CompactTrigger::Manual)
-            .await
-            .unwrap();
+        // Small window + payload that exceeds the tail budget, so the
+        // reduction gate is meaningful for the fixture.
+        let (compactor, store) = mock_compactor_with_window(Ok(valid_checkpoint_json()), 2_000);
+        let msgs: Vec<Message> = (0..40)
+            .map(|i| msg("user", &format!("task {i} {}", "y".repeat(200))))
+            .collect();
+        let result = compactor
+            .compact_detailed("sess-m", "SYS", &msgs, CompactTrigger::Manual)
+            .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => panic!("manual compact failed: {e:?}"),
+        };
+        assert_eq!(result.trigger, CompactTrigger::Manual);
+        assert!(result.tokens_after < result.tokens_before);
         assert!(store.load_checkpoint("sess-m").unwrap().is_some());
     }
 
@@ -645,7 +743,8 @@ mod tests {
         let res = compactor.compact("sess-x", "SYS", &msgs, CompactTrigger::Automatic).await;
         assert!(res.is_err());
         assert!(store.load_checkpoint("sess-x").unwrap().is_none());
-        assert_eq!(compactor.status(), CompactionStatus::Running); // not Completed
+        // Failed cycles report Failed, never Completed.
+        assert_eq!(compactor.status(), CompactionStatus::Failed);
     }
 
     #[tokio::test]
@@ -668,11 +767,44 @@ mod tests {
 
     #[tokio::test]
     async fn session_isolation_across_compactions() {
-        let (compactor, store) = mock_compactor(Ok(valid_checkpoint_json()));
-        let msgs = vec![msg("user", "task")];
+        // Small window + payload that exceeds the tail budget, so the
+        // reduction gate is meaningful for the fixture.
+        let (compactor, store) = mock_compactor_with_window(Ok(valid_checkpoint_json()), 2_000);
+        let msgs: Vec<Message> = (0..40)
+            .map(|i| msg("user", &format!("task {i} {}", "y".repeat(200))))
+            .collect();
         compactor.compact("sess-a", "SYS", &msgs, CompactTrigger::Manual).await.unwrap();
         // Session B has no checkpoint.
         assert!(store.load_checkpoint("sess-b").unwrap().is_none());
         assert!(store.load_checkpoint("sess-a").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn tiny_history_is_nothing_to_compact() {
+        let (compactor, store) = mock_compactor(Ok(valid_checkpoint_json()));
+        let msgs = vec![msg("user", "hi")];
+        let res = compactor.compact("sess-t", "SYS", &msgs, CompactTrigger::Automatic).await;
+        assert!(matches!(res, Err(CompactionError::NothingToCompact)));
+        assert!(store.load_checkpoint("sess-t").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn detailed_result_carries_token_accounting() {
+        // Small window so the reduction gate is meaningful for the fixture.
+        let (compactor, _store) = mock_compactor_with_window(Ok(valid_checkpoint_json()), 2_000);
+        let msgs: Vec<Message> = (0..30)
+            .map(|i| msg("user", &format!("message {i} {}", "y".repeat(200))))
+            .collect();
+        let result = compactor
+            .compact_detailed("sess-d", "SYS", &msgs, CompactTrigger::Automatic)
+            .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => panic!("compact_detailed failed: {e:?}"),
+        };
+        assert!(result.tokens_before > 0);
+        assert!(result.tokens_after < result.tokens_before);
+        assert!(result.messages_compacted > 0);
+        assert_eq!(result.trigger, CompactTrigger::Automatic);
     }
 }

@@ -1720,17 +1720,17 @@ async fn compact_session(session_id: String) -> Result<CompactResultDto, String>
         Arc::new(aether_core::compaction_store::SessionCheckpointStore::new(sessions_db())),
     );
 
+    // Manual and automatic compaction share the same mechanism (spec §13/21).
     match compactor
-        .compact(&session_id, "AETHER session compaction", &messages, aether_context::CompactTrigger::Manual)
+        .compact_detailed(&session_id, "AETHER session compaction", &messages, aether_context::CompactTrigger::Manual)
         .await
     {
-        Ok(rebuilt) => {
-            let tokens_after = aether_context::checkpoint::estimate_message_tokens(&rebuilt);
+        Ok(result) => {
             Ok(CompactResultDto {
                 status: "completed".into(),
-                tokens_before,
-                tokens_after,
-                message: "Context compacted".into(),
+                tokens_before: result.tokens_before,
+                tokens_after: result.tokens_after,
+                message: format!("Context compacted ({} messages folded in {} ms)", result.messages_compacted, result.elapsed_ms),
             })
         }
         Err(e) => Ok(CompactResultDto {

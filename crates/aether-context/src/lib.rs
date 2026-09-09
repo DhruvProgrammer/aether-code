@@ -30,6 +30,7 @@ pub mod summarizer;
 pub mod thresholds;
 pub mod workspace;
 pub mod checkpoint;
+pub mod budget;
 
 pub use state::{
     ContextSegment, ContextSegmentKind, ContextState, SegmentMeta, TokenUsage,

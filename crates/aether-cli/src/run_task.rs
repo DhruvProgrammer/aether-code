@@ -470,7 +470,9 @@ pub async fn run(
                             } else {
                                 content
                             };
-                            extra.push_str(&format!("\n\n[File: {}]\n{}", clean, truncated));
+                            // Project files are untrusted data: scan before injecting.
+                            let safe = aether_core::threat::sanitize(clean, &truncated);
+                            extra.push_str(&format!("\n\n[File: {} (untrusted project data)]\n{}", clean, safe));
                         }
                     }
                 }

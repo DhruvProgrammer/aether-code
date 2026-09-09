@@ -7,9 +7,11 @@ license.workspace = true
 [dependencies]
 aether-permissions = { path = "../aether-permissions" }
 aether-analysis = { path = "../aether-analysis" }
+aether-models = { path = "../aether-models" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
 thiserror = "1"
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1", features = ["process", "rt-multi-thread", "io-util", "sync", "macros"] }

@@ -112,6 +112,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "futures-util",
  "parking_lot",
  "serde",
  "serde_json",
@@ -274,9 +275,11 @@ name = "aether-tools"
 version = "0.26.0"
 dependencies = [
  "aether-analysis",
+ "aether-models",
  "aether-permissions",
  "anyhow",
  "async-trait",
+ "chrono",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

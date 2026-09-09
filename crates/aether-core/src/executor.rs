@@ -318,21 +318,16 @@ impl Executor {
             trigger: "automatic".into(),
         });
         match compactor
-            .compact(&self.session_id, system_content, &messages, aether_context::CompactTrigger::Automatic)
+            .compact_detailed(&self.session_id, system_content, &messages, aether_context::CompactTrigger::Automatic)
             .await
         {
-            Ok(rebuilt) => {
-                let after = aether_context::checkpoint::estimate_request_tokens(
-                    system_content,
-                    tool_schemas,
-                    &rebuilt,
-                );
+            Ok(result) => {
                 self.emit_tool(|tid| crate::task_state::TaskEventKind::CompactionCompleted {
                     task_id: tid.into(),
-                    tokens_before: estimated,
-                    tokens_after: after,
+                    tokens_before: result.tokens_before,
+                    tokens_after: result.tokens_after,
                 });
-                rebuilt
+                result.rebuilt
             }
             Err(e) => {
                 // Transactional failure: old state kept (spec §16).

@@ -3,7 +3,8 @@
 //! relational, append-only logs, not semantic memory.
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -33,6 +34,173 @@ pub struct MessageRow {
     pub content: String,
     pub tool_calls: Option<Vec<serde_json::Value>>,
     pub tool_call_id: Option<String>,
+}
+
+/// v0.27 part-typed message fragment. Old rows still appear as
+/// `MessagePart::Text`; new rows can also be `Tool`, `Reasoning`, or
+/// `Compaction`. The flat `messages.content` remains the rendered
+/// fallback for backward compat.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MessagePart {
+    Text { text: String },
+    Tool { tool_call_id: String, name: String, args: serde_json::Value, output: Option<String>, status: String },
+    Reasoning { text: String },
+    Compaction { summary: String, tokens_before: u32, tokens_after: u32 },
+}
+
+impl MessagePart {
+    /// Render this part to a single string (used for legacy flat-content
+    /// compatibility and tool-result display).
+    pub fn render(&self) -> String {
+        match self {
+            MessagePart::Text { text } => text.clone(),
+            MessagePart::Tool { name, args, output, status, .. } => {
+                let args_str = serde_json::to_string(args).unwrap_or_default();
+                let out_str = output.clone().unwrap_or_default();
+                format!("[Tool {name}({args_str}) status={status}]: {out_str}")
+            }
+            MessagePart::Reasoning { text } => format!("[Reasoning]: {text}"),
+            MessagePart::Compaction { summary, tokens_before, tokens_after } => {
+                format!("[Compaction {tokens_before}->{tokens_after}]: {summary}")
+            }
+        }
+    }
+
+    /// Stable kind string for the `message_parts.kind` column.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            MessagePart::Text { .. } => "text",
+            MessagePart::Tool { .. } => "tool",
+            MessagePart::Reasoning { .. } => "reasoning",
+            MessagePart::Compaction { .. } => "compaction",
+        }
+    }
+}
+
+impl SessionStore {
+    /// Persist a part-typed message and return its message id. The flat
+    /// `messages.content` is populated with the rendered concatenation of
+    /// parts so the legacy read API still works.
+    pub fn add_message_parts(&self, session_id: &str, role: &str, parts: &[MessagePart]) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let rendered = parts.iter().map(|p| p.render()).collect::<Vec<_>>().join("\n");
+        self.conn.execute(
+            "INSERT INTO messages(session_id, role, content, ts) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![session_id, role, rendered, now],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        for (i, p) in parts.iter().enumerate() {
+            let payload = serde_json::to_string(p).unwrap_or_else(|_| "null".to_string());
+            self.conn.execute(
+                "INSERT INTO message_parts(message_id, ordinal, kind, payload) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, i as i64, p.kind_str(), payload],
+            )?;
+        }
+        Ok(id)
+    }
+
+    /// Fetch the parts of a single message in original order. Returns
+    /// `None` if the message does not exist; returns `Some(vec![Text{...}])`
+    /// (synthesised) if the message has no parts table entries (legacy).
+    pub fn get_message_parts(&self, message_id: i64) -> Result<Option<Vec<MessagePart>>> {
+        // First check the message exists
+        let exists: bool = self.conn.query_row(
+            "SELECT 1 FROM messages WHERE id = ?1",
+            rusqlite::params![message_id],
+            |_r| Ok(true),
+        ).optional().unwrap_or(Some(false)).unwrap_or(false);
+        if !exists {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, payload FROM message_parts WHERE message_id = ?1 ORDER BY ordinal ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![message_id], |r| {
+            let kind: String = r.get(0)?;
+            let payload: String = r.get(1)?;
+            Ok((kind, payload))
+        })?;
+        let mut out: Vec<MessagePart> = Vec::new();
+        for row in rows {
+            let (kind, payload) = row?;
+            // Handle two payload shapes:
+            //   1. Tagged JSON:    {"Text":{"text":"..."}}  or  {"Tool":{...}}
+            //   2. Bare string:    "<plain text>"           (legacy / "Text" rows)
+            let p: MessagePart = match serde_json::from_str::<serde_json::Value>(&payload) {
+                Ok(v) => match v {
+                    serde_json::Value::Object(map) => {
+                        // Tagged form: pick the only key.
+                        if map.len() == 1 {
+                            let (k, inner) = map.into_iter().next().unwrap();
+                            match k.as_str() {
+                                "Text" => {
+                                    if let Some(t) = inner.get("text").and_then(|x| x.as_str()) {
+                                        MessagePart::Text { text: t.to_string() }
+                                    } else {
+                                        MessagePart::Text { text: payload }
+                                    }
+                                }
+                                "Reasoning" => {
+                                    let t = inner.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                    MessagePart::Reasoning { text: t }
+                                }
+                                "Compaction" => {
+                                    let summary = inner.get("summary").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                    let tb = inner.get("tokens_before").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                                    let ta = inner.get("tokens_after").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                                    MessagePart::Compaction { summary, tokens_before: tb, tokens_after: ta }
+                                }
+                                "Tool" => {
+                                    let tool_call_id = inner.get("tool_call_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                    let name = inner.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                    let args = inner.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                                    let output = inner.get("output").and_then(|x| x.as_str()).map(|s| s.to_string());
+                                    let status = inner.get("status").and_then(|x| x.as_str()).unwrap_or("ok").to_string();
+                                    MessagePart::Tool { tool_call_id, name, args, output, status }
+                                }
+                                _ => MessagePart::Text { text: payload },
+                            }
+                        } else {
+                            MessagePart::Text { text: payload }
+                        }
+                    }
+                    _ => MessagePart::Text { text: payload },
+                },
+                Err(_) => MessagePart::Text { text: payload },
+            };
+            out.push(p);
+        }
+        if out.is_empty() {
+            // Legacy fallback: render from messages.content
+            let content: String = self.conn.query_row(
+                "SELECT content FROM messages WHERE id = ?1",
+                rusqlite::params![message_id],
+                |r| r.get(0),
+            )?;
+            out.push(MessagePart::Text { text: content });
+        }
+        Ok(Some(out))
+    }
+
+    /// Crash-recovery helper: drop every message after `keep_until_message_id`
+    /// in this session, and drop their parts. Used by `recovery_state` in the
+    /// agent loop to resume at a safe boundary.
+    pub fn truncate_after(&self, session_id: &str, keep_until_message_id: i64) -> Result<u32> {
+        let n: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND id > ?2",
+            rusqlite::params![session_id, keep_until_message_id],
+            |r| r.get::<_, i64>(0),
+        )? as u32;
+        self.conn.execute(
+            "DELETE FROM message_parts WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1 AND id > ?2)",
+            rusqlite::params![session_id, keep_until_message_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND id > ?2",
+            rusqlite::params![session_id, keep_until_message_id],
+        )?;
+        Ok(n)
+    }
 }
 
 pub struct SessionStore {
@@ -76,6 +244,14 @@ impl SessionStore {
                 before_content TEXT,
                 ts TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS message_parts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS kv(
                 session_id TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -86,8 +262,7 @@ impl SessionStore {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 ts TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                agent TEXT NOT NULL,
+                kind TEXT NOT NULL,                agent TEXT NOT NULL,
                 parent TEXT,
                 summary TEXT NOT NULL,
                 payload TEXT
@@ -193,9 +368,15 @@ impl SessionStore {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO messages(session_id, role, content, ts) VALUES (?1, ?2, ?3, ?4)",
-            (session_id, role, content, now.as_str()),
+            (session_id, role, content, now),
         )?;
         Ok(())
+    }
+
+    /// Return the auto-assigned rowid after a raw `INSERT INTO messages`.
+    /// Caller must have just executed the insert.
+    pub fn last_message_id(&self) -> Result<i64> {
+        Ok(self.conn.last_insert_rowid())
     }
 
     /// Persist a message with optional tool-call payload. Used by the Executor to record
@@ -505,6 +686,48 @@ mod tests {
         let cp = store.last_checkpoint(&sid).unwrap().expect("checkpoint present");
         assert_eq!(cp.path, "foo.rs");
         assert_eq!(cp.before_content.as_deref(), Some("old content"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn message_parts_roundtrip() {
+        let (path, store) = tmp_store("parts");
+        let sid = store.new_session().unwrap();
+        let parts = vec![
+            MessagePart::Reasoning { text: "thinking...".into() },
+            MessagePart::Text { text: "answer".into() },
+            MessagePart::Tool { tool_call_id: "c1".into(), name: "read_file".into(), args: serde_json::json!({"path":"a.txt"}), output: Some("hi".into()), status: "ok".into() },
+        ];
+        let id = store.add_message_parts(&sid, "assistant", &parts).unwrap();
+        let got = store.get_message_parts(id).unwrap().unwrap();
+        assert_eq!(got, parts);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn truncate_after_drops_messages_and_parts() {
+        let (path, store) = tmp_store("trunc");
+        let sid = store.new_session().unwrap();
+        store.add_message(&sid, "user", "1").unwrap();
+        let id1 = store.last_message_id().unwrap();
+        store.add_message(&sid, "assistant", "2").unwrap();
+        let id2 = store.last_message_id().unwrap();
+        store.add_message(&sid, "tool", "3").unwrap();
+        let id3 = store.last_message_id().unwrap();
+        store.add_message_parts(&sid, "assistant", &[MessagePart::Text { text: "x".into() }]).unwrap();
+        let dropped = store.truncate_after(&sid, id2).unwrap();
+        assert_eq!(dropped, 2);
+        let mut stmt = store.conn.prepare("SELECT id FROM messages WHERE session_id = ?1 ORDER BY id").unwrap();
+        let remaining: Vec<i64> = stmt.query_map(rusqlite::params![sid], |r| r.get(0))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect();
+        assert_eq!(remaining, vec![id1, id2]);
+        // id3 was deleted; querying it should be gone
+        let exists: bool = store.conn.query_row(
+            "SELECT 1 FROM messages WHERE id = ?1", rusqlite::params![id3], |_| Ok(true),
+        ).optional().unwrap_or(Some(false)).unwrap_or(false);
+        assert!(!exists, "id3 should be deleted");
         let _ = std::fs::remove_file(&path);
     }
 }

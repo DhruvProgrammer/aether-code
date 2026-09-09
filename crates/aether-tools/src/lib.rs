@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod analysis;
+pub mod registry;
+pub mod workspace;
 pub struct ToolContext {
     pub cwd: PathBuf,
 }

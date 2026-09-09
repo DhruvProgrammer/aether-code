@@ -295,6 +295,16 @@ pub struct ModelEntry {
     pub max_output_tokens: Option<u32>,
 }
 
+/// Authoritative runtime model + provider config (OpenCode-style depth).
+/// `from_entry` upgrades a persisted `ProviderEntry` into a `ProviderConfigV2`
+/// for the runtime registry.
+pub mod model_config;
+pub use model_config::{
+    from_entry as provider_from_entry, ModelApi, ModelCapabilities, ModelConfigV2,
+    ModelCost, ModelLimit, ModelModalities, ModelStatus, ModelVariant, ProviderAuth,
+    ProviderConfigV2,
+};
+
 /// Per-session role assignment: which provider/model performs each AETHER role.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RoleAssignments {
