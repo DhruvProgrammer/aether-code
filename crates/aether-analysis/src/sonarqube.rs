@@ -485,12 +485,14 @@ pub fn parse_issues_json(json: &str, project: &str) -> Result<Vec<Finding>, Anal
     Ok(body.issues.iter().map(|i| normalize_issue(i, project)).collect())
 }
 
-/// Remove the literal token from any log-like text (defence in depth).
+/// Remove the literal token from any log-like text (defence in depth),
+/// then apply shape-based redaction for any other secret-shaped strings.
 fn redact_token(text: &str, token: Option<&str>) -> String {
-    match token {
+    let once = match token {
         Some(t) if !t.is_empty() => text.replace(t, "<redacted>"),
         _ => text.to_string(),
-    }
+    };
+    aether_models::redact_secrets(&once)
 }
 
 /// Minimal `which` without an extra dependency.

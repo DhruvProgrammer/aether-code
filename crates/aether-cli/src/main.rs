@@ -124,12 +124,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let _ = std::io::stderr().write_all(format!("error: {message}\n").as_bytes());
         }
         TaskEvent::Exit { code, success } => {
-            *sink_state.lock().unwrap() = (code, success);
+            *sink_state.lock().unwrap_or_else(|e| e.into_inner()) = (code, success);
         }
         TaskEvent::TaskState { .. } => {}
     });
     run(opts, cancel, sink).await?;
-    let (code, success) = *exit_state.lock().unwrap();
+    let (code, success) = *exit_state.lock().unwrap_or_else(|e| e.into_inner());
     if !success || code != 0 {
         std::process::exit(if code == 0 { 1 } else { code });
     }

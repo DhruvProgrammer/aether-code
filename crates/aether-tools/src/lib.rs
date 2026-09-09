@@ -74,6 +74,7 @@ impl Tool for ReadFileTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
         let path = arg_str(&args, "path").ok_or_else(|| ToolError::Other("missing 'path'".into()))?;
         let full = ctx.cwd.join(&path);
+        sandbox_check(&full, &ctx.cwd)?;
         // Binary guard: reject files with null bytes in first 8k
         let bytes = std::fs::read(&full).map_err(|e| ToolError::Io(e))?;
         if bytes.iter().take(8192).any(|&b| b == 0) {
@@ -189,7 +190,6 @@ impl Tool for ListDirectoryTool {
         for e in std::fs::read_dir(&full)? {
             let e = e?;
             if count >= max { out.push_str("…(truncated)\n"); break; }
-            let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
             if name.starts_with('.') && name != "." && name != ".." { continue; }
             let (kind, size) = match e.file_type() {

@@ -91,7 +91,7 @@ impl OpenAICompatibleProvider {
             body["tools"] = serde_json::json!(tools);
         }
         if let Some(eb) = &self.extra_body {
-            merge_json(&mut body, eb);
+            merge_extra_body(&mut body, eb);
         }
         // Multimodal: extend the last `user` message with image parts (spec: LLM 3 vision).
         // Defend against SSRF / exfiltration by allowing only safe schemes and capping length.
@@ -124,6 +124,16 @@ impl OpenAICompatibleProvider {
             if let Some(obj) = hdrs.as_object() {
                 let mut b = builder;
                 for (k, v) in obj {
+                    // Blocklist: custom headers must never override auth,
+                    // routing, or framing headers.
+                    let kl = k.to_ascii_lowercase();
+                    if matches!(
+                        kl.as_str(),
+                        "authorization" | "host" | "content-length" | "cookie"
+                            | "connection" | "transfer-encoding" | "x-api-key"
+                    ) {
+                        continue;
+                    }
                     if let Some(s) = v.as_str() {
                         b = b.header(k.as_str(), s);
                     }
@@ -219,9 +229,19 @@ impl ModelProvider for OpenAICompatibleProvider {
     }
 }
 
-fn merge_json(base: &mut Value, overlay: &Value) {
+/// Merge provider `extra_body` fields without allowing them to override
+/// request-critical keys (`model`, `messages`, `stream`, tools, sampling
+/// params). A tampered provider config must not be able to silently swap
+/// the model or inject prompts.
+fn merge_extra_body(base: &mut Value, overlay: &Value) {
+    const BLOCKED: &[&str] = &[
+        "model", "messages", "stream", "tools", "tool_choice", "temperature", "max_tokens",
+    ];
     if let (Some(b), Some(o)) = (base.as_object_mut(), overlay.as_object()) {
         for (k, v) in o {
+            if BLOCKED.contains(&k.as_str()) {
+                continue;
+            }
             b.insert(k.clone(), v.clone());
         }
     }

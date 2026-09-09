@@ -39,31 +39,53 @@ struct Input {
 }
 impl Input {
     fn insert(&mut self, c: char) {
+        // Clamp a possibly stale cursor (e.g. after external value edits) to a
+        // char boundary before indexing — never panic on multi-byte input.
+        self.cursor = self.cursor.min(self.value.len());
+        while !self.value.is_char_boundary(self.cursor) && self.cursor > 0 {
+            self.cursor -= 1;
+        }
         self.value.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
     fn backspace(&mut self) {
         if self.cursor > 0 {
-            let prev = self.value[..self.cursor].chars().last().unwrap();
-            self.cursor -= prev.len_utf8();
-            self.value.remove(self.cursor);
+            let clamped = self.cursor.min(self.value.len());
+            if let Some(prev) = self.value[..clamped].chars().last() {
+                self.cursor = clamped - prev.len_utf8();
+                self.value.remove(self.cursor);
+            } else {
+                self.cursor = 0;
+            }
         }
     }
     fn delete(&mut self) {
-        if self.cursor < self.value.len() {
+        if self.cursor < self.value.len() && self.value.is_char_boundary(self.cursor) {
             self.value.remove(self.cursor);
         }
     }
     fn left(&mut self) {
         if self.cursor > 0 {
-            let prev = self.value[..self.cursor].chars().last().unwrap();
-            self.cursor -= prev.len_utf8();
+            let clamped = self.cursor.min(self.value.len());
+            if let Some(prev) = self.value[..clamped].chars().last() {
+                self.cursor = clamped - prev.len_utf8();
+            } else {
+                self.cursor = 0;
+            }
         }
     }
     fn right(&mut self) {
         if self.cursor < self.value.len() {
-            let n = self.value[self.cursor..].chars().next().unwrap().len_utf8();
-            self.cursor += n;
+            if let Some(n) = self.value.get(self.cursor..).and_then(|s| s.chars().next()).map(|c| c.len_utf8()) {
+                self.cursor += n;
+            } else {
+                // Stale non-boundary cursor: snap forward to the next boundary.
+                let mut c = (self.cursor + 1).min(self.value.len());
+                while c < self.value.len() && !self.value.is_char_boundary(c) {
+                    c += 1;
+                }
+                self.cursor = c;
+            }
         }
     }
     fn home(&mut self) { self.cursor = 0; }

@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 mod openai;
 pub use openai::OpenAICompatibleProvider;
 
+pub mod redact;
+pub use redact::redact_secrets;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Message {
     pub role: String,

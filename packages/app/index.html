@@ -245,24 +245,17 @@
           <textarea id="prompt-input" rows="1" class="w-full bg-transparent border-none text-app-textPrimary placeholder-app-textSecondary focus:ring-0 resize-none pb-3 text-sm font-sans" placeholder="Ask anything, / for commands, @ for context..."></textarea>
           <div class="flex items-center justify-between pt-2 border-t border-app-border/50">
             <div class="flex items-center space-x-4">
-              <button id="attach-btn" class="p-1 text-app-textSecondary hover:text-app-brand hover:bg-app-hover rounded transition-colors" title="Attach file">
-                <i class="w-4 h-4" data-lucide="paperclip"></i>
-              </button>
-              <button id="mode-btn" class="flex items-center space-x-1 text-sm text-app-textSecondary hover:text-app-brand hover:bg-app-hover px-2 py-1 rounded transition-colors">
+              <button id="mode-btn" class="flex items-center space-x-1 text-sm text-app-textSecondary hover:text-app-brand hover:bg-app-hover px-2 py-1 rounded transition-colors" title="Toggle build/plan mode" aria-label="Toggle build or plan mode">
                 <span id="mode-label">Build</span>
                 <i class="w-3 h-3" data-lucide="chevron-down"></i>
               </button>
-              <button id="model-btn" class="flex items-center space-x-1 text-sm text-app-textSecondary hover:text-app-brand hover:bg-app-hover px-2 py-1 rounded transition-colors">
+              <button id="model-btn" class="flex items-center space-x-1 text-sm text-app-textSecondary hover:text-app-brand hover:bg-app-hover px-2 py-1 rounded transition-colors" title="Select models for LLM roles" aria-label="Select models for LLM roles">
                 <i class="w-3.5 h-3.5 mr-1" data-lucide="box"></i>
                 <span id="model-label">controller</span>
                 <i class="w-3 h-3" data-lucide="chevron-down"></i>
               </button>
-              <button id="profile-btn" class="flex items-center space-x-1 text-sm text-app-textSecondary hover:text-app-brand hover:bg-app-hover px-2 py-1 rounded transition-colors">
-                <span>Default</span>
-                <i class="w-3 h-3" data-lucide="chevron-down"></i>
-              </button>
             </div>
-            <button id="send-btn" class="w-8 h-8 rounded-lg bg-app-surface border border-app-border hover:bg-app-hover hover:border-app-brand flex items-center justify-center text-app-textSecondary hover:text-app-brand transition-colors">
+            <button id="send-btn" class="w-8 h-8 rounded-lg bg-app-surface border border-app-border hover:bg-app-hover hover:border-app-brand flex items-center justify-center text-app-textSecondary hover:text-app-brand transition-colors" title="Send message" aria-label="Send message">
               <i class="w-4 h-4" data-lucide="arrow-up"></i>
             </button>
           </div>
@@ -275,7 +268,7 @@
       <div class="bg-app-surface border border-app-border rounded-xl w-full max-w-5xl max-h-[85vh] overflow-hidden flex flex-col">
         <div class="flex items-center justify-between px-5 py-3 border-b border-app-border">
           <h2 id="modal-title" class="text-base font-semibold text-app-brand">Settings</h2>
-          <button id="modal-close" class="text-app-textSecondary hover:text-app-textPrimary">
+          <button id="modal-close" class="text-app-textSecondary hover:text-app-textPrimary" title="Close" aria-label="Close dialog">
             <i class="w-5 h-5" data-lucide="x"></i>
           </button>
         </div>
@@ -288,7 +281,7 @@
       <div class="modal-card">
         <div class="flex items-center justify-between px-5 py-3 border-b border-app-border">
           <h2 id="provider-modal-title" class="text-sm font-semibold text-app-brand">Add Provider</h2>
-          <button id="provider-modal-close" class="text-app-textSecondary hover:text-app-textPrimary"><i class="w-5 h-5" data-lucide="x"></i></button>
+          <button id="provider-modal-close" class="text-app-textSecondary hover:text-app-textPrimary" title="Close" aria-label="Close provider dialog"><i class="w-5 h-5" data-lucide="x"></i></button>
         </div>
         <div id="provider-modal-body" class="p-5 overflow-y-auto space-y-4"></div>
       </div>
@@ -298,7 +291,7 @@
       <div class="modal-card">
         <div class="flex items-center justify-between px-5 py-3 border-b border-app-border">
           <h2 id="model-modal-title" class="text-sm font-semibold text-app-brand">Add Model</h2>
-          <button id="model-modal-close" class="text-app-textSecondary hover:text-app-textPrimary"><i class="w-5 h-5" data-lucide="x"></i></button>
+          <button id="model-modal-close" class="text-app-textSecondary hover:text-app-textPrimary" title="Close" aria-label="Close model dialog"><i class="w-5 h-5" data-lucide="x"></i></button>
         </div>
         <div id="model-modal-body" class="p-5 overflow-y-auto space-y-4"></div>
       </div>
@@ -310,7 +303,7 @@
           <h2 id="diff-modal-title" class="text-sm font-mono text-app-textPrimary truncate">Diff</h2>
           <div class="flex items-center space-x-2">
             <span id="diff-modal-stats" class="text-xs font-mono text-app-textSecondary"></span>
-            <button id="diff-modal-close" class="text-app-textSecondary hover:text-app-textPrimary"><i class="w-5 h-5" data-lucide="x"></i></button>
+            <button id="diff-modal-close" class="text-app-textSecondary hover:text-app-textPrimary" title="Close" aria-label="Close diff viewer"><i class="w-5 h-5" data-lucide="x"></i></button>
           </div>
         </div>
         <div id="diff-modal-body" class="p-0 overflow-auto max-h-[70vh] font-mono text-xs"></div>

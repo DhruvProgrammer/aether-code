@@ -44,14 +44,14 @@ pub struct DecisionLog {
 impl DecisionLog {
     pub fn new() -> Self { Self::default() }
     pub fn record(&self, rec: DecisionRecord) {
-        self.records.lock().unwrap().push(rec);
+        self.records.lock().unwrap_or_else(|e| e.into_inner()).push(rec);
     }
     pub fn snapshot(&self) -> Vec<DecisionRecord> {
-        self.records.lock().unwrap().clone()
+        self.records.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
-    pub fn len(&self) -> usize { self.records.lock().unwrap().len() }
+    pub fn len(&self) -> usize { self.records.lock().unwrap_or_else(|e| e.into_inner()).len() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
-    pub fn clear(&self) { self.records.lock().unwrap().clear(); }
+    pub fn clear(&self) { self.records.lock().unwrap_or_else(|e| e.into_inner()).clear(); }
 }
 
 /// Anything that wants to hear about permission decisions.
@@ -66,7 +66,7 @@ pub struct InMemorySink {
 }
 impl PermissionEventSink for InMemorySink {
     fn on_decision(&self, rec: &DecisionRecord) {
-        self.records.lock().unwrap().push(rec.clone());
+        self.records.lock().unwrap_or_else(|e| e.into_inner()).push(rec.clone());
     }
 }
 

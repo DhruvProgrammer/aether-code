@@ -5,7 +5,7 @@
 //! `name()`. Toolsets are named groups of tool names used to scope the
 //! surface per LLM role (planner / executor / reviewer).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::Tool;

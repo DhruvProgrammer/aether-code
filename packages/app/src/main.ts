@@ -467,7 +467,7 @@ async function openModal(kind: "settings" | "history") {
       const lucide = (window as any).lucide;
       if (lucide?.createIcons) lucide.createIcons();
     } catch (e) {
-      body.innerHTML = `<div class="text-app-error text-sm">Failed: ${escapeHtml(String(e))}</div>`;
+      body.innerHTML = `<div class="text-app-error text-sm">Failed: ${escapeHtml(redactSecrets(String(e)).slice(0,300))}</div>`;
     }
   } else {
     body.innerHTML = `<div class="text-app-textSecondary text-sm">Loading…</div>`;
@@ -476,7 +476,7 @@ async function openModal(kind: "settings" | "history") {
       body.innerHTML = renderHistory(rows);
       wireHistory(body);
     } catch (e) {
-      body.innerHTML = `<div class="text-app-error text-sm">Failed: ${escapeHtml(String(e))}</div>`;
+      body.innerHTML = `<div class="text-app-error text-sm">Failed: ${escapeHtml(redactSecrets(String(e)).slice(0,300))}</div>`;
     }
   }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -535,6 +535,10 @@ function maskApiKey(s: string): string {
   return "•".repeat(Math.min(s.length, 16));
 }
 
+function isEnvVarName(s: string | null | undefined): boolean {
+  return !!s && /^[A-Z0-9_]{2,64}$/.test(s);
+}
+
 function renderProviderCatalog(): string {
   if (app.providers.length === 0) {
     return `<div class="text-xs text-app-textSecondary italic py-4 text-center">No providers configured yet. Add one below.</div>`;
@@ -558,7 +562,7 @@ function renderProviderCatalog(): string {
       </div>
       <div class="mt-3 space-y-2 text-xs">
         <div><span class="text-app-textSecondary">Base URL:</span> <code class="font-mono text-app-textPrimary">${escapeHtml(p.base_url || "— not set —")}</code></div>
-        <div><span class="text-app-textSecondary">API Key:</span> <code class="font-mono">${p.auth_type === "raw" ? maskApiKey(p.api_key ?? p.api_key_env ?? "") : p.auth_type === "none" ? "— none —" : escapeHtml(p.api_key_env || "— not set —")}</code> <span class="text-[10px] text-app-textSecondary">(${escapeHtml(p.auth_type === "raw" ? "raw" : p.auth_type === "none" ? "none" : p.api_key_env ? p.auth_type ?? "env_var" : "empty")})</span></div>
+        <div><span class="text-app-textSecondary">API Key:</span> <code class="font-mono">${p.auth_type === "none" ? "— none —" : isEnvVarName(p.api_key_env) && p.auth_type !== "raw" ? escapeHtml(p.api_key_env || "— not set —") : maskApiKey(p.auth_type === "raw" ? (p.api_key ?? p.api_key_env ?? "") : p.api_key_env)}</code> <span class="text-[10px] text-app-textSecondary">(${escapeHtml(p.auth_type === "raw" ? "raw" : p.auth_type === "none" ? "none" : p.api_key_env ? p.auth_type ?? "env_var" : "empty")})</span></div>
         ${headers.length ? `<div><span class="text-app-textSecondary">Headers:</span> <span class="font-mono text-[11px]">${headers.map(([k,v])=> escapeHtml(k)+": "+maskApiKey(String(v))).join(", ")}</span></div>` : ""}
       </div>
       <div class="flex items-center space-x-2 mt-3">
@@ -636,8 +640,8 @@ async function renderSettings(cfg: DesktopConfig, path: string): Promise<string>
 
         <div class="flex items-center space-x-4">
           <label class="text-xs uppercase tracking-wide text-app-textSecondary w-20">Opacity</label>
-          <input id="bg-opacity" type="range" min="0" max="100" value="${appearance.background_opacity}" class="opacity-slider flex-1" />
-          <span id="bg-opacity-label" class="text-xs font-mono w-12 text-right">${appearance.background_opacity}%</span>
+          <input id="bg-opacity" type="range" min="0" max="100" value="${escapeAttr(String(Number(appearance.background_opacity) || 60))}" class="opacity-slider flex-1" />
+          <span id="bg-opacity-label" class="text-xs font-mono w-12 text-right">${escapeHtml(String(Number(appearance.background_opacity) || 60))}%</span>
         </div>
 
         <div class="flex items-center space-x-4 mt-3">
@@ -766,6 +770,7 @@ function wireProviderCatalog(body: HTMLElement): void {
   body.querySelectorAll<HTMLButtonElement>("[data-provider-edit]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const idx = parseInt(btn.dataset.providerEdit!, 10);
+      if (!Number.isInteger(idx) || !app.providers[idx]) { refreshProviderCatalog(body); return; }
       openProviderModal(idx);
     });
   });
@@ -773,6 +778,7 @@ function wireProviderCatalog(body: HTMLElement): void {
   body.querySelectorAll<HTMLButtonElement>("[data-provider-del]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const idx = parseInt(btn.dataset.providerDel!, 10);
+      if (!Number.isInteger(idx) || !app.providers[idx]) { refreshProviderCatalog(body); return; }
       app.providers.splice(idx, 1);
       providerValidation.delete(idx);
       // reindex validation maps
@@ -783,6 +789,16 @@ function wireProviderCatalog(body: HTMLElement): void {
       });
       providerValidation.clear();
       newMap.forEach((v, k) => providerValidation.set(k, v));
+      // Reindex model validations too so badges don't shift onto wrong models.
+      const newMMap = new Map<string, { checking: boolean; ok?: boolean; detail: string }>();
+      modelValidation.forEach((v, k) => {
+        const [kpi, kmi] = k.split(":").map((n) => parseInt(n, 10));
+        if (kpi === idx) return; // deleted provider's models
+        else if (kpi > idx) newMMap.set(`${kpi - 1}:${kmi}`, v);
+        else newMMap.set(k, v);
+      });
+      modelValidation.clear();
+      newMMap.forEach((v, k) => modelValidation.set(k, v));
       refreshProviderCatalog(body);
     });
   });
@@ -790,6 +806,7 @@ function wireProviderCatalog(body: HTMLElement): void {
   body.querySelectorAll<HTMLButtonElement>("[data-provider-check]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const idx = parseInt(btn.dataset.providerCheck!, 10);
+      if (!Number.isInteger(idx) || !app.providers[idx]) { refreshProviderCatalog(body); return; }
       const prov = app.providers[idx];
       providerValidation.set(idx, { checking: true, detail: "checking…" });
       refreshProviderCatalog(body);
@@ -798,7 +815,7 @@ function wireProviderCatalog(body: HTMLElement): void {
         const ok = out.can_save;
         providerValidation.set(idx, { checking: false, ok, detail: out.message + (out.checks?.length ? " — " + out.checks.map(c=> `${c.label}:${c.passed?"ok":"fail"}`).join(", ") : "") });
       } catch (e) {
-        providerValidation.set(idx, { checking: false, ok: false, detail: String(e) });
+        providerValidation.set(idx, { checking: false, ok: false, detail: redactSecrets(String(e)).slice(0,200) });
       }
       refreshProviderCatalog(body);
     });
@@ -814,6 +831,7 @@ function wireProviderCatalog(body: HTMLElement): void {
   body.querySelectorAll<HTMLButtonElement>("[data-model-edit]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const [pi, mi] = btn.dataset.modelEdit!.split("|").map((n) => parseInt(n, 10));
+      if (!Number.isInteger(pi) || !Number.isInteger(mi) || !app.providers[pi] || !app.providers[pi].models[mi]) { refreshProviderCatalog(body); return; }
       openModelModal(pi, mi);
     });
   });
@@ -821,6 +839,7 @@ function wireProviderCatalog(body: HTMLElement): void {
   body.querySelectorAll<HTMLButtonElement>("[data-model-del]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const [pi, mi] = btn.dataset.modelDel!.split("|").map((n) => parseInt(n, 10));
+      if (!Number.isInteger(pi) || !Number.isInteger(mi) || !app.providers[pi] || !app.providers[pi].models[mi]) { refreshProviderCatalog(body); return; }
       const prov = app.providers[pi];
       prov.models.splice(mi, 1);
       // Reindex validation map so badges don't shift onto wrong models.
@@ -841,6 +860,7 @@ function wireProviderCatalog(body: HTMLElement): void {
   body.querySelectorAll<HTMLButtonElement>("[data-model-check]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const [pi, mi] = btn.dataset.modelCheck!.split("|").map((n) => parseInt(n, 10));
+      if (!Number.isInteger(pi) || !Number.isInteger(mi) || !app.providers[pi] || !app.providers[pi].models[mi]) { refreshProviderCatalog(body); return; }
       const prov = app.providers[pi];
       const model = prov.models[mi];
       const key = `${pi}:${mi}`;
@@ -850,7 +870,7 @@ function wireProviderCatalog(body: HTMLElement): void {
         const out = await api.providersValidate(prov.id, model.id);
         modelValidation.set(key, { checking: false, ok: out.ok, detail: out.detail });
       } catch (e) {
-        modelValidation.set(key, { checking: false, ok: false, detail: String(e) });
+        modelValidation.set(key, { checking: false, ok: false, detail: redactSecrets(String(e)).slice(0,200) });
       }
       refreshProviderCatalog(body);
     });
@@ -944,6 +964,11 @@ function openProviderModal(editIdx: number | null): void {
     </div>`;
 
   modal.classList.add("open");
+  // Keyboard users: focus the first input so Tab starts inside the modal.
+  window.setTimeout(() => {
+    const first = modal.querySelector<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>("input:not([type=hidden]), select, button");
+    try { first?.focus(); } catch {}
+  }, 30);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
 
@@ -1083,7 +1108,7 @@ function openProviderModal(editIdx: number | null): void {
       statusEl.className = `text-xs font-mono mt-2 ${ok ? "text-green-400" : "text-app-error"}`;
       _providerChecked = ok;
     } catch(e){
-      statusEl.textContent = `✗ Validation failed — ${String(e).slice(0,200)}`;
+      statusEl.textContent = `✗ Validation failed — ${redactSecrets(String(e)).slice(0,200)}`;
       statusEl.className="text-xs font-mono mt-2 text-app-error";
       _providerChecked=false;
     } finally {
@@ -1093,6 +1118,9 @@ function openProviderModal(editIdx: number | null): void {
   });
 
   body.querySelector<HTMLButtonElement>("#pm-fetch-models")?.addEventListener("click", async () => {
+    const fbtn = body.querySelector<HTMLButtonElement>("#pm-fetch-models")!;
+    if (fbtn.disabled) return;
+    fbtn.disabled = true;
     const base = (body.querySelector<HTMLInputElement>("#pm-base")!.value.trim());
     const auth = getAuthType();
     let key = "";
@@ -1135,12 +1163,17 @@ function openProviderModal(editIdx: number | null): void {
         discEl.textContent = out.models_discovered ? "No models discovered (endpoint may not support /models). Add manually." : "No models returned.";
       }
     } catch(e) {
-      discEl.textContent = `Fetch failed: ${String(e).slice(0,200)}`;
+      discEl.textContent = `Fetch failed: ${redactSecrets(String(e)).slice(0,200)}`;
+    } finally {
+      fbtn.disabled = false;
     }
   });
 
   body.querySelector<HTMLButtonElement>("#pm-cancel")?.addEventListener("click", () => closeProviderModal());
   body.querySelector<HTMLButtonElement>("#pm-save")?.addEventListener("click", async () => {
+    const saveBtn = body.querySelector<HTMLButtonElement>("#pm-save")!;
+    if (saveBtn.disabled) return;
+    saveBtn.disabled = true;
     const id = (body.querySelector<HTMLInputElement>("#pm-id")!.value.trim());
     const name = (body.querySelector<HTMLInputElement>("#pm-name")!.value.trim() || id);
     const protocol = (body.querySelector<HTMLSelectElement>("#pm-protocol")!.value || "openai_compatible");
@@ -1201,8 +1234,11 @@ function openProviderModal(editIdx: number | null): void {
       const settingsBody = document.querySelector<HTMLElement>("#modal-body");
       if (settingsBody) refreshProviderCatalog(settingsBody);
     } catch(e){
-      statusEl.textContent = `Save failed: ${String(e)}`;
+      statusEl.textContent = `Save failed: ${redactSecrets(String(e)).slice(0,300)}`;
       statusEl.className="text-xs font-mono mt-2 text-app-error";
+    } finally {
+      saveBtn.disabled = false;
+      updateSave();
     }
   });
 
@@ -1251,6 +1287,11 @@ function openModelModal(providerIdx: number, modelIdx: number | null): void {
     </div>`;
 
   modal.classList.add("open");
+  // Keyboard users: focus the first input so Tab starts inside the modal.
+  window.setTimeout(() => {
+    const first = modal.querySelector<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>("input:not([type=hidden]), select, button");
+    try { first?.focus(); } catch {}
+  }, 30);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
 
@@ -1276,7 +1317,7 @@ function openModelModal(providerIdx: number, modelIdx: number | null): void {
       statusEl.className = `text-xs font-mono mt-2 ${out.ok ? "text-green-400" : "text-app-error"}`;
       modelChecked = out.ok;
     } catch(e){
-      statusEl.textContent = `✗ Validation failed — ${String(e).slice(0,200)}`;
+      statusEl.textContent = `✗ Validation failed — ${redactSecrets(String(e)).slice(0,200)}`;
       statusEl.className="text-xs font-mono mt-2 text-app-error";
       modelChecked=false;
     } finally {
@@ -1321,7 +1362,7 @@ function openModelModal(providerIdx: number, modelIdx: number | null): void {
       const settingsBody = document.querySelector<HTMLElement>("#modal-body");
       if (settingsBody) refreshProviderCatalog(settingsBody);
     } catch(e){
-      statusEl.textContent = `Save failed: ${String(e)}`;
+      statusEl.textContent = `Save failed: ${redactSecrets(String(e)).slice(0,300)}`;
       statusEl.className="text-xs font-mono mt-2 text-app-error";
     }
   });
@@ -1407,7 +1448,7 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
       const lines = r.checks.map((c) => `${c.passed ? "✓" : "✗"} ${c.label}: ${c.detail}`).join("\n");
       out.textContent = `${r.message}\n\n${lines}\n\nStatus: ${r.status} · Latency: ${r.total_latency_ms}ms · Can save: ${r.can_save}`;
     } catch (e) {
-      out.textContent = `Check failed: ${String(e)}`;
+      out.textContent = `Check failed: ${redactSecrets(String(e)).slice(0,300)}`;
     }
   });
 
@@ -1435,7 +1476,7 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
         }),
       );
     } catch (e) {
-      out.textContent = `Failed: ${String(e)}`;
+      out.textContent = `Failed: ${redactSecrets(String(e)).slice(0,300)}`;
     }
   }
   body.querySelector<HTMLButtonElement>("#snap-list")?.addEventListener("click", () => void refreshSnapshotList());
@@ -1447,7 +1488,7 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
       const r = await api.snapshotUndo(sid);
       out.innerHTML = `<div class="validation-${r.success ? "ok" : "err"}">${escapeHtml(r.message)} (${r.files_restored} files)</div>` + (out.innerHTML ?? "");
       await refreshSnapshotList();
-    } catch (e) { out.textContent = String(e); }
+    } catch (e) { out.textContent = redactSecrets(String(e)).slice(0,300); }
   });
   body.querySelector<HTMLButtonElement>("#snap-redo")?.addEventListener("click", async () => {
     const sid = body.querySelector<HTMLInputElement>("#snap-session")?.value.trim() ?? "";
@@ -1457,7 +1498,7 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
       const r = await api.snapshotRedo(sid);
       out.innerHTML = `<div class="validation-${r.success ? "ok" : "err"}">${escapeHtml(r.message)} (${r.files_restored} files)</div>` + (out.innerHTML ?? "");
       await refreshSnapshotList();
-    } catch (e) { out.textContent = String(e); }
+    } catch (e) { out.textContent = redactSecrets(String(e)).slice(0,300); }
   });
 
   // ----- SonarQube code-analysis (v0.14) -----
@@ -1509,7 +1550,7 @@ function wireSettings(body: HTMLElement, originalCfg: DesktopConfig) {
       validation.classList.remove("validation-ok");
       validation.classList.add("validation-err");
       validation.style.display = "block";
-      validation.textContent = String(e);
+      validation.textContent = redactSecrets(String(e)).slice(0,300);
     }
   });
 
@@ -1686,9 +1727,10 @@ async function refreshBackgroundPreview(body: HTMLElement): Promise<void> {
   try {
     const payload = await api.getBackground();
     if (payload.data_base64) {
-      const url = `data:${payload.content_type};base64,${payload.data_base64}`;
+      const safeCt = /^image\/(png|jpeg|webp|gif)$/.test(payload.content_type) ? payload.content_type : "image/png";
+      const url = `data:${safeCt};base64,${payload.data_base64}`;
       if (img) img.src = url;
-      cachedBackground = { data: payload.data_base64, contentType: payload.content_type };
+      cachedBackground = { data: payload.data_base64, contentType: /^image\/(png|jpeg|webp|gif)$/.test(payload.content_type) ? payload.content_type : "image/png" };
     } else {
       if (img) img.src = "";
       cachedBackground = null;
@@ -1724,7 +1766,7 @@ function applyBackgroundLayer(enabled: boolean, opacityPct: number, mode = "fill
     fade.style.opacity = "1";
     return;
   }
-  if (!img.src) img.src = `data:${cachedBackground.contentType};base64,${cachedBackground.data}`;
+  if (!img.src) { const ct2 = /^image\/(png|jpeg|webp|gif)$/.test(cachedBackground.contentType) ? cachedBackground.contentType : "image/png"; img.src = `data:${ct2};base64,${cachedBackground.data}`; }
   img.style.display = "block";
   img.style.objectFit = objectFitForMode(mode);
   img.style.opacity = String(opacityPct / 100);
@@ -1798,7 +1840,7 @@ async function boot() {
     try {
       const payload = await api.getBackground();
       if (payload.data_base64) {
-        cachedBackground = { data: payload.data_base64, contentType: payload.content_type };
+        cachedBackground = { data: payload.data_base64, contentType: /^image\/(png|jpeg|webp|gif)$/.test(payload.content_type) ? payload.content_type : "image/png" };
       }
     } catch { /* keep null; layer renders solid */ }
     applyBackgroundLayer(appearance.background_enabled, appearance.background_opacity, appearance.background_mode ?? "fill");
@@ -1971,7 +2013,7 @@ async function pickFolder(): Promise<void> {
       await openWorkspaceByPath(selected);
     }
   } catch (e) {
-    const msg = `Folder picker failed: ${String(e).slice(0,200)}`;
+    const msg = `Folder picker failed: ${redactSecrets(String(e)).slice(0,200)}`;
     const sub = document.querySelector("#ws-home-subtitle") as HTMLElement | null;
     if (sub) sub.textContent = msg;
     console.error(msg);
@@ -1990,7 +2032,7 @@ async function openWorkspaceByPath(path: string): Promise<void> {
     await loadWorkspaceSessions();
     showWorkspaceUi();
   } catch (e) {
-    const msg = `Failed to open workspace: ${String(e).slice(0,200)}`;
+    const msg = `Failed to open workspace: ${redactSecrets(String(e)).slice(0,200)}`;
     const sub = document.querySelector("#ws-home-subtitle") as HTMLElement | null;
     if (sub) { sub.textContent = msg; sub.classList.add("text-app-error"); }
     console.error(msg);
@@ -2159,6 +2201,11 @@ async function openDiffViewer(filePath: string): Promise<void> {
   stats.textContent = "Loading…";
   body.innerHTML = `<div class="p-6 text-app-textSecondary text-sm">Loading diff…</div>`;
   modal.classList.add("open");
+  // Keyboard users: focus the first input so Tab starts inside the modal.
+  window.setTimeout(() => {
+    const first = modal.querySelector<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>("input:not([type=hidden]), select, button");
+    try { first?.focus(); } catch {}
+  }, 30);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const lucide = (window as any).lucide; if (lucide?.createIcons) lucide.createIcons();
   try {
@@ -2207,7 +2254,7 @@ async function createNewSession(): Promise<void> {
     app.roleAssignments = null;
     renderAll();
   } catch (e) {
-    const msg = `Failed to create session: ${String(e).slice(0,200)}`;
+    const msg = `Failed to create session: ${redactSecrets(String(e)).slice(0,200)}`;
     try {
       const s = current();
       s.blocks.push({ id: newId(s), kind: "error", text: msg });
@@ -2331,7 +2378,7 @@ function openRolePanel(): void {
       .map((o) => {
         const disabled = requireVision && !o.vision;
         const selected = cur && cur.provider_id === o.provider_id && cur.model_id === o.model_id ? "selected" : "";
-        return `<option value="${escapeAttr(o.provider_id)}|${escapeAttr(o.model_id)}" ${selected} ${disabled ? "disabled" : ""}>${escapeHtml(o.label)}${disabled ? " (vision unavailable)" : ""}</option>`;
+        return `<option value="${escapeAttr(encodeURIComponent(o.provider_id))}|${escapeAttr(encodeURIComponent(o.model_id))}" ${selected} ${disabled ? "disabled" : ""}>${escapeHtml(o.label)}${disabled ? " (vision unavailable)" : ""}</option>`;
       })
       .join("");
     return `<select data-role-select="${role}" class="w-full bg-app-bg border border-app-border rounded px-2 py-1.5 text-xs font-mono text-app-textPrimary">
@@ -2371,8 +2418,16 @@ function openRolePanel(): void {
     const read = (role: "executor" | "controller" | "reviewer") => {
       const v = body.querySelector<HTMLSelectElement>(`[data-role-select="${role}"]`)?.value ?? "";
       if (!v) return null;
-      const [provider_id, model_id] = v.split("|");
-      return { provider_id, model_id };
+      const parts = v.split("|");
+      if (parts.length !== 2) return null;
+      try {
+        const provider_id = decodeURIComponent(parts[0]);
+        const model_id = decodeURIComponent(parts[1]);
+        if (!provider_id || !model_id) return null;
+        return { provider_id, model_id };
+      } catch {
+        return null;
+      }
     };
     const next: RoleAssignmentsDto = {
       executor: read("executor"),

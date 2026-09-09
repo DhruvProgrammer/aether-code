@@ -40,6 +40,8 @@ pub enum SnapshotError {
     NothingToUndo,
     #[error("nothing to redo")]
     NothingToRedo,
+    #[error("refusing to restore outside workspace: {0}")]
+    OutsideWorkspace(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,7 +206,7 @@ impl SnapshotManager {
     /// `before_content`s at the time of capture, so applying them rewinds
     /// the workspace to that point in history. The cursor then steps back
     /// to the parent.
-    pub fn undo(&mut self, session_id: &str) -> Result<Snapshot, SnapshotError> {
+    pub fn undo(&mut self, session_id: &str, workspace_root: &Path) -> Result<Snapshot, SnapshotError> {
         let cur = self.cursors.get(session_id).ok_or(SnapshotError::NothingToUndo)?.clone();
         let cursor_id = cur.cursor.as_ref().ok_or(SnapshotError::NothingToUndo)?;
         let snap = self.snapshots.get(cursor_id).ok_or(SnapshotError::NotFound(cursor_id.clone()))?.clone();
@@ -212,13 +214,14 @@ impl SnapshotManager {
         // Apply the current snapshot's before-content (the workspace state
         // captured when this snapshot was taken), then move the cursor to
         // the parent.
-        restore_files(&snap.files)?;
-        self.cursors.get_mut(session_id).unwrap().cursor = Some(parent.clone());
+        restore_files(&snap.files, workspace_root)?;
+        let cursor = self.cursors.get_mut(session_id).ok_or(SnapshotError::NothingToUndo)?;
+        cursor.cursor = Some(parent.clone());
         Ok(self.snapshots.get(&parent).ok_or(SnapshotError::NotFound(parent))?.clone())
     }
 
     /// Move the cursor one step forward (towards head).
-    pub fn redo(&mut self, session_id: &str) -> Result<Snapshot, SnapshotError> {
+    pub fn redo(&mut self, session_id: &str, workspace_root: &Path) -> Result<Snapshot, SnapshotError> {
         let cur = self.cursors.get(session_id).ok_or(SnapshotError::NothingToRedo)?.clone();
         let cursor_id = cur.cursor.ok_or(SnapshotError::NothingToRedo)?;
         // Find the snapshot that points back to cursor_id as parent.
@@ -227,16 +230,18 @@ impl SnapshotManager {
             .ok_or(SnapshotError::NothingToRedo)?
             .id.clone();
         let next_snap = self.snapshots.get(&next).ok_or(SnapshotError::NotFound(next.clone()))?;
-        restore_files(&next_snap.files)?;
-        self.cursors.get_mut(session_id).unwrap().cursor = Some(next.clone());
+        restore_files(&next_snap.files, workspace_root)?;
+        let cursor = self.cursors.get_mut(session_id).ok_or(SnapshotError::NothingToRedo)?;
+        cursor.cursor = Some(next.clone());
         Ok(next_snap.clone())
     }
 
     /// Jump the cursor to an arbitrary snapshot and apply it.
-    pub fn restore(&mut self, id: &str) -> Result<Snapshot, SnapshotError> {
+    pub fn restore(&mut self, id: &str, workspace_root: &Path) -> Result<Snapshot, SnapshotError> {
         let snap = self.snapshots.get(id).ok_or_else(|| SnapshotError::NotFound(id.to_string()))?.clone();
-        restore_files(&snap.files)?;
-        self.cursors.get_mut(&snap.session_id).unwrap().cursor = Some(id.to_string());
+        restore_files(&snap.files, workspace_root)?;
+        let cursor = self.cursors.get_mut(&snap.session_id).ok_or_else(|| SnapshotError::NotFound(snap.session_id.clone()))?;
+        cursor.cursor = Some(id.to_string());
         Ok(snap)
     }
 
@@ -291,16 +296,46 @@ pub struct SnapshotDiff {
     pub changed: Vec<PathBuf>,
 }
 
-fn restore_files(files: &[FileSnapshot]) -> Result<(), SnapshotError> {
+fn restore_files(files: &[FileSnapshot], workspace_root: &Path) -> Result<(), SnapshotError> {
+    let root = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.to_path_buf());
     for f in files {
+        // Confine every restore target to the workspace root. Snapshot paths
+        // are absolute; canonicalize (resolving symlinks) and require the
+        // result to stay under root. Fail closed on any escape.
+        let target = if f.path.is_absolute() {
+            f.path.clone()
+        } else {
+            root.join(&f.path)
+        };
+        let canon_parent = target
+            .parent()
+            .map(|p| {
+                if p.exists() {
+                    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+                } else {
+                    // Walk up to the nearest existing ancestor for the check.
+                    let mut anc = p;
+                    while !anc.exists() {
+                        match anc.parent() {
+                            Some(par) => anc = par,
+                            None => break,
+                        }
+                    }
+                    anc.canonicalize().unwrap_or_else(|_| anc.to_path_buf())
+                }
+            })
+            .unwrap_or_else(|| root.clone());
+        if !canon_parent.starts_with(&root) {
+            return Err(SnapshotError::OutsideWorkspace(target.display().to_string()));
+        }
         match &f.before_content {
             Some(content) => {
-                if let Some(parent) = f.path.parent() { std::fs::create_dir_all(parent)?; }
-                std::fs::write(&f.path, content)?;
+                if let Some(parent) = target.parent() { std::fs::create_dir_all(parent)?; }
+                std::fs::write(&target, content)?;
             }
             None => {
                 // File didn't exist before — make sure it doesn't after restore.
-                let _ = std::fs::remove_file(&f.path);
+                let _ = std::fs::remove_file(&target);
             }
         }
     }
@@ -330,12 +365,12 @@ mod tests {
         std::fs::write(&f, "v3").unwrap();
 
         // Undo from cursor=s2 restores s2's before-content = v2.
-        mgr.undo("s1").unwrap();
+        mgr.undo("s1", &dir).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v2");
         // Cannot undo past the root — s1 has no parent.
-        assert!(mgr.undo("s1").is_err());
+        assert!(mgr.undo("s1", &dir).is_err());
         // Redo moves cursor to s2 and applies s2's before-content (v2).
-        mgr.redo("s1").unwrap();
+        mgr.redo("s1", &dir).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v2");
 
         // Persistence.
@@ -365,5 +400,41 @@ mod tests {
         let diff = mgr.compare(&sa, &sb).unwrap();
         assert!(diff.changed.contains(&f1));
         assert!(diff.only_in_b.contains(&f2));
+    }
+
+    #[test]
+    fn restore_rejects_outside_workspace() {
+        use std::collections::HashMap;
+        let dir = tmp();
+        let other = tmp();
+        let outside = other.join("evil.txt");
+        let mut mgr = SnapshotManager::open(&dir).unwrap();
+        // Craft a snapshot whose file lives outside the workspace root.
+        let snap = Snapshot {
+            id: "snap-evil".into(),
+            session_id: "s".into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            trigger: Trigger::Manual,
+            agent_id: None,
+            task: None,
+            files: vec![crate::snapshot::FileSnapshot { path: outside.clone(), before_content: Some("pwned".into()) }],
+            state: HashMap::new(),
+            metadata: HashMap::new(),
+        };
+        mgr.snapshots.insert(snap.id.clone(), snap);
+        mgr.cursors.insert("s".into(), Cursor { session_id: "s".into(), head: Some("snap-evil".into()), cursor: Some("snap-evil".into()) });
+        let err = mgr.restore("snap-evil", &dir).unwrap_err();
+        assert!(matches!(err, SnapshotError::OutsideWorkspace(_)));
+        assert!(!outside.exists(), "must not write outside workspace");
+    }
+
+    #[test]
+    fn restore_missing_cursor_returns_not_found() {
+        let dir = tmp();
+        let mut mgr = SnapshotManager::open(&dir).unwrap();
+        // No cursor for this session at all.
+        let err = mgr.undo("ghost", &dir).unwrap_err();
+        assert!(matches!(err, SnapshotError::NothingToUndo));
     }
 }

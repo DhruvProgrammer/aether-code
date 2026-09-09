@@ -65,9 +65,9 @@ impl PermissionEngine {
         }
     }
 
-    pub fn with_default(self, p: Permission) -> Self { *self.inner.default.lock().unwrap() = p; self }
-    pub fn with_sink(self, sink: Arc<dyn PermissionEventSink>) -> Self { *self.inner.sink.lock().unwrap() = sink; self }
-    pub fn with_approval(self, ch: Arc<dyn ApprovalChannel>) -> Self { *self.inner.approval.lock().unwrap() = ch; self }
+    pub fn with_default(self, p: Permission) -> Self { *self.inner.default.lock().unwrap_or_else(|e| e.into_inner()) = p; self }
+    pub fn with_sink(self, sink: Arc<dyn PermissionEventSink>) -> Self { *self.inner.sink.lock().unwrap_or_else(|e| e.into_inner()) = sink; self }
+    pub fn with_approval(self, ch: Arc<dyn ApprovalChannel>) -> Self { *self.inner.approval.lock().unwrap_or_else(|e| e.into_inner()) = ch; self }
 
     pub fn from_policy(p: &Policy) -> Self {
         let engine = Self::new().with_default(Permission::Ask);
@@ -77,27 +77,27 @@ impl PermissionEngine {
 
     pub fn log(&self) -> &DecisionLog { &self.inner.log }
 
-    pub fn add_global(&self, r: Rule) { self.inner.global.lock().unwrap().push(r); }
-    pub fn add_project(&self, r: Rule) { self.inner.project.lock().unwrap().push(r); }
+    pub fn add_global(&self, r: Rule) { self.inner.global.lock().unwrap_or_else(|e| e.into_inner()).push(r); }
+    pub fn add_project(&self, r: Rule) { self.inner.project.lock().unwrap_or_else(|e| e.into_inner()).push(r); }
     pub fn add_role(&self, role: impl Into<String>, r: Rule) {
-        self.inner.roles.lock().unwrap().entry(role.into()).or_default().push(r);
+        self.inner.roles.lock().unwrap_or_else(|e| e.into_inner()).entry(role.into()).or_default().push(r);
     }
     pub fn add_agent(&self, agent: impl Into<String>, r: Rule) {
-        self.inner.agents.lock().unwrap().entry(agent.into()).or_default().push(r);
+        self.inner.agents.lock().unwrap_or_else(|e| e.into_inner()).entry(agent.into()).or_default().push(r);
     }
     pub fn add_tool(&self, tool: impl Into<String>, r: Rule) {
-        self.inner.tools.lock().unwrap().entry(tool.into()).or_default().push(r);
+        self.inner.tools.lock().unwrap_or_else(|e| e.into_inner()).entry(tool.into()).or_default().push(r);
     }
 
     pub fn push_global(&self, rs: Vec<Rule>) { for r in rs { self.add_global(r); } }
     pub fn push_project(&self, rs: Vec<Rule>) { for r in rs { self.add_project(r); } }
 
     /// Record a session-scoped grant (e.g. user clicked "Allow for session").
-    pub fn grant_session(&self, r: Rule) { self.inner.session_grants.lock().unwrap().push(r); }
+    pub fn grant_session(&self, r: Rule) { self.inner.session_grants.lock().unwrap_or_else(|e| e.into_inner()).push(r); }
 
-    pub fn set_default(&self, p: Permission) { *self.inner.default.lock().unwrap() = p; }
+    pub fn set_default(&self, p: Permission) { *self.inner.default.lock().unwrap_or_else(|e| e.into_inner()) = p; }
 
-    pub fn set_approval(&self, ch: Arc<dyn ApprovalChannel>) { *self.inner.approval.lock().unwrap() = ch; }
+    pub fn set_approval(&self, ch: Arc<dyn ApprovalChannel>) { *self.inner.approval.lock().unwrap_or_else(|e| e.into_inner()) = ch; }
 
     /// Decide an operation.
     pub fn decide(
@@ -117,12 +117,12 @@ impl PermissionEngine {
         // (Inline / Session comes last so that user "Allow for session" grants
         //  do not override the engine's deny rules.)
         let _ignored_layers_marker: Option<()> = None;
-        let session = self.inner.session_grants.lock().unwrap().clone();
-        let agents = ctx.agent_id.and_then(|id| self.inner.agents.lock().unwrap().get(id).cloned()).unwrap_or_default();
-        let tools = ctx.tool.and_then(|t| self.inner.tools.lock().unwrap().get(t).cloned()).unwrap_or_default();
-        let roles = ctx.role.and_then(|r| self.inner.roles.lock().unwrap().get(r).cloned()).unwrap_or_default();
-        let project = self.inner.project.lock().unwrap().clone();
-        let global = self.inner.global.lock().unwrap().clone();
+        let session = self.inner.session_grants.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let agents = ctx.agent_id.and_then(|id| self.inner.agents.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()).unwrap_or_default();
+        let tools = ctx.tool.and_then(|t| self.inner.tools.lock().unwrap_or_else(|e| e.into_inner()).get(t).cloned()).unwrap_or_default();
+        let roles = ctx.role.and_then(|r| self.inner.roles.lock().unwrap_or_else(|e| e.into_inner()).get(r).cloned()).unwrap_or_default();
+        let project = self.inner.project.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let global = self.inner.global.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         let candidates: [(RuleSource, Vec<Rule>); 6] = [
             (RuleSource::Agent, agents),
@@ -140,15 +140,17 @@ impl PermissionEngine {
                 matched = Some(m.clone());
                 match verdict {
                     None => verdict = Some(m.rule.permission),
-                    Some(Permission::Allow) if m.rule.permission == Permission::Deny => verdict = Some(Permission::Deny),
-                    Some(Permission::Deny) if m.rule.permission == Permission::Allow => { /* Deny wins (defense in depth) */ }
+                    // Deny is sticky and wins over everything, including Ask:
+                    // a later-layer Deny must always override an earlier Ask.
+                    Some(Permission::Deny) => {}
+                    _ if m.rule.permission == Permission::Deny => verdict = Some(Permission::Deny),
                     _ => {}
                 }
                 if matches!(verdict, Some(Permission::Deny)) { break; }
             }
         }
 
-        let default_perm = *self.inner.default.lock().unwrap();
+        let default_perm = *self.inner.default.lock().unwrap_or_else(|e| e.into_inner());
         let mut final_perm = verdict.unwrap_or(default_perm);
         if final_perm == Permission::Ask {
             let req = ApprovalRequest {
@@ -159,7 +161,7 @@ impl PermissionEngine {
                 reason: ctx.reason.map(str::to_string),
                 risk: risk_for(op),
             };
-            let resp: ApprovalResponse = self.inner.approval.lock().unwrap().request(&req);
+            let resp: ApprovalResponse = self.inner.approval.lock().unwrap_or_else(|e| e.into_inner()).request(&req);
             final_perm = resp.permission;
             // Persist session-grant if scope allows.
             if resp.permission == Permission::Allow && matches!(resp.scope, ApprovalScope::Session | ApprovalScope::Project) {
@@ -178,7 +180,7 @@ impl PermissionEngine {
             reason: ctx.reason.map(str::to_string),
         };
         self.inner.log.record(rec.clone());
-        self.inner.sink.lock().unwrap().on_decision(&rec);
+        self.inner.sink.lock().unwrap_or_else(|e| e.into_inner()).on_decision(&rec);
         rec
     }
 

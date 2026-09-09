@@ -7,6 +7,13 @@ use serde_json::Value;
 use tokio::process::Command;
 
 async fn run_git(ctx: &ToolContext, args: &[&str]) -> Result<ToolResult, ToolError> {
+    // Reject option-looking positionals: a model-controlled `--output=...`
+    // or `-u` smuggled as a path/branch would alter git behavior.
+    for a in args.iter().skip(1) {
+        if a.starts_with('-') && *a != "--" {
+            return Err(ToolError::Other(format!("refusing git argument that looks like an option: {a}")));
+        }
+    }
     let output = Command::new("git")
         .args(args)
         .current_dir(&ctx.cwd)
@@ -61,6 +68,7 @@ git_tool!(
     |args| {
         let mut v = vec!["diff".to_string()];
         if let Some(p) = args.get("path").and_then(|x| x.as_str()) {
+            v.push("--".to_string());
             v.push(p.to_string());
         }
         v
@@ -111,7 +119,7 @@ git_tool!(
     serde_json::json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
     |args| {
         let p = args.get("path").and_then(|x| x.as_str()).unwrap_or(".").to_string();
-        vec!["add".into(), p]
+        vec!["add".into(), "--".into(), p]
     }
 );
 

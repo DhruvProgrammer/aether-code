@@ -13,7 +13,7 @@ use std::sync::Arc;
 use aether_core::agent_loop::Agent;
 use aether_core::mode::Mode;
 use aether_models::ModelProvider;
-use aether_mind::{skills::SkillIndex, Mind, memory::{MemoryManager, BuiltinMemoryProvider, MemoryTurn}};
+use aether_mind::{skills::SkillIndex, Mind, memory::{MemoryManager, BuiltinMemoryProvider}};
 use aether_permissions::Permission;
 use aether_sessions::SessionStore;
 use aether_tools::Tool;
@@ -235,7 +235,10 @@ pub async fn run(
         let mind_path = aether_config::expand_tilde(&cfg.memory.path);
         match Mind::open(&mind_path) {
             Ok(m) => (Some(m), Some(controller.clone())),
-            Err(_) => (None, None),
+            Err(e) => {
+                emit(&sink, "stderr", &format!("memory store unavailable, continuing without memory ({e})"));
+                (None, None)
+            }
         }
     } else {
         (None, None)
@@ -356,9 +359,22 @@ pub async fn run(
     ));
     let snapshots_root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
     let snapshots = Arc::new(std::sync::Mutex::new(
-        aether_sessions::SnapshotManager::open(snapshots_root).unwrap_or_else(|_| {
-            let tmp = std::env::temp_dir().join(format!("aether-snap-{session_id}"));
-            aether_sessions::SnapshotManager::open(tmp).expect("snapshots dir")
+        aether_sessions::SnapshotManager::open(snapshots_root).unwrap_or_else(|e| {
+            emit(&sink, "stderr", &format!("snapshot store unavailable, snapshots disabled: {e}"));
+            // In-memory fallback: sanitize the session id to a safe charset
+            // first so a hostile `--session-id ../../x` cannot escape temp.
+            let safe: String = session_id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .take(64)
+                .collect();
+            let tmp = std::env::temp_dir().join(format!("aether-snap-{safe}"));
+            aether_sessions::SnapshotManager::open(tmp).unwrap_or_else(|_| {
+                // Last resort: a fresh temp dir that always opens.
+                let fallback = std::env::temp_dir().join(format!("aether-snap-fallback-{}", std::process::id()));
+                aether_sessions::SnapshotManager::open(fallback)
+                    .expect("fallback snapshot dir must open")
+            })
         }),
     ));
 
@@ -575,7 +591,7 @@ async fn run_rollback(
 async fn run_background(
     opts: RunOptions,
     task: &str,
-    cfg_path: &Path,
+    _cfg_path: &Path,
     _cancel: &Arc<Notify>,
     sink: &OutputSink,
 ) -> anyhow::Result<()> {

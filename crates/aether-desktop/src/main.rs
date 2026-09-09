@@ -48,6 +48,58 @@ fn aether_dir() -> PathBuf {
 fn config_path() -> PathBuf { aether_dir().join("config.toml") }
 fn sessions_db() -> PathBuf { aether_dir().join("sessions.db") }
 
+/// Session IDs flow into filesystem paths (`~/.aether/snapshots/{id}`) and
+/// snapshot lookups. Reject anything outside `[A-Za-z0-9_-]` to kill path
+/// traversal (`../..`) at the IPC boundary. Backend-generated IDs
+/// (`desktop-...`, UUIDs) always pass.
+fn validate_session_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 128 {
+        return Err("invalid session id.".into());
+    }
+    if id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        Ok(())
+    } else {
+        Err("invalid session id.".into())
+    }
+}
+
+/// Strip a user-supplied path down to its file name for error messages so
+/// error strings never echo full attacker-controlled paths.
+fn sanitize_path_for_error(p: &str) -> String {
+    std::path::Path::new(p)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("invalid path")
+        .chars()
+        .take(80)
+        .collect()
+}
+
+/// Resolve the canonical workspace root for a session, for restore
+/// confinement. Fails closed: unknown session or workspace → no restore.
+fn workspace_root_for_session(session_id: &str) -> Result<PathBuf, String> {
+    let store = aether_sessions::SessionStore::open(
+        &aether_config::Config::default_dir().join("sessions.db"),
+    )
+    .map_err(|e| e.to_string())?;
+    let ws_id = store
+        .session_workspace_id(session_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "session has no workspace; restore refused.".to_string())?;
+    let ws_store = workspace_store()?;
+    let ws = ws_store
+        .get(&ws_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "workspace not found; restore refused.".to_string())?;
+    let canon = PathBuf::from(&ws.path)
+        .canonicalize()
+        .map_err(|_| "workspace path is not accessible; restore refused.".to_string())?;
+    if !canon.is_dir() {
+        return Err("workspace path is not a directory; restore refused.".to_string());
+    }
+    Ok(canon)
+}
+
 // ---------------------------------------------------------------------------
 // Config model (mirrors aether-config; duplicated here to keep the desktop
 // crate independent of the rest of the workspace during `tauri build`).
@@ -176,7 +228,10 @@ async fn read_config() -> Result<ConfigResponse, String> {
     let exists = path.exists();
     let config = if exists {
         let txt = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        toml::from_str::<DesktopConfig>(&txt).unwrap_or_default()
+        // Surface corruption instead of silently resetting to defaults —
+        // a silent reset would wipe the user's providers without warning.
+        toml::from_str::<DesktopConfig>(&txt)
+            .map_err(|e| format!("config file is corrupt ({}): fix or delete it to reset", redact_secrets(&e.to_string())) )?
     } else {
         DesktopConfig::default()
     };
@@ -314,6 +369,22 @@ async fn run_task(
             uuid::Uuid::new_v4().simple()
         )
     });
+    validate_session_id(&session_id)?;
+
+    // Validate workspace_path: must exist, be a directory, and stay put
+    // after canonicalization (no traversal tricks from a compromised renderer).
+    let workspace_path = match workspace_path {
+        Some(p) if !p.trim().is_empty() => {
+            let canon = std::path::PathBuf::from(&p)
+                .canonicalize()
+                .map_err(|_| format!("workspace path does not exist: {}", sanitize_path_for_error(&p)))?;
+            if !canon.is_dir() {
+                return Err("workspace path is not a directory.".into());
+            }
+            Some(canon)
+        }
+        _ => None,
+    };
 
     let cancel = Arc::new(tokio::sync::Notify::new());
     {
@@ -363,7 +434,7 @@ async fn run_task(
         task: Some(task),
         plan,
         session_id: Some(session_id.clone()),
-        workspace_path: workspace_path.map(std::path::PathBuf::from),
+        workspace_path,
         providers,
         role_assignments,
         ..Default::default()
@@ -797,6 +868,9 @@ struct SnapshotDto {
 
 #[tauri::command]
 fn list_snapshots(session_id: String) -> Vec<SnapshotDto> {
+    if validate_session_id(&session_id).is_err() {
+        return vec![];
+    }
     let root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
     let mgr = match aether_sessions::SnapshotManager::open(root) { Ok(m) => m, Err(_) => return vec![] };
     mgr.list(&session_id).into_iter().map(|s| SnapshotDto {
@@ -821,12 +895,22 @@ struct SnapshotResultDto {
 
 #[tauri::command]
 fn restore_snapshot(session_id: String, snapshot_id: String) -> SnapshotResultDto {
+    if validate_session_id(&session_id).is_err() {
+        return SnapshotResultDto { snapshot_id, files_restored: 0, success: false, message: "invalid session id.".into() };
+    }
+    if snapshot_id.is_empty() || snapshot_id.len() > 128 || !snapshot_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return SnapshotResultDto { snapshot_id, files_restored: 0, success: false, message: "invalid snapshot id.".into() };
+    }
+    let workspace_root = match workspace_root_for_session(&session_id) {
+        Ok(p) => p,
+        Err(e) => return SnapshotResultDto { snapshot_id, files_restored: 0, success: false, message: e },
+    };
     let root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
     let mut mgr = match aether_sessions::SnapshotManager::open(root) {
         Ok(m) => m,
         Err(e) => return SnapshotResultDto { snapshot_id, files_restored: 0, success: false, message: e.to_string() },
     };
-    match mgr.restore(&snapshot_id) {
+    match mgr.restore(&snapshot_id, &workspace_root) {
         Ok(s) => SnapshotResultDto {
             snapshot_id: s.id,
             files_restored: s.files.len(),
@@ -844,12 +928,19 @@ fn restore_snapshot(session_id: String, snapshot_id: String) -> SnapshotResultDt
 
 #[tauri::command]
 fn snapshot_undo(session_id: String) -> SnapshotResultDto {
+    if validate_session_id(&session_id).is_err() {
+        return SnapshotResultDto { snapshot_id: String::new(), files_restored: 0, success: false, message: "invalid session id.".into() };
+    }
+    let workspace_root = match workspace_root_for_session(&session_id) {
+        Ok(p) => p,
+        Err(e) => return SnapshotResultDto { snapshot_id: String::new(), files_restored: 0, success: false, message: e },
+    };
     let root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
     let mut mgr = match aether_sessions::SnapshotManager::open(root) {
         Ok(m) => m,
         Err(e) => return SnapshotResultDto { snapshot_id: String::new(), files_restored: 0, success: false, message: e.to_string() },
     };
-    match mgr.undo(&session_id) {
+    match mgr.undo(&session_id, &workspace_root) {
         Ok(s) => SnapshotResultDto {
             snapshot_id: s.id,
             files_restored: s.files.len(),
@@ -867,12 +958,19 @@ fn snapshot_undo(session_id: String) -> SnapshotResultDto {
 
 #[tauri::command]
 fn snapshot_redo(session_id: String) -> SnapshotResultDto {
+    if validate_session_id(&session_id).is_err() {
+        return SnapshotResultDto { snapshot_id: String::new(), files_restored: 0, success: false, message: "invalid session id.".into() };
+    }
+    let workspace_root = match workspace_root_for_session(&session_id) {
+        Ok(p) => p,
+        Err(e) => return SnapshotResultDto { snapshot_id: String::new(), files_restored: 0, success: false, message: e },
+    };
     let root = aether_config::expand_tilde(&format!("~/.aether/snapshots/{}", session_id));
     let mut mgr = match aether_sessions::SnapshotManager::open(root) {
         Ok(m) => m,
         Err(e) => return SnapshotResultDto { snapshot_id: String::new(), files_restored: 0, success: false, message: e.to_string() },
     };
-    match mgr.redo(&session_id) {
+    match mgr.redo(&session_id, &workspace_root) {
         Ok(s) => SnapshotResultDto {
             snapshot_id: s.id,
             files_restored: s.files.len(),
@@ -909,24 +1007,31 @@ struct BackgroundPayload {
 /// payload is returned (the UI hides the background layer in that case).
 #[tauri::command]
 async fn get_background(app: AppHandle) -> Result<BackgroundPayload, String> {
-    // User-chosen image first.
+    // User-chosen image first. Confined to the aether data dir with a size
+    // cap so a tampered config can't exfiltrate arbitrary files as base64.
+    const MAX_BACKGROUND_BYTES: u64 = 25 * 1024 * 1024;
     let cfg_path = config_path();
     if let Ok(txt) = std::fs::read_to_string(&cfg_path) {
         if let Ok(parsed) = toml::from_str::<DesktopConfig>(&txt) {
             if let Some(p) = parsed.appearance.background_image.as_deref() {
-                let path = PathBuf::from(p);
-                if path.exists() {
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        let ct = if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg")).unwrap_or(false) {
-                            "image/jpeg"
-                        } else {
-                            "image/png"
-                        };
-                        return Ok(BackgroundPayload {
-                            data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
-                            content_type: ct.into(),
-                            is_default: false,
-                        });
+                let data_root = aether_dir().canonicalize().unwrap_or_else(|_| aether_dir());
+                if let Ok(canon) = PathBuf::from(p).canonicalize() {
+                    let meta_ok = std::fs::metadata(&canon)
+                        .map(|m| m.is_file() && m.len() <= MAX_BACKGROUND_BYTES)
+                        .unwrap_or(false);
+                    if meta_ok && canon.starts_with(&data_root) {
+                        if let Ok(bytes) = std::fs::read(&canon) {
+                            let ct = if canon.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg")).unwrap_or(false) {
+                                "image/jpeg"
+                            } else {
+                                "image/png"
+                            };
+                            return Ok(BackgroundPayload {
+                                data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+                                content_type: ct.into(),
+                                is_default: false,
+                            });
+                        }
                     }
                 }
             }
@@ -1372,30 +1477,8 @@ struct ModelEntryDto {
 
 fn default_true() -> bool { true }
 
-/// Redact secret-shaped strings before any error text reaches the frontend.
-fn redact_secrets(s: &str) -> String {
-    let mut out = s.to_string();
-    for pat in ["sk-", "nvapi-", "venice-"] {
-        // Redact <prefix><8+ chars>
-        let mut result = String::new();
-        let mut rest = out.as_str();
-        while let Some(idx) = rest.find(pat) {
-            let after = &rest[idx + pat.len()..];
-            let token_len = after.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').count();
-            if token_len >= 8 {
-                result.push_str(&rest[..idx + pat.len()]);
-                result.push_str("[REDACTED]");
-                rest = &after[token_len..];
-            } else {
-                result.push_str(&rest[..idx + pat.len() + token_len]);
-                rest = &after[token_len..];
-            }
-        }
-        result.push_str(rest);
-        out = result;
-    }
-    out
-}
+/// Shared secret redaction (single source of truth in `aether-models`).
+use aether_models::redact_secrets;
 
 fn providers_path() -> std::path::PathBuf {
     aether_config::Config::default_dir().join("providers.json")
@@ -1434,7 +1517,10 @@ fn providers_list() -> Result<Vec<ProviderEntryDto>, String> {
         return Ok(vec![]);
     }
     let txt = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut providers: Vec<ProviderEntryDto> = serde_json::from_str(&txt).unwrap_or_default();
+    // Surface corruption instead of silently presenting an empty provider
+    // list — a silent empty list would wipe the user's catalog on next save.
+    let mut providers: Vec<ProviderEntryDto> = serde_json::from_str(&txt)
+        .map_err(|e| format!("providers file is corrupt: {} (fix or delete it to reset)", redact_secrets(&e.to_string())))?;
     let mut migrated = false;
     for p in &mut providers {
         // Migrate auth_type / api_key for legacy entries where api_key_env contains raw key
@@ -1568,7 +1654,7 @@ async fn provider_check_connection(provider_id: String) -> Result<aether_registr
         )
     } else if !cred.is_empty() {
         // Raw key
-        let mut d = aether_registry::ProviderDescriptor {
+        let d = aether_registry::ProviderDescriptor {
             id: prov.id.clone(),
             display_name: prov.display_name.clone(),
             provider_type: prov.protocol.clone(),

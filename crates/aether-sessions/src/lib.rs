@@ -122,7 +122,7 @@ impl SessionStore {
         })?;
         let mut out: Vec<MessagePart> = Vec::new();
         for row in rows {
-            let (kind, payload) = row?;
+            let (_kind, payload) = row?;
             // Handle two payload shapes:
             //   1. Tagged JSON:    {"Text":{"text":"..."}}  or  {"Tool":{...}}
             //   2. Bare string:    "<plain text>"           (legacy / "Text" rows)
@@ -299,6 +299,18 @@ impl SessionStore {
             (id.as_str(), now.as_str(), workspace_id, title, now.as_str()),
         )?;
         Ok(id)
+    }
+
+    /// Look up which workspace a session belongs to (for restore confinement).
+    pub fn session_workspace_id(&self, session_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT workspace_id FROM sessions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map((session_id,), |r| r.get::<_, Option<String>>(0))?;
+        match rows.next() {
+            Some(row) => Ok(row?),
+            None => Ok(None),
+        }
     }
 
     /// List sessions for a specific workspace, newest-first.

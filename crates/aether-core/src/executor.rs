@@ -350,11 +350,12 @@ impl Executor {
             }
         }
 
-        // Write checkpoint before mutating files (spec §15).
+        // Write checkpoint before mutating files (spec §15). Async read so
+        // the tokio worker isn't stalled on disk I/O.
         if tc.name == "write_file" {
             if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
                 let full = self.cwd.join(path);
-                let before = std::fs::read_to_string(&full).ok();
+                let before = tokio::fs::read_to_string(&full).await.ok();
                 if let Some(store) = &self.session {
                     let _ = store.add_checkpoint(&self.session_id, &tc.name, path, before.as_deref());
                 }
@@ -428,10 +429,10 @@ impl Executor {
         let res = tool.execute(tc.arguments.clone(), &ctx).await;
 
         if let Some(store) = &self.session {
-            let args = tc.arguments.to_string();
+            let args = aether_models::redact_secrets(&tc.arguments.to_string());
             let payload = match &res {
-                Ok(r) => r.output.clone(),
-                Err(e) => format!("ERROR: {e}"),
+                Ok(r) => aether_models::redact_secrets(&r.output),
+                Err(e) => aether_models::redact_secrets(&format!("ERROR: {e}")),
             };
             let _ = store.add_tool_call(&self.session_id, &tc.name, &args, &payload);
         }

@@ -257,6 +257,14 @@ impl Agent {
         }
     }
 
+    /// Validated state transition that logs rejections instead of silently
+    /// dropping them (keeps backend task-state and frontend display in sync).
+    fn transition(&self, tsm: &mut TaskStateMachine, to: TaskState, role: LlmRole, reason: &str) {
+        if let Err(e) = tsm.transition(to, role, reason) {
+            eprintln!("aether: task transition {} -> {} rejected: {e}", tsm.state().label(), to.label());
+        }
+    }
+
     /// Accessor used by the Executor when integrating with the permission
     /// engine.
     pub fn permission_engine(&self) -> Option<&Arc<aether_permissions::PermissionEngine>> {
@@ -405,7 +413,7 @@ impl Agent {
 
         // Multi-agent: Explorer (SMALL LLM) gathers repo findings before the Controller plans.
         // Task state: CREATED → UNDERSTANDING (LLM 3 observes/understands).
-        let _ = tsm.transition(TaskState::Understanding, LlmRole::Reviewer, "initial understanding");
+        self.transition(&mut tsm, TaskState::Understanding, LlmRole::Reviewer, "initial understanding");
         tsm.set_activity("Understanding the task and inspecting workspace");
         self.emit_task_event(TaskEventKind::TaskStateChanged {
             task_id: task_id.clone(),
@@ -490,12 +498,42 @@ impl Agent {
         let mut last_test: Option<SubagentResult> = None;
         let mut escalation: Option<String> = None;
 
+        // Model 1 executor: every construction input is loop-invariant
+        // (provider, model, tools, policy, cwd, session, system prompt), so
+        // build it once and reuse it for every plan→execute cycle instead of
+        // re-cloning the tools map, policy, and cwd per iteration.
+        let coder_model = self.executor_model.clone();
+        let mut coder = Executor::new(
+            self.provider_for(&coder_model),
+            coder_model,
+            self.tools.clone(),
+            self.policy.clone(),
+            self.cwd.clone(),
+            self.max_iterations,
+            self.context_max_tokens,
+            self.session.clone(),
+            sid.to_string(),
+            coder_system.clone(),
+            None,
+        )
+        .with_agent_id("coder");
+        if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
+        if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
+        if let Some(cp) = &self.compactor { coder = coder.with_compactor(cp.clone()); }
+        {
+            let sink2 = self.task_event_sink.clone();
+            let tid2 = task_id.clone();
+            if let Some(sink2) = sink2 {
+                coder = coder.with_runtime_events(sink2, tid2);
+            }
+        }
+
         // --- Closed loop: plan → execute → verify → (re)plan --------------------
         for iter in 0..loop_budget {
             if let Some(c) = &self.cancel {
                 if tokio::time::timeout(std::time::Duration::ZERO, c.notified()).await.is_ok() {
                     final_result = "[cancelled by caller]".into();
-                    let _ = tsm.transition(TaskState::Cancelled, LlmRole::System, "cancelled by user");
+                    self.transition(&mut tsm, TaskState::Cancelled, LlmRole::System, "cancelled by user");
                     self.emit_task_event(TaskEventKind::TaskCancelled {
                         task_id: task_id.clone(),
                         session_id: sid.to_string(),
@@ -519,7 +557,7 @@ impl Agent {
             // Task state: UNDERSTANDING → PLANNING (LLM 2 plans).
             let plan_from = tsm.state();
             if plan_from == TaskState::Understanding {
-                let _ = tsm.transition(TaskState::Planning, LlmRole::Planner, "planning");
+                self.transition(&mut tsm, TaskState::Planning, LlmRole::Planner, "planning");
             }
             tsm.set_activity("Building execution strategy");
             self.emit_task_event(TaskEventKind::TaskStateChanged {
@@ -558,8 +596,8 @@ impl Agent {
             tsm.set_plan(&plan, None);
             tsm.record_strategy(&plan);
             if iter == 0 {
-                let _ = tsm.transition(TaskState::PlanReady, LlmRole::Planner, "plan produced");
-                let _ = tsm.transition(TaskState::Executing, LlmRole::Executor, "executing approved plan");
+                self.transition(&mut tsm, TaskState::PlanReady, LlmRole::Planner, "plan produced");
+                self.transition(&mut tsm, TaskState::Executing, LlmRole::Executor, "executing approved plan");
                 tsm.set_activity("Implementing planned changes");
                 self.emit_task_event(TaskEventKind::TaskStateChanged {
                     task_id: task_id.clone(),
@@ -576,7 +614,7 @@ impl Agent {
                     to_role: LlmRole::Executor.label().into(),
                 });
             } else {
-                let _ = tsm.transition(TaskState::Repairing, LlmRole::Executor, "implementing repair plan");
+                self.transition(&mut tsm, TaskState::Repairing, LlmRole::Executor, "implementing repair plan");
                 tsm.set_activity("Implementing repair");
                 self.emit_task_event(TaskEventKind::TaskStateChanged {
                     task_id: task_id.clone(),
@@ -597,33 +635,8 @@ impl Agent {
                 let _ = store.set_kv(sid, "task_state", &tsm.serialize());
             }
 
-            // Model 1 always runs on the explicitly configured executor provider.
-            // No cost routing, no dynamic selection (v0.15 gateway spec §1, §23).
-            let coder_model = self.executor_model.clone();
-            let mut coder = Executor::new(
-                self.provider_for(&coder_model),
-                coder_model,
-                self.tools.clone(),
-                self.policy.clone(),
-                self.cwd.clone(),
-                self.max_iterations,
-                self.context_max_tokens,
-                self.session.clone(),
-                sid.to_string(),
-                coder_system.clone(),
-                None,
-            )
-            .with_agent_id("coder");
-            if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
-            if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
-            if let Some(cp) = &self.compactor { coder = coder.with_compactor(cp.clone()); }
-            {
-                let sink2 = self.task_event_sink.clone();
-                let tid2 = task_id.clone();
-                if let Some(sink2) = sink2 {
-                    coder = coder.with_runtime_events(sink2, tid2);
-                }
-            }
+            // Model 1 executes the approved plan via the loop-invariant coder
+            // built once before the loop (explicit per-role binding preserved).
             let result = coder.run(&cycle_task).await?;
             eng.record_action(&format!("execute plan (iter {})", iter + 1));
             eng.observe("executor", &summarize(&result), None, None);
@@ -631,7 +644,7 @@ impl Agent {
 
             // Task state: EXECUTING/REPAIRING → REVIEWING (LLM 3 reviews; LLM 1 cannot self-complete).
             let exec_from = tsm.state();
-            let _ = tsm.transition(TaskState::Reviewing, LlmRole::Reviewer, "execution finished — independent review");
+            self.transition(&mut tsm, TaskState::Reviewing, LlmRole::Reviewer, "execution finished — independent review");
             tsm.set_activity("Reviewing implementation against objective");
             self.emit_task_event(TaskEventKind::TaskStateChanged {
                 task_id: task_id.clone(),
@@ -834,7 +847,7 @@ impl Agent {
             }
 
             // Task state: REVIEWING → VERIFYING (LLM 3 owns verification).
-            let _ = tsm.transition(TaskState::Verifying, LlmRole::Reviewer, "verification pass");
+            self.transition(&mut tsm, TaskState::Verifying, LlmRole::Reviewer, "verification pass");
             tsm.set_activity("Inspecting implementation and test evidence");
             self.emit_task_event(TaskEventKind::TaskStateChanged {
                 task_id: task_id.clone(),
@@ -870,7 +883,7 @@ impl Agent {
                 tsm.add_verification_evidence("review", "pass", "reviewer approved", None);
                 tsm.add_verification_evidence("tests", "pass", "tester approved", None);
                 tsm.conclude_verification(true);
-                let _ = tsm.transition(TaskState::Completed, LlmRole::Reviewer, "verification passed — LLM 3 concludes");
+                self.transition(&mut tsm, TaskState::Completed, LlmRole::Reviewer, "verification passed — LLM 3 concludes");
                 self.emit_task_event(TaskEventKind::TaskCompleted {
                     task_id: task_id.clone(),
                     session_id: sid.to_string(),
@@ -885,7 +898,7 @@ impl Agent {
                 tsm.add_verification_evidence("review", "fail", &fail_detail, None);
                 tsm.conclude_verification(false);
                 tsm.record_error(&fail_detail, "verification");
-                let _ = tsm.transition(TaskState::Replanning, LlmRole::Planner, "verification failed — replanning");
+                self.transition(&mut tsm, TaskState::Replanning, LlmRole::Planner, "verification failed — replanning");
                 self.emit_task_event(TaskEventKind::TaskStateChanged {
                     task_id: task_id.clone(),
                     session_id: sid.to_string(),
@@ -925,7 +938,7 @@ impl Agent {
             if tsm.doom_detected() {
                 let reason = tsm.doom_reason().unwrap_or("doom loop detected").to_string();
                 tsm.record_error(&reason, "doom_loop");
-                let _ = tsm.transition(TaskState::Failed, LlmRole::System, &reason);
+                self.transition(&mut tsm, TaskState::Failed, LlmRole::System, &reason);
                 self.emit_task_event(TaskEventKind::TaskFailed {
                     task_id: task_id.clone(),
                     session_id: sid.to_string(),
@@ -941,7 +954,7 @@ impl Agent {
             match eng.decide(iter + 1, loop_budget) {
                 LoopAction::Escalate => {
                     persist_trace(&self.session, sid, "decision", "loop-engine", "ESCALATE");
-                    let _ = tsm.transition(TaskState::Failed, LlmRole::System, "loop engine escalated");
+                    self.transition(&mut tsm, TaskState::Failed, LlmRole::System, "loop engine escalated");
                     self.emit_task_event(TaskEventKind::TaskFailed {
                         task_id: task_id.clone(),
                         session_id: sid.to_string(),
@@ -957,9 +970,9 @@ impl Agent {
                     persist_trace(&self.session, sid, "decision", "loop-engine", "STOP");
                     if !tsm.state().is_terminal() {
                         if tsm.record.verification.has_evidence() && tsm.record.verification.overall_pass {
-                            let _ = tsm.transition(TaskState::Completed, LlmRole::Reviewer, "loop budget exhausted with passing verification");
+                            self.transition(&mut tsm, TaskState::Completed, LlmRole::Reviewer, "loop budget exhausted with passing verification");
                         } else {
-                            let _ = tsm.transition(TaskState::Failed, LlmRole::System, "loop budget exhausted");
+                            self.transition(&mut tsm, TaskState::Failed, LlmRole::System, "loop budget exhausted");
                         }
                         if let Some(store) = &self.session {
                             let _ = store.set_kv(sid, "task_state", &tsm.serialize());
