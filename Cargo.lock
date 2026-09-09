@@ -52,6 +52,7 @@ dependencies = [
  "aether-models",
  "aether-permissions",
  "aether-plugin",
+ "aether-runtime",
  "aether-sessions",
  "aether-skills",
  "aether-tools",
@@ -108,6 +109,7 @@ dependencies = [
  "aether-models",
  "aether-permissions",
  "aether-plugin",
+ "aether-runtime",
  "aether-sessions",
  "aether-skills",
  "aether-tools",
@@ -261,6 +263,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aether-runtime"
+version = "0.28.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml 0.8.2",
+]
+
+[[package]]
 name = "aether-sessions"
 version = "0.28.0"
 dependencies = [
@@ -289,6 +304,7 @@ dependencies = [
  "aether-analysis",
  "aether-models",
  "aether-permissions",
+ "aether-runtime",
  "anyhow",
  "async-trait",
  "chrono",

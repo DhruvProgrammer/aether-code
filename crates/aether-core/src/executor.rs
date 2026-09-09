@@ -40,6 +40,13 @@ pub struct Executor {
     pub(crate) runtime_events: Option<Arc<dyn Fn(crate::task_state::TaskEventKind) + Send + Sync>>,
     /// Task id used for runtime event correlation.
     pub(crate) task_id: Option<String>,
+    /// Plugin host for tool-seam interception (visibility, pre/post
+    /// waterfalls, guards, result events). `None` = legacy direct
+    /// path, byte-identical to pre-seam behavior.
+    pub(crate) plugin_host: Option<Arc<aether_runtime::PluginHost>>,
+    /// Scope key the tool seam resolves visibility against (one per
+    /// session; minted by the host in `run_task`).
+    pub(crate) tool_scope: aether_runtime::ScopeKey,
 }
 
 impl Executor {
@@ -75,6 +82,8 @@ impl Executor {
             compactor: None,
             runtime_events: None,
             task_id: None,
+            plugin_host: None,
+            tool_scope: aether_runtime::ScopeKey::GLOBAL,
         }
     }
 
@@ -82,6 +91,22 @@ impl Executor {
     pub fn with_permission_engine(mut self, e: Arc<aether_permissions::PermissionEngine>) -> Self { self.permission_engine = Some(e); self }
     pub fn with_context_manager(mut self, c: Arc<aether_context::ContextManager>) -> Self { self.context_manager = Some(c); self }
     pub fn with_compactor(mut self, c: Arc<aether_context::SessionCompactor>) -> Self { self.compactor = Some(c); self }
+
+    /// Attach the plugin host: tool calls run through the seam
+    /// (scoped visibility → pre-execute waterfall → policy/guards →
+    /// body → post-execute waterfall → result event). See
+    /// `aether-runtime::tools` for the contract.
+    pub fn with_plugin_host(mut self, host: Arc<aether_runtime::PluginHost>) -> Self {
+        self.plugin_host = Some(host);
+        self
+    }
+
+    /// Scope the seam resolves tool visibility against. Defaults to
+    /// global (no restrictions apply).
+    pub fn with_tool_scope(mut self, scope: aether_runtime::ScopeKey) -> Self {
+        self.tool_scope = scope;
+        self
+    }
 
     /// Inject a typed runtime-event sink (spec §4). Events are best-effort;
     /// a missing sink simply means no events.
@@ -350,6 +375,41 @@ impl Executor {
             }
         }
 
+        // ---- Plugin seam: scoped visibility + pre-execute waterfall ----
+        // A filtered-away tool is indistinguishable from a missing one
+        // (UNKNOWN_TOOL taxonomy at the seam boundary).
+        let seam_exec: Option<aether_runtime::ToolExec> = match &self.plugin_host {
+            None => None,
+            Some(host) => {
+                let chain = aether_runtime::ScopeChain::for_scope(self.tool_scope);
+                if host.inner().tools.resolve(&tc.name, &chain).is_none() {
+                    return Err(ToolError::Other(format!(
+                        "unknown tool: {} (not available in this session)",
+                        tc.name
+                    )));
+                }
+                Some(aether_runtime::ToolExec {
+                    call_id: next_call_id(),
+                    name: tc.name.clone(),
+                    args: tc.arguments.clone(),
+                    scope: self.tool_scope,
+                    cwd: self.cwd.clone(),
+                })
+            }
+        };
+        let mut plugin_ask = false;
+        if let (Some(host), Some(exec)) = (&self.plugin_host, &seam_exec) {
+            match host.inner().tools.pre_check(&host.inner().bus, exec).await {
+                aether_runtime::PreDecision::Allow => {}
+                aether_runtime::PreDecision::Deny { reason } => {
+                    return Err(ToolError::Other(format!("denied by plugin policy: {reason}")));
+                }
+                aether_runtime::PreDecision::Ask { reason: _ } => {
+                    plugin_ask = true;
+                }
+            }
+        }
+
         // Write checkpoint before mutating files (spec §15). Async read so
         // the tokio worker isn't stalled on disk I/O.
         if tc.name == "write_file" {
@@ -403,10 +463,16 @@ impl Executor {
                 self.policy.value_for(category)
             }
         };
-        let effective = match (policy_perm, tool.required_permission()) {
-            (Permission::Deny, _) | (_, Permission::Deny) => Permission::Deny,
-            (Permission::Ask, _) | (Permission::Allow, Permission::Ask) => Permission::Ask,
-            (Permission::Allow, Permission::Allow) => Permission::Allow,
+        let effective = if plugin_ask {
+            // A pre-execute listener asked for user approval: force the
+            // Ask path regardless of static policy.
+            Permission::Ask
+        } else {
+            match (policy_perm, tool.required_permission()) {
+                (Permission::Deny, _) | (_, Permission::Deny) => Permission::Deny,
+                (Permission::Ask, _) | (Permission::Allow, Permission::Ask) => Permission::Ask,
+                (Permission::Allow, Permission::Allow) => Permission::Allow,
+            }
         };
 
         match effective {
@@ -425,8 +491,43 @@ impl Executor {
             Permission::Allow => {}
         }
 
+        // ---- Plugin seam: monotonic deny guards ----
+        // Guards run after static policy approval and can only deny;
+        // nothing here (or in any guard) can re-allow a denial.
+        if let (Some(host), Some(exec)) = (&self.plugin_host, &seam_exec) {
+            if let Some(reason) = host.inner().tools.check_guards(exec) {
+                return Err(ToolError::Other(format!("denied by guard: {reason}")));
+            }
+        }
+
         let ctx = ToolContext { cwd: self.cwd.clone() };
-        let res = tool.execute(tc.arguments.clone(), &ctx).await;
+        let mut res = tool.execute(tc.arguments.clone(), &ctx).await;
+
+        // ---- Plugin seam: post-execute waterfall + result event ----
+        // Post runs before session persistence so the log records what
+        // the model actually sees (model-visible ⟺ logged).
+        if let (Some(host), Some(exec)) = (&self.plugin_host, &seam_exec) {
+            let tools = &host.inner().tools;
+            if let Ok(r) = &res {
+                let output = serde_json::json!({
+                    "output": r.output,
+                    "is_error": r.is_error,
+                });
+                match tools.post_check(&host.inner().bus, exec, &output).await {
+                    aether_runtime::PostDecision::Accept { content_override: None } => {}
+                    aether_runtime::PostDecision::Accept {
+                        content_override: Some(text),
+                    } => {
+                        res = Ok(ToolResult { output: text, is_error: false });
+                    }
+                    aether_runtime::PostDecision::Block { feedback } => {
+                        res = Ok(ToolResult { output: feedback, is_error: true });
+                    }
+                }
+            }
+            let ok = matches!(&res, Ok(r) if !r.is_error);
+            tools.emit_result(&host.inner().bus, exec, ok).await;
+        }
 
         if let Some(store) = &self.session {
             let args = aether_models::redact_secrets(&tc.arguments.to_string());
@@ -442,6 +543,13 @@ impl Executor {
 
 fn estimate_tokens(msgs: &[Message]) -> usize {
     msgs.iter().map(|m| m.content.chars().count() / 4 + 16).sum()
+}
+
+/// Monotonic tool-call ids for pairing seam pre/post/result events.
+fn next_call_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("tool-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Classify a provider error as a context-overflow failure. Used to trigger
@@ -540,8 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_compact_keeps_system_and_recent() {
-        let mut msgs = vec![Message {
+    fn legacy_compact_keeps_system_and_recent() {        let mut msgs = vec![Message {
             role: "system".into(),
             content: "SYS".into(),
             ..Default::default()
@@ -556,5 +663,185 @@ mod tests {
         let out = compact_messages(msgs, 500);
         assert_eq!(out[0].role, "system");
         assert!(out.len() <= 12);
+    }
+}
+
+
+#[cfg(test)]
+mod seam_tests {
+    //! Tool-seam integration: the real `ToolService` + real bus drive
+    //! `execute_tool` through visibility ? pre ? guard ? body ? post.
+    use super::*;
+    use aether_runtime::{
+        BoxFuture, ListenerCb, Next, PluginHost, ScopeFilter, ask_value, block_value, deny_value,
+    };
+
+    struct StubTool {
+        calls: Arc<std::sync::Mutex<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StubTool {
+        fn name(&self) -> &str {
+            "stub_read"
+        }
+        fn description(&self) -> &str {
+            "stub read-category tool for seam tests"
+        }
+        fn json_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn category(&self) -> &'static str {
+            "read"
+        }
+        fn required_permission(&self) -> Permission {
+            Permission::Allow
+        }
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(ToolResult { output: "stub-ok".into(), is_error: false })
+        }
+    }
+
+    fn harness() -> (Executor, Arc<PluginHost>, Arc<std::sync::Mutex<u32>>) {
+        let calls = Arc::new(std::sync::Mutex::new(0u32));
+        let tool: Arc<dyn Tool> = Arc::new(StubTool { calls: calls.clone() });
+        let mut tools = HashMap::new();
+        tools.insert("stub_read".to_string(), tool.clone());
+        let host = Arc::new(PluginHost::new());
+        host.inner().tools.register(aether_tools::plugins::adapt(tool, "test"));
+        let executor = Executor::new(
+            Arc::new(crate::testing::MockProvider::new(vec![])),
+            "mock".into(),
+            tools,
+            Policy::default(),
+            PathBuf::from("/tmp"),
+            4,
+            8000,
+            None,
+            "sess".into(),
+            "sys".into(),
+            None,
+        )
+        .with_plugin_host(host.clone());
+        (executor, host, calls)
+    }
+
+    fn call() -> ToolCall {
+        ToolCall { id: "t1".into(), name: "stub_read".into(), arguments: serde_json::json!({}) }
+    }
+
+    /// Fixed-decision listener for one tool, delegating otherwise.
+    fn decide(tool_name: &'static str, decision: Value) -> ListenerCb {
+        Arc::new(move |v: Value, next: Next| {
+            let decision = decision.clone();
+            let fut = async move {
+                if v.get("tool").and_then(|t| t.as_str()) == Some(tool_name) {
+                    decision
+                } else {
+                    next.proceed(v).await
+                }
+            };
+            Box::pin(fut) as BoxFuture<'static, Value>
+        })
+    }
+
+    #[tokio::test]
+    async fn seam_allows_and_emits_result_by_default() {
+        let (ex, host, calls) = harness();
+        let seen: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen2 = seen.clone();
+        let observer: ListenerCb = Arc::new(move |v: Value, _n: Next| {
+            let seen2 = seen2.clone();
+            let fut = async move {
+                seen2.lock().unwrap().push(v["ok"].as_bool().unwrap());
+                v
+            };
+            Box::pin(fut) as BoxFuture<'static, Value>
+        });
+        let (_h, _e) = host.inner().bus.on("tools/result", ScopeFilter::All, observer);
+        let res = ex.execute_tool(&call()).await.unwrap();
+        assert_eq!(res.output, "stub-ok");
+        assert!(!res.is_error);
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(*seen.lock().unwrap(), vec![true]);
+    }
+
+    #[tokio::test]
+    async fn seam_restriction_hides_tool_as_unknown() {
+        let (ex, host, calls) = harness();
+        host.inner().tools.restrict(
+            aether_runtime::ScopeKey::GLOBAL,
+            aether_runtime::ToolRestriction::deny(["stub_read".to_string()]),
+        );
+        let err = ex.execute_tool(&call()).await.unwrap_err();
+        assert!(err.to_string().contains("not available in this session"), "{err}");
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn seam_pre_deny_blocks_before_body() {
+        let (ex, host, calls) = harness();
+        let (_h, _e) = host.inner().bus.on(
+            "tools/pre-execute",
+            ScopeFilter::All,
+            decide("stub_read", deny_value("policy says no")),
+        );
+        let err = ex.execute_tool(&call()).await.unwrap_err();
+        assert!(err.to_string().contains("denied by plugin policy"), "{err}");
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn seam_pre_ask_forces_approval_path() {
+        // Ask overrides the static Allow policy; with no TTY under
+        // `cargo test`, non-bash Ask resolves to user-deny.
+        assert!(!std::io::stdin().is_terminal());
+        let (ex, host, calls) = harness();
+        let (_h, _e) = host.inner().bus.on(
+            "tools/pre-execute",
+            ScopeFilter::All,
+            decide("stub_read", ask_value("human please")),
+        );
+        let err = ex.execute_tool(&call()).await.unwrap_err();
+        assert!(err.to_string().contains("permission denied by user"), "{err}");
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn seam_guard_denies_after_policy() {
+        let (ex, host, calls) = harness();
+        host.inner().tools.guard(
+            "test-guard",
+            Arc::new(|e: &aether_runtime::ToolExec| {
+                (e.name == "stub_read").then(|| "guard says no".to_string())
+            }),
+        );
+        let err = ex.execute_tool(&call()).await.unwrap_err();
+        assert!(err.to_string().contains("denied by guard"), "{err}");
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn seam_post_block_converts_success_to_error_output() {
+        let (ex, host, calls) = harness();
+        let (_h, _e) = host.inner().bus.on(
+            "tools/post-execute",
+            ScopeFilter::All,
+            decide("stub_read", block_value("scrubbed by policy")),
+        );
+        let res = ex.execute_tool(&call()).await.unwrap();
+        assert!(res.is_error);
+        assert_eq!(res.output, "scrubbed by policy");
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_path_untouched_without_host() {
+        let (mut ex, _host, calls) = harness();
+        ex.plugin_host = None;
+        let res = ex.execute_tool(&call()).await.unwrap();
+        assert_eq!(res.output, "stub-ok");
+        assert_eq!(*calls.lock().unwrap(), 1);
     }
 }

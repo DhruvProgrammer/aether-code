@@ -89,6 +89,12 @@ pub struct Agent {
     /// the coder system prompt is compiled via PromptCompiler within the
     /// executor's context budget; otherwise the legacy static prompt is used.
     skill_index: Option<Arc<aether_skills::SkillIndex>>,
+    // ---- plugin runtime (DeepSeek-Harness port, P0) ----
+    /// Plugin host for tool-seam interception. `None` = legacy direct
+    /// path everywhere. Threaded into every `Executor` this loop builds.
+    plugin_host: Option<Arc<aether_runtime::PluginHost>>,
+    /// Scope key tool visibility resolves against (one per session).
+    tool_scope: aether_runtime::ScopeKey,
 }
 
 impl Agent {
@@ -147,6 +153,8 @@ impl Agent {
             task_event_sink: None,
             memory_manager: Arc::new(aether_mind::memory::MemoryManager::new()),
             skill_index: None,
+            plugin_host: None,
+            tool_scope: aether_runtime::ScopeKey::GLOBAL,
         }
     }
 
@@ -206,6 +214,21 @@ impl Agent {
     /// Inject a skill index for dynamic per-task skill loading.
     pub fn with_skill_index(mut self, idx: Arc<aether_skills::SkillIndex>) -> Self {
         self.skill_index = Some(idx);
+        self
+    }
+
+    /// Attach the plugin host: every `Executor` this loop builds runs
+    /// tool calls through the seam (visibility → pre → guard → body →
+    /// post → result). `None` (default) keeps the legacy direct path.
+    pub fn with_plugin_host(mut self, host: Arc<aether_runtime::PluginHost>) -> Self {
+        self.plugin_host = Some(host);
+        self
+    }
+
+    /// Scope key the tool seam resolves visibility against. Mint one
+    /// per session via `PluginHost::mint_scope`.
+    pub fn with_tool_scope(mut self, scope: aether_runtime::ScopeKey) -> Self {
+        self.tool_scope = scope;
         self
     }
 
@@ -517,6 +540,11 @@ impl Agent {
             None,
         )
         .with_agent_id("coder");
+        if let Some(host) = &self.plugin_host {
+            coder = coder
+                .with_plugin_host(host.clone())
+                .with_tool_scope(self.tool_scope);
+        }
         if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
         if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
         if let Some(cp) = &self.compactor { coder = coder.with_compactor(cp.clone()); }
@@ -1190,6 +1218,11 @@ impl CorrectionExecutor for Agent {
             None,
         )
         .with_agent_id("correction-coder");
+        if let Some(host) = &self.plugin_host {
+            coder = coder
+                .with_plugin_host(host.clone())
+                .with_tool_scope(self.tool_scope);
+        }
         if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
         if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
         if let Some(cp) = &self.compactor { coder = coder.with_compactor(cp.clone()); }

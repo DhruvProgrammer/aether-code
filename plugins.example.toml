@@ -1,0 +1,33 @@
+# AETHER plugin composition — user layer example.
+#
+# Copy to ~/.aether/plugins.toml and uncomment rows to use.
+# Layer order: bundled base → ~/.aether/plugins.toml → --plugin-patch overlays.
+# A row whose `id` matches an earlier row REPLACES the whole row
+# (config is NOT merged). A brand-new id appends with a warning.
+# Run `aether --dump-plugins` to preview the effective composition.
+
+# Disable the terminal group on this machine:
+# [[plugin]]
+# id = "tools-terminal"
+# plugin = "builtin:tools-terminal"
+# disabled = true
+
+# Gate a row on the OS:
+# [[plugin]]
+# id = "tools-mcp"
+# plugin = "builtin:tools-mcp"
+# only_os = "windows"
+
+# Gate a row on environment variables (skipped with reason when absent):
+# [[plugin]]
+# id = "tools-analysis"
+# plugin = "builtin:tools-analysis"
+# requires_env = ["AETHER_ENABLE_ANALYSIS"]
+
+# Restate a row with config (whole-row replace — include every key):
+# [[plugin]]
+# id = "tools-fs"
+# plugin = "builtin:tools-fs"
+#
+# [plugin.config]
+# note = "reserved for future tool options; unknown keys warn, never fail"

@@ -51,6 +51,13 @@ pub struct Cli {
     pub config: Option<PathBuf>,
     #[arg(long)]
     pub tui: bool,
+    /// Plugin composition overlay files (`[[plugin]]` TOML rows,
+    /// applied after the user file). Repeatable.
+    #[arg(long = "plugin-patch")]
+    pub plugin_patch: Vec<PathBuf>,
+    /// Print the effective plugin composition (with provenance) and exit.
+    #[arg(long = "dump-plugins")]
+    pub dump_plugins: bool,
 }
 
 impl Cli {
@@ -70,6 +77,8 @@ impl Cli {
             session_id: self.session_id.clone(),
             config: self.config.clone(),
             tui: self.tui,
+            plugin_patch: self.plugin_patch.clone(),
+            dump_plugins: self.dump_plugins,
             ..Default::default()
         }
     }
@@ -98,6 +107,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     if cli.tui
         || (interactive
             && !has_task
+            && !cli.dump_plugins
             && cli.background.is_none()
             && cli.resume.is_none()
             && cli.rollback.is_none()

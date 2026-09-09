@@ -20,6 +20,7 @@ Every crate is justified. No "might be useful later". (spec §30)
 | `chrono` | aether-sessions | RFC3339 timestamps for log rows |
 | `redb` | aether-mind | Embedded graph + kv + vector store (Phase 3, spec §9) |
 | `aether-mind` | aether-core, aether-cli | Memory engine + skills + context discovery |
+| `aether-runtime` | aether-tools, aether-core, aether-cli | Plugin runtime: services, mode-tagged bus, tool seam, TOML composition (DeepSeek-Harness port). Deps only: serde/serde_json/toml/thiserror/anyhow/async-trait/tokio (all already above) — no new external crates |
 
 **Rejected for v1:** `ratatui` (replaced by a dependency-free ANSI styling layer in
 `aether-cli/src/ui.rs` wired to `docs/design.md` tokens — keeps the binary light and the GNU-only

@@ -44,6 +44,11 @@ pub struct RunOptions {
     pub role_assignments: Option<aether_config::RoleAssignments>,
     /// v0.17: workspace folder to run the task in (sets the agent cwd).
     pub workspace_path: Option<PathBuf>,
+    /// Plugin composition overlays (`[[plugin]]` TOML rows, applied after
+    /// the user file). Same id replaces the whole row; new ids append.
+    pub plugin_patch: Vec<PathBuf>,
+    /// Print the effective plugin composition (with provenance) and exit.
+    pub dump_plugins: bool,
 }
 
 impl Default for RunOptions {
@@ -66,6 +71,8 @@ impl Default for RunOptions {
             providers: None,
             role_assignments: None,
             workspace_path: None,
+            plugin_patch: Vec::new(),
+            dump_plugins: false,
         }
     }
 }
@@ -106,6 +113,25 @@ pub async fn run(
     // no visible console window.
     if let Some(task) = &opts.background {
         return run_background(opts.clone(), task, &cfg_path, &cancel, &sink).await;
+    }
+
+    // Composition preview: no config, gateway, or model needed.
+    if opts.dump_plugins {
+        match load_composition(&opts.plugin_patch) {
+            Ok(layers) => {
+                let composition = aether_runtime::compose(
+                    aether_tools::plugins::base_profile(),
+                    layers,
+                );
+                print!("{}", aether_runtime::dump(&composition));
+                return Ok(());
+            }
+            Err(e) => {
+                (sink)(TaskEvent::Error { message: format!("{e}") });
+                (sink)(TaskEvent::Exit { code: 1, success: false });
+                return Ok(());
+            }
+        }
     }
 
     let mut cfg = match aether_config::Config::load(opts.config.clone()) {
@@ -253,36 +279,109 @@ pub async fn run(
     memory_manager.add_provider(Arc::new(BuiltinMemoryProvider));
 
     let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
-    for tool in aether_tools::default_tools() {
-        tools.insert(tool.name().to_string(), tool);
-    }
-    for t in aether_tools::analysis::analysis_tools() {
-        tools.insert(t.name().to_string(), t);
-    }
-    if let Some(m) = &mind {
-        for t in aether_mind::tools::memory_tools(m.clone(), embedder.clone()) {
-            tools.insert(t.name().to_string(), t);
+    // ---- Plugin-first tool composition (DeepSeek-Harness port, P0) ----
+    // Every tool group enters through a composition row that a plugin
+    // activates; the same groups feed the legacy executor map during
+    // the P0 transition (P1 resolves the executor through the seam).
+    // Layer order: bundled base → ~/.aether/plugins.toml → overlays.
+    // A group with nothing to contribute (memory store down, no MCP
+    // servers) still boots its row with zero tools, so `--dump-plugins`
+    // always matches boot. Failures are loud: no silent partial sets.
+    let plugin_host = Arc::new(aether_runtime::PluginHost::new());
+    let tool_scope = plugin_host.mint_scope();
+    let mut tool_plugins: Vec<Arc<aether_tools::plugins::ToolPlugin>> = Vec::new();
+    {
+        use aether_tools::plugins::ToolPlugin;
+        // Prebuilt groups use today's constructors (construction is
+        // unchanged — only registration moves behind rows).
+        let mut mcp_tools: Vec<Arc<dyn Tool>> = Vec::new();
+        for srv in &cfg.mcp.servers {
+            match aether_tools::mcp::McpClient::connect(&srv.command, &srv.args).await {
+                Ok(client) => match client.list_tools().await {
+                    Ok(infos) => {
+                        for info in infos {
+                            let t: Arc<dyn Tool> = Arc::new(
+                                aether_tools::mcp::McpTool::from_info(client.clone(), info),
+                            );
+                            mcp_tools.push(t);
+                        }
+                        emit(&sink, "stdout", &format!("connected to MCP server '{}'", srv.name));
+                    }
+                    Err(e) => emit(&sink, "stderr", &format!("mcp '{}' list failed: {e}", srv.name)),
+                },
+                Err(e) => emit(&sink, "stderr", &format!("mcp '{}' connect failed: {e}", srv.name)),
+            }
+        }
+        let groups: Vec<Arc<ToolPlugin>> = vec![
+            Arc::new(ToolPlugin::fs()),
+            Arc::new(ToolPlugin::git()),
+            Arc::new(ToolPlugin::terminal()),
+            Arc::new(ToolPlugin::analysis()),
+            Arc::new(ToolPlugin::prebuilt(
+                "tools-memory",
+                "Memory tools",
+                "mind recall/store tools",
+                match &mind {
+                    Some(m) => aether_mind::tools::memory_tools(m.clone(), embedder.clone()),
+                    None => Vec::new(),
+                },
+            )),
+            Arc::new(ToolPlugin::prebuilt(
+                "tools-skills",
+                "Skill tools",
+                "skill lookup tools",
+                aether_mind::tools::skill_tools(skills.clone()),
+            )),
+            Arc::new(ToolPlugin::prebuilt("tools-mcp", "MCP tools", "bridged MCP server tools", mcp_tools)),
+        ];
+        let factories: HashMap<&str, &'static str> = [
+            ("tools-fs", aether_tools::plugins::FACTORY_FS),
+            ("tools-git", aether_tools::plugins::FACTORY_GIT),
+            ("tools-terminal", aether_tools::plugins::FACTORY_TERMINAL),
+            ("tools-analysis", aether_tools::plugins::FACTORY_ANALYSIS),
+            ("tools-memory", aether_tools::plugins::FACTORY_MEMORY),
+            ("tools-skills", aether_tools::plugins::FACTORY_SKILLS),
+            ("tools-mcp", aether_tools::plugins::FACTORY_MCP),
+        ]
+        .into_iter()
+        .collect();
+        for plugin in groups {
+            let factory = factories[plugin.id()];
+            let p = plugin.clone();
+            plugin_host.register_factory(factory, Box::new(move || p.clone()));
+            tool_plugins.push(plugin);
         }
     }
-    for t in aether_mind::tools::skill_tools(skills.clone()) {
-        tools.insert(t.name().to_string(), t);
+    let base_rows: Vec<aether_runtime::Row> = aether_tools::plugins::base_profile();
+    let layers = match load_composition(&opts.plugin_patch) {
+        Ok(layers) => layers,
+        Err(e) => {
+            emit(&sink, "stderr", &format!("{e}"));
+            (sink)(TaskEvent::Exit { code: 1, success: false });
+            return Ok(());
+        }
+    };
+    let composition = aether_runtime::compose(base_rows, layers);
+    let boot_report = match plugin_host.boot(composition).await {
+        Ok(report) => report,
+        Err(e) => {
+            emit(&sink, "stderr", &format!("plugin boot failed: {e}"));
+            (sink)(TaskEvent::Exit { code: 1, success: false });
+            return Ok(());
+        }
+    };
+    if opts.debug {
+        emit(&sink, "stdout", &format!("plugins: {} activated", boot_report.activated.join(", ")));
+        for (id, reason) in &boot_report.skipped {
+            emit(&sink, "stdout", &format!("plugins: row '{id}' skipped ({reason})"));
+        }
+        for w in &boot_report.warnings {
+            emit(&sink, "stdout", &format!("plugins: warn {w}"));
+        }
     }
-
-    // MCP client (best-effort).
-    for srv in &cfg.mcp.servers {
-        match aether_tools::mcp::McpClient::connect(&srv.command, &srv.args).await {
-            Ok(client) => match client.list_tools().await {
-                Ok(infos) => {
-                    for info in infos {
-                        let t: Arc<dyn Tool> =
-                            Arc::new(aether_tools::mcp::McpTool::from_info(client.clone(), info));
-                        tools.insert(t.name().to_string(), t);
-                    }
-                    emit(&sink, "stdout", &format!("connected to MCP server '{}'", srv.name));
-                }
-                Err(e) => emit(&sink, "stderr", &format!("mcp '{}' list failed: {e}", srv.name)),
-            },
-            Err(e) => emit(&sink, "stderr", &format!("mcp '{}' connect failed: {e}", srv.name)),
+    for plugin in &tool_plugins {
+        for tool in plugin.registered() {
+            tools.insert(tool.name().to_string(), tool);
         }
     }
     let subagent_tools = tools;
@@ -442,6 +541,8 @@ pub async fn run(
         })
     })
     .with_memory_manager(memory_manager.clone())
+    .with_plugin_host(plugin_host)
+    .with_tool_scope(tool_scope)
     .with_cancel(cancel);
 
     // Skill wiring: builders consume self, so re-wrap when an index exists.
@@ -639,8 +740,70 @@ async fn run_background(
     Ok(())
 }
 
-fn make_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
-    // Reuse the CLI's worktree setup.
+/// Load patch layers for plugin composition: the user file
+/// (`~/.aether/plugins.toml`, example created on first boot) then
+/// `--plugin-patch` overlays in order. Pure file IO — no host needed,
+/// so `--dump-plugins` works without any model configured.
+fn load_composition(
+    patches: &[PathBuf],
+) -> anyhow::Result<Vec<(aether_runtime::Origin, Vec<aether_runtime::Row>)>> {
+    let user_file = aether_config::Config::default_dir().join("plugins.toml");
+    ensure_example_plugins_file(&user_file);
+    let mut layers = Vec::new();
+    if user_file.exists() {
+        let text = std::fs::read_to_string(&user_file)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", user_file.display()))?;
+        let rows = aether_runtime::compose::parse_file(&text)
+            .map_err(|e| anyhow::anyhow!("cannot parse {}: {e}", user_file.display()))?;
+        layers.push((aether_runtime::Origin::UserFile, rows));
+    }
+    for (i, path) in patches.iter().enumerate() {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        let rows = aether_runtime::compose::parse_file(&text)
+            .map_err(|e| anyhow::anyhow!("cannot parse {}: {e}", path.display()))?;
+        layers.push((aether_runtime::Origin::Overlay(i as u16), rows));
+    }
+    Ok(layers)
+}
+
+/// Write a commented `plugins.toml` example on first boot when the user
+/// file is missing. Best-effort and never overwrites: an existing file
+/// (even an empty one) is left alone.
+fn ensure_example_plugins_file(path: &Path) {
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, EXAMPLE_PLUGINS_TOML);
+}
+
+/// Commented user-layer example (also shipped as `plugins.example.toml`).
+const EXAMPLE_PLUGINS_TOML: &str = r#"# AETHER plugin composition - user layer.
+# Layer order: bundled base -> this file -> --plugin-patch overlays.
+# A row whose `id` matches an earlier row REPLACES the whole row
+# (config is NOT merged). A brand-new id appends. Run
+# `aether --dump-plugins` to preview the effective composition.
+#
+# Examples (uncomment to use):
+#
+# Disable the terminal group for this machine:
+# [[plugin]]
+# id = "tools-terminal"
+# plugin = "builtin:tools-terminal"
+# disabled = true
+#
+# Gate a row on the OS or environment:
+# [[plugin]]
+# id = "tools-mcp"
+# plugin = "builtin:tools-mcp"
+# only_os = "windows"
+# requires_env = ["AETHER_ENABLE_MCP"]
+"#;
+
+fn make_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {    // Reuse the CLI's worktree setup.
     let id = uuid::Uuid::new_v4().simple().to_string();
     let branch = format!("aether-{id}");
     let path = cwd.parent().unwrap_or(cwd).join(format!(

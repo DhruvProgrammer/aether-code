@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod analysis;
+pub mod plugins;
 pub mod registry;
 pub mod workspace;
 pub struct ToolContext {

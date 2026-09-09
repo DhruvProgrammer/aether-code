@@ -8,6 +8,7 @@ license.workspace = true
 aether-permissions = { path = "../aether-permissions" }
 aether-analysis = { path = "../aether-analysis" }
 aether-models = { path = "../aether-models" }
+aether-runtime = { path = "../aether-runtime" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"

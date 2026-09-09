@@ -15,6 +15,7 @@ aether-context = { path = "../aether-context" }
 aether-evidence = { path = "../aether-evidence" }
 aether-plugin = { path = "../aether-plugin" }
 aether-skills = { path = "../aether-skills" }
+aether-runtime = { path = "../aether-runtime" }
 async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"

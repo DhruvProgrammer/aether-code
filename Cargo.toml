@@ -19,6 +19,7 @@ members = [
     "crates/aether-workspace",
     "crates/aether-changes",
     "crates/aether-skills",
+    "crates/aether-runtime",
 ]
 
 [workspace.package]
