@@ -130,6 +130,7 @@ Only LLM 3 may conclude task completion, and only with actual verification evide
 - Bounded repair and replan limits
 - Multi-agent verification pipeline (Tester, Reviewer, Security Reviewer)
 - Loop engineering circuit breaker (stagnation detection, confidence tracking, budget enforcement)
+- Dynamic skill loading — relevant engineering guidance retrieved per task (measured 89% fewer prompt tokens vs loading the full skill)
 
 ### Context & Sessions
 
@@ -155,7 +156,7 @@ Only LLM 3 may conclude task completion, and only with actual verification evide
 
 - Provider registry — register any OpenAI-compatible provider with multiple models (provider owns connection, model owns identity)
 - Per-session role assignment — bind different providers/models per role per session
-- Skills system — auto-discovered instruction files
+- Dynamic skill system — 27-section engineering skill with keyword retrieval, dependencies, and compact forms (see below)
 - Plugin hooks (session start/end, agent spawn/complete)
 - Custom subagent definitions via TOML
 - MCP tool integration
@@ -168,6 +169,7 @@ Only LLM 3 may conclude task completion, and only with actual verification evide
 - Workspace boundaries
 - Credentials isolated per provider (env var or raw key, never in logs/events, fingerprint gates validation)
 - Secret sanitization in analysis output
+- Prompt-injection scanning for project context files (AGENTS.md, README) before they enter prompts
 
 ---
 
@@ -232,6 +234,24 @@ Session selects:
 - No duplication of Base URL or API key per model.
 - Model ID vs Display Name are separate; API uses `model` field, UI shows display name.
 - Validation is truthful: Base URL → Connectivity (`GET /models`) → Authentication (real bearer) → Model availability → API response (`POST /chat/completions` via same gateway as chat). `Can save` is not conflated with `health`.
+
+---
+
+## Dynamic Skills & Token-Efficient Prompts
+
+AETHER ships a 27-section software-engineering skill (process, testing, security, architecture, review discipline) but never pastes it whole into the prompt. A deterministic retriever selects only relevant sections per task:
+
+```
+User: "Fix an authentication bug."
+  → loads: core, implementation, testing, security, errors (≈713 tokens)
+  → skips: database, ADR, observability, PRD, documentation
+```
+
+- **Small permanent kernel** (~500 tokens): identity, instruction hierarchy, evidence rules, security. Detailed procedures stay external.
+- **Compact section forms**: same rules at a fraction of the cost; full text loads on demand.
+- **Explicit references**: `@software-engineering/testing` forces a section; dependencies resolve automatically.
+- **Budgeted compiler**: fixed ordering (system → role → skills → workspace → memory → references → checkpoint → recent → request) compiled within the configured model's limit, with a per-category token breakdown for debugging.
+- **Measured**: 6,256 tokens (full skill) → 713 tokens (dynamic) for a typical bug-fix task — **89% reduction**.
 
 ---
 
@@ -433,6 +453,7 @@ AETHER
 ├── Permission Engine (aether-permissions)
 ├── Model Gateway (explicit role bindings)
 ├── Evidence Engine (aether-evidence)
+├── Skill Retriever + Prompt Compiler (aether-skills, token-budgeted)
 ├── Persistent Memory (graph + vector + kv + skills, aether-mind)
 ├── Plugin System (aether-plugin)
 └── Snapshot Manager
@@ -462,9 +483,10 @@ aether/
 │   ├── aether-plugin/      # Plugin registry
 │   ├── aether-analysis/    # SonarQube
 │   └── aether-registry/    # Provider health checks
+│   └── aether-skills/      # Dynamic skill retrieval + prompt compiler
 ├── packages/app/           # Desktop frontend (TypeScript + Vite)
 ├── agents/                 # Subagent TOML definitions
-├── skills/                 # Bundled skill files
+├── skills/                 # Bundled skills (software-engineering: 27 modules + index)
 └── assets/                 # Images
 ```
 
@@ -502,12 +524,14 @@ cargo tauri dev --config crates/aether-desktop/tauri.conf.json
 - Context compaction and serialization roundtrip
 - Provider validation (fingerprint, error classification, secret redaction)
 - Realtime changes: file create/modify/delete/rename, Git modified/untracked/deleted, non-Git fallback, watcher debouncing, session isolation
+- Dynamic skills: retrieval targeting, dependency order, compact-vs-full cost, budget reduction, prompt ordering
 - Gateway behavior (no routing, role isolation)
 - Sidebar collapse/persistence, chat error handling (no-model, invalid key, network, timeout)
 
 ```bash
 cargo test --workspace   # all tests
 cargo test -p aether-changes # realtime changes 10 tests
+cargo test -p aether-skills  # skill retrieval + compiler 19 tests
 ```
 
 ---
@@ -524,6 +548,8 @@ cargo test -p aether-changes # realtime changes 10 tests
 - Workspace-based sessions with collapsible sidebar (state persists, smooth transition)
 - Chat crash hardening (hello never crashes, all config/network errors are in-app)
 - Context compaction, loop engineering, doom-loop detection, permission engine, MCP, SonarQube, desktop/CLI/TUI
+- Dynamic skill loading with token-budgeted prompt compiler (89% measured reduction)
+- Prompt-injection scanning for project context files
 
 ### In Development
 
@@ -557,6 +583,9 @@ Filesystem watcher → debounce → `git status` + `diff --numstat` → `workspa
 
 ### What is context compaction?
 Structured checkpoint (objective, plan, decisions, tool results) generated by LLM 2, then `system + checkpoint + recent tail` rebuilds context; history never deleted.
+
+### How do skills stay token-efficient?
+The 27-section engineering skill is never pasted whole. A retriever loads only relevant compact sections per task (e.g. an auth bug loads core, testing, security — not database or ADR), compiled within the model's budget. Measured 89% fewer tokens vs full-skill loading.
 
 ---
 
