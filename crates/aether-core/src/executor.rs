@@ -47,6 +47,8 @@ pub struct Executor {
     /// Scope key the tool seam resolves visibility against (one per
     /// session; minted by the host in `run_task`).
     pub(crate) tool_scope: aether_runtime::ScopeKey,
+    /// Cancellation signal for tool execution (Wave 1).
+    pub(crate) cancel: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Executor {
@@ -84,6 +86,7 @@ impl Executor {
             task_id: None,
             plugin_host: None,
             tool_scope: aether_runtime::ScopeKey::GLOBAL,
+            cancel: None,
         }
     }
 
@@ -107,6 +110,8 @@ impl Executor {
         self.tool_scope = scope;
         self
     }
+
+    pub fn with_cancel(mut self, n: Arc<tokio::sync::Notify>) -> Self { self.cancel = Some(n); self }
 
     /// Inject a typed runtime-event sink (spec §4). Events are best-effort;
     /// a missing sink simply means no events.
@@ -500,7 +505,8 @@ impl Executor {
             }
         }
 
-        let ctx = ToolContext { cwd: self.cwd.clone() };
+        let mut ctx = ToolContext::new(self.cwd.clone()).with_timeout(tool.default_timeout()).with_session(self.session_id.clone());
+        if let Some(c) = &self.cancel { ctx = ctx.with_cancel(c.clone()); }
         let mut res = tool.execute(tc.arguments.clone(), &ctx).await;
 
         // ---- Plugin seam: post-execute waterfall + result event ----
@@ -794,9 +800,12 @@ mod seam_tests {
 
     #[tokio::test]
     async fn seam_pre_ask_forces_approval_path() {
-        // Ask overrides the static Allow policy; with no TTY under
-        // `cargo test`, non-bash Ask resolves to user-deny.
-        assert!(!std::io::stdin().is_terminal());
+        // Ask overrides the static Allow policy; with no TTY, non-bash Ask resolves to user-deny.
+        // Guard against TTY-attached runners (e.g. some Windows CI shells) — skip rather than flake.
+        if std::io::stdin().is_terminal() {
+            eprintln!("SKIP seam_pre_ask: stdin is a TTY in this runner");
+            return;
+        }
         let (ex, host, calls) = harness();
         let (_h, _e) = host.inner().bus.on(
             "tools/pre-execute",

@@ -293,7 +293,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx() -> ToolContext {
-        ToolContext { cwd: PathBuf::from(".") }
+        ToolContext::new(PathBuf::from("."))
     }
 
     #[test]

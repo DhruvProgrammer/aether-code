@@ -14,11 +14,28 @@ async fn run_git(ctx: &ToolContext, args: &[&str]) -> Result<ToolResult, ToolErr
             return Err(ToolError::Other(format!("refusing git argument that looks like an option: {a}")));
         }
     }
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(&ctx.cwd)
-        .output()
-        .await?;
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(&ctx.cwd);
+    let mut child = cmd.kill_on_drop(true).spawn().map_err(ToolError::Io)?;
+    let timeout = ctx.timeout;
+    let output = if let Some(cancel) = ctx.cancel.clone() {
+        tokio::select! {
+            out = child.wait_with_output() => out.map_err(ToolError::Io)?,
+            _ = tokio::time::sleep(timeout) => {
+                return Err(ToolError::Other(format!("git timeout after {}ms: {}", timeout.as_millis(), args.join(" "))));
+            }
+            _ = cancel.notified() => {
+                return Err(ToolError::Other("git cancelled".into()));
+            }
+        }
+    } else {
+        tokio::select! {
+            out = child.wait_with_output() => out.map_err(ToolError::Io)?,
+            _ = tokio::time::sleep(timeout) => {
+                return Err(ToolError::Other(format!("git timeout after {}ms: {}", timeout.as_millis(), args.join(" "))));
+            }
+        }
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let text = format!(

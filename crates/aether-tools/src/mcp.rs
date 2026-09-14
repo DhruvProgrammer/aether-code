@@ -94,7 +94,16 @@ impl McpClient {
             .await
     }
 
+    pub async fn call_tool_with_ctx(&self, name: &str, args: Value, timeout: std::time::Duration, cancel: Option<Arc<tokio::sync::Notify>>) -> anyhow::Result<Value> {
+        self.request_with_ctx("tools/call", serde_json::json!({ "name": name, "arguments": args }), timeout, cancel)
+            .await
+    }
+
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.request_with_ctx(method, params, std::time::Duration::from_secs(30), None).await
+    }
+
+    async fn request_with_ctx(&self, method: &str, params: Value, timeout: std::time::Duration, cancel: Option<Arc<tokio::sync::Notify>>) -> anyhow::Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let req = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         {
@@ -104,22 +113,36 @@ impl McpClient {
             s.write_all(b"\n").await?;
             s.flush().await?;
         }
-        loop {
-            {
-                let mut buf = self.buf.lock().await;
-                if let Some(pos) = buf
-                    .iter()
-                    .position(|v| v.get("id").and_then(|x| x.as_u64()) == Some(id))
+        let recv_fut = async {
+            loop {
                 {
-                    return Ok(buf.remove(pos));
+                    let mut buf = self.buf.lock().await;
+                    if let Some(pos) = buf
+                        .iter()
+                        .position(|v| v.get("id").and_then(|x| x.as_u64()) == Some(id))
+                    {
+                        return Ok::<Value, anyhow::Error>(buf.remove(pos));
+                    }
+                }
+                let mut rx = self.rx.lock().await;
+                let v = rx.recv().await.ok_or_else(|| anyhow!("mcp server closed connection"))?;
+                if v.get("id").and_then(|x| x.as_u64()) == Some(id) {
+                    return Ok(v);
+                } else {
+                    self.buf.lock().await.push(v);
                 }
             }
-            let mut rx = self.rx.lock().await;
-            let v = rx.recv().await.ok_or_else(|| anyhow!("mcp server closed connection"))?;
-            if v.get("id").and_then(|x| x.as_u64()) == Some(id) {
-                return Ok(v);
-            } else {
-                self.buf.lock().await.push(v);
+        };
+        if let Some(c) = cancel {
+            tokio::select! {
+                res = recv_fut => res,
+                _ = tokio::time::sleep(timeout) => Err(anyhow!("mcp timeout after {}ms for {}", timeout.as_millis(), method)),
+                _ = c.notified() => Err(anyhow!("mcp cancelled")),
+            }
+        } else {
+            tokio::select! {
+                res = recv_fut => res,
+                _ = tokio::time::sleep(timeout) => Err(anyhow!("mcp timeout after {}ms for {}", timeout.as_millis(), method)),
             }
         }
     }
@@ -171,10 +194,11 @@ impl Tool for McpTool {
     fn json_schema(&self) -> Value {
         self.schema.clone()
     }
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+    fn default_timeout(&self) -> std::time::Duration { std::time::Duration::from_secs(60) }
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
         let v = self
             .client
-            .call_tool(&self.name, args)
+            .call_tool_with_ctx(&self.name, args, ctx.timeout, ctx.cancel.clone())
             .await
             .map_err(|e| ToolError::Other(e.to_string()))?;
         let content = v

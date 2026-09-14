@@ -56,7 +56,7 @@ pub fn adapt(tool: Arc<dyn Tool>, owner: &str) -> ToolContributor {
         move |args: Value, cwd: PathBuf| -> BoxFuture<'static, Result<Value, ToolFault>> {
             let tool = tool.clone();
             Box::pin(async move {
-                let ctx = crate::ToolContext { cwd };
+                let ctx = crate::ToolContext::new(cwd);
                 match tool.execute(args, &ctx).await {
                     Ok(res) => Ok(serde_json::json!({
                         "output": res.output,

@@ -12,8 +12,26 @@ pub mod analysis;
 pub mod plugins;
 pub mod registry;
 pub mod workspace;
+use std::time::Duration;
+use tokio::sync::Notify;
+
 pub struct ToolContext {
     pub cwd: PathBuf,
+    /// Per-execution timeout. Defaults to 120s for shell, 30s for others if not set.
+    pub timeout: Duration,
+    /// Optional session id for session-scoped tools / diagnostics.
+    pub session_id: Option<String>,
+    /// Cancellation signal — when notified, the tool should abort promptly.
+    pub cancel: Option<Arc<Notify>>,
+}
+
+impl ToolContext {
+    pub fn new(cwd: PathBuf) -> Self {
+        Self { cwd, timeout: Duration::from_secs(30), session_id: None, cancel: None }
+    }
+    pub fn with_timeout(mut self, d: Duration) -> Self { self.timeout = d; self }
+    pub fn with_session(mut self, id: impl Into<String>) -> Self { self.session_id = Some(id.into()); self }
+    pub fn with_cancel(mut self, n: Arc<Notify>) -> Self { self.cancel = Some(n); self }
 }
 
 #[derive(Debug)]
@@ -43,6 +61,8 @@ pub trait Tool: Send + Sync {
     fn category(&self) -> &'static str;
     /// Intrinsic minimum permission the tool requires (combined with policy).
     fn required_permission(&self) -> Permission;
+    /// Default timeout for this tool. Executor may override via ToolContext::timeout.
+    fn default_timeout(&self) -> Duration { Duration::from_secs(30) }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError>;
 }
 
@@ -286,37 +306,60 @@ impl Tool for ExecuteCommandTool {
     fn description(&self) -> &str { "Run a shell command; captures stdout/stderr/exit/duration." }
     fn category(&self) -> &'static str { "bash" }
     fn required_permission(&self) -> Permission { Permission::Allow }
+    fn default_timeout(&self) -> Duration { Duration::from_secs(120) }
     fn json_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
-            "properties": { "command": { "type": "string" } },
+            "properties": { "command": { "type": "string" }, "timeout_ms": { "type": "integer", "description": "Optional timeout in ms (default 120000)" } },
             "required": ["command"]
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
         let command = arg_str(&args, "command").ok_or_else(|| ToolError::Other("missing 'command'".into()))?;
+        let timeout = args.get("timeout_ms").and_then(|v| v.as_u64()).map(Duration::from_millis).unwrap_or(ctx.timeout);
         let (shell, flag) = if cfg!(target_os = "windows") {
             ("cmd", "/C")
         } else {
             ("sh", "-c")
         };
         let start = std::time::Instant::now();
-        let output = tokio::process::Command::new(shell)
-            .arg(flag)
-            .arg(&command)
-            .current_dir(&ctx.cwd)
-            .output()
-            .await?;
+        let mut cmd = tokio::process::Command::new(shell);
+        cmd.arg(flag).arg(&command).current_dir(&ctx.cwd);
+        // Use kill_on_drop to ensure child is terminated on timeout/cancel
+        let mut child = cmd.kill_on_drop(true).spawn().map_err(|e| ToolError::Io(e))?;
+        let output = if let Some(cancel) = ctx.cancel.clone() {
+            tokio::select! {
+                out = child.wait_with_output() => out.map_err(|e| ToolError::Io(e))?,
+                _ = tokio::time::sleep(timeout) => {
+                    return Err(ToolError::Other(format!("tool timeout after {}ms", timeout.as_millis())));
+                }
+                _ = cancel.notified() => {
+                    return Err(ToolError::Other("tool cancelled".into()));
+                }
+            }
+        } else {
+            tokio::select! {
+                out = child.wait_with_output() => out.map_err(|e| ToolError::Io(e))?,
+                _ = tokio::time::sleep(timeout) => {
+                    return Err(ToolError::Other(format!("tool timeout after {}ms", timeout.as_millis())));
+                }
+            }
+        };
         let dur = start.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let text = format!(
+        // Truncate very large outputs to avoid context blowout
+        let mut text = format!(
             "exit={}\nduration_ms={}\n--- stdout ---\n{}\n--- stderr ---\n{}",
             output.status.code().unwrap_or(-1),
             dur.as_millis(),
             stdout,
             stderr
         );
+        if text.len() > 100_000 {
+            text.truncate(100_000);
+            text.push_str("\n[truncated: output too large, 100k cap]");
+        }
         Ok(ToolResult { output: text, is_error: !output.status.success() })
     }
 }
@@ -360,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn write_file_sandbox_rejects_path_traversal() {
         let cwd = tmp_cwd("sandbox");
-        let ctx = ToolContext { cwd: cwd.clone() };
+        let ctx = ToolContext::new(cwd.clone());
         // `..` escape must be rejected.
         let res = WriteFileTool
             .execute(serde_json::json!({ "path": "../escape.txt", "content": "no" }), &ctx)
@@ -376,7 +419,7 @@ mod tests {
     #[tokio::test]
     async fn write_file_accepts_cwd_and_subdir() {
         let cwd = tmp_cwd("sandbox-ok");
-        let ctx = ToolContext { cwd: cwd.clone() };
+        let ctx = ToolContext::new(cwd.clone());
         let res = WriteFileTool
             .execute(serde_json::json!({ "path": "inside.txt", "content": "ok" }), &ctx)
             .await;
@@ -391,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_reports_missing_path() {
         let cwd = tmp_cwd("read");
-        let ctx = ToolContext { cwd };
+        let ctx = ToolContext::new(cwd);
         let res = ReadFileTool
             .execute(serde_json::json!({ "path": "does-not-exist.txt" }), &ctx)
             .await;

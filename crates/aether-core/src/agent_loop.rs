@@ -548,6 +548,7 @@ impl Agent {
         if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
         if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
         if let Some(cp) = &self.compactor { coder = coder.with_compactor(cp.clone()); }
+        if let Some(c) = &self.cancel { coder = coder.with_cancel(c.clone()); }
         {
             let sink2 = self.task_event_sink.clone();
             let tid2 = task_id.clone();
@@ -1226,6 +1227,7 @@ impl CorrectionExecutor for Agent {
         if let Some(pe) = &self.permission_engine { coder = coder.with_permission_engine(pe.clone()); }
         if let Some(cm) = &self.context_manager { coder = coder.with_context_manager(cm.clone()); }
         if let Some(cp) = &self.compactor { coder = coder.with_compactor(cp.clone()); }
+        if let Some(c) = &self.cancel { coder = coder.with_cancel(c.clone()); }
         {
             // Correction executor has no task_id in scope; use the session-scoped id.
             let sink2 = self.task_event_sink.clone();

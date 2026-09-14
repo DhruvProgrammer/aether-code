@@ -111,7 +111,7 @@ async fn handle(
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
             match tools.get(name) {
                 Some(t) => {
-                    let ctx = ToolContext { cwd: cwd.to_path_buf() };
+                    let ctx = ToolContext::new(cwd.to_path_buf());
                     let res = t.execute(args, &ctx).await;
                     let (text, is_error) = match res {
                         Ok(r) => (r.output, r.is_error),
