@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 mod openai;
 pub use openai::OpenAICompatibleProvider;
 
+pub mod retry;
+pub use retry::{RetryConfig, RetryEvent};
+
 pub mod redact;
 pub use redact::redact_secrets;
 

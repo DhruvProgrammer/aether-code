@@ -1,7 +1,8 @@
 //! OpenAI-compatible provider: speaks `/v1/chat/completions` and `/v1/embeddings`.
 
 use super::{
-    CompletionRequest, CompletionResponse, ModelProvider, ProviderError, ToolCall, TokenStream, Usage,
+    CompletionRequest, CompletionResponse, ModelProvider, ProviderError, RetryConfig, RetryEvent,
+    ToolCall, TokenStream, Usage,
 };
 use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream};
@@ -16,6 +17,10 @@ pub struct OpenAICompatibleProvider {
     default_max_tokens: u32,
     headers: Option<Value>,
     extra_body: Option<Value>,
+    retry: RetryConfig,
+    /// Recent retries (capped), so the engine/UI can report "retrying in Xs"
+    /// instead of hanging silently. Mirrors OpenHarness `ApiRetryEvent`.
+    retry_events: std::sync::Mutex<Vec<RetryEvent>>,
 }
 
 impl OpenAICompatibleProvider {
@@ -68,7 +73,100 @@ impl OpenAICompatibleProvider {
             default_max_tokens: 4096,
             headers,
             extra_body,
+            retry: RetryConfig::default(),
+            retry_events: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Override the retry policy (default: 3 retries, 1s base, 30s cap).
+    /// `max_retries = 0` disables retries — every failure surfaces at once.
+    pub fn with_retry(mut self, retry: RetryConfig) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Current retry policy.
+    pub fn retry_config(&self) -> &RetryConfig {
+        &self.retry
+    }
+
+    /// Recent retry events, newest last. Empty when the last call succeeded
+    /// without retrying.
+    pub fn recent_retries(&self) -> Vec<RetryEvent> {
+        self.retry_events
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    fn record_retry(&self, event: RetryEvent) {
+        if let Ok(mut guard) = self.retry_events.lock() {
+            guard.push(event);
+            // Bound memory: long sessions can retry often.
+            const KEEP: usize = 16;
+            if guard.len() > KEEP {
+                let drop = guard.len() - KEEP;
+                guard.drain(..drop);
+            }
+        }
+    }
+
+    /// POST with OpenHarness-style retry: transient statuses and transport
+    /// errors are retried with exponential backoff; auth/client errors and a
+    /// spent budget return immediately. `make` rebuilds the request each
+    /// attempt (builders are single-shot).
+    async fn send_with_retry(
+        &self,
+        make: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let mut attempt: u32 = 0;
+        loop {
+            match make().send().await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        return Ok(resp);
+                    }
+                    let status = resp.status().as_u16();
+                    if !super::retry::is_retryable_status(status)
+                        || attempt >= self.retry.max_retries
+                    {
+                        let txt = resp.text().await.unwrap_or_default();
+                        return Err(ProviderError::ApiStatus { status, body: txt });
+                    }
+                    let retry_after = super::retry::retry_after_from_headers(resp.headers());
+                    let delay = super::retry::retry_delay(attempt, &self.retry, retry_after);
+                    self.record_retry(RetryEvent {
+                        attempt,
+                        max_retries: self.retry.max_retries,
+                        delay,
+                        status: Some(status),
+                        message: format!("HTTP {status}; retrying"),
+                    });
+                    // Body is dropped unread on purpose: the attempt failed and
+                    // must not be parsed as a completion.
+                    drop(resp);
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    if !super::retry::is_retryable_error(&e)
+                        || attempt >= self.retry.max_retries
+                    {
+                        return Err(ProviderError::Http(e));
+                    }
+                    let delay = super::retry::retry_delay(attempt, &self.retry, None);
+                    self.record_retry(RetryEvent {
+                        attempt,
+                        max_retries: self.retry.max_retries,
+                        delay,
+                        status: None,
+                        message: format!("transport error ({e}); retrying"),
+                    });
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
     }
 
     pub fn from_config(cfg: &aether_config::ModelConfig) -> Result<Self, ProviderError> {
@@ -157,20 +255,17 @@ impl ModelProvider for OpenAICompatibleProvider {
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         let body = self.build_body(&req);
+        let url = format!("{}/chat/completions", self.base_url);
         let resp = self
-            .with_headers(
-                self.client
-                    .post(format!("{}/chat/completions", self.base_url))
-                    .bearer_auth(&self.api_key)
-                    .json(&body),
-            )
-            .send()
+            .send_with_retry(|| {
+                self.with_headers(
+                    self.client
+                        .post(url.clone())
+                        .bearer_auth(&self.api_key)
+                        .json(&body),
+                )
+            })
             .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiStatus { status, body: txt });
-        }
         let v: Value = resp.json().await?;
         Ok(parse_completion(&v))
     }
@@ -178,20 +273,17 @@ impl ModelProvider for OpenAICompatibleProvider {
     async fn stream(&self, req: CompletionRequest) -> Result<TokenStream, ProviderError> {
         let mut body = self.build_body(&req);
         body["stream"] = serde_json::Value::Bool(true);
+        let url = format!("{}/chat/completions", self.base_url);
         let resp = self
-            .with_headers(
-                self.client
-                    .post(format!("{}/chat/completions", self.base_url))
-                    .bearer_auth(&self.api_key)
-                    .json(&body),
-            )
-            .send()
+            .send_with_retry(|| {
+                self.with_headers(
+                    self.client
+                        .post(url.clone())
+                        .bearer_auth(&self.api_key)
+                        .json(&body),
+                )
+            })
             .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiStatus { status, body: txt });
-        }
         let bytes = resp.bytes().await?;
         let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<Result<String, ProviderError>> = parse_sse_text(&text);
@@ -201,20 +293,17 @@ impl ModelProvider for OpenAICompatibleProvider {
 
     async fn embeddings(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, ProviderError> {
         let body = serde_json::json!({ "model": self.default_model, "input": input });
+        let url = format!("{}/embeddings", self.base_url);
         let resp = self
-            .with_headers(
-                self.client
-                    .post(format!("{}/embeddings", self.base_url))
-                    .bearer_auth(&self.api_key)
-                    .json(&body),
-            )
-            .send()
+            .send_with_retry(|| {
+                self.with_headers(
+                    self.client
+                        .post(url.clone())
+                        .bearer_auth(&self.api_key)
+                        .json(&body),
+                )
+            })
             .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::ApiStatus { status, body: txt });
-        }
         let v: Value = resp.json().await?;
         let mut out = Vec::new();
         if let Some(arr) = v["data"].as_array() {
@@ -382,5 +471,32 @@ mod tests {
         let huge = format!("data:image/png;base64,{}", "A".repeat(21 * 1024 * 1024));
         let s = sanitize_image_url(&huge);
         assert!(s.len() < 200, "oversized image must be replaced, not echoed");
+    }
+
+    #[test]
+    fn retry_events_capped_for_long_sessions() {
+        let p = test_provider();
+        for i in 0..40 {
+            p.record_retry(RetryEvent {
+                attempt: i,
+                max_retries: 3,
+                delay: std::time::Duration::from_secs(1),
+                status: Some(503),
+                message: "x".into(),
+            });
+        }
+        let evs = p.recent_retries();
+        assert_eq!(evs.len(), 16, "retry history must stay bounded");
+        assert_eq!(evs.last().unwrap().attempt, 39);
+    }
+
+    #[test]
+    fn retry_policy_overridable() {
+        let p = test_provider().with_retry(RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        });
+        assert_eq!(p.retry_config().max_retries, 0);
+        assert!(p.recent_retries().is_empty());
     }
 }

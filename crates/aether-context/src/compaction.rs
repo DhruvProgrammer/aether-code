@@ -134,11 +134,12 @@ impl CompactionEngine {
         let before = state.total_tokens();
         let mut preserved: u32 = 0;
         let mut summarised: u32 = 0;
-        let mut dropped: u32 = 0;
         let mut preservation_map: std::collections::BTreeMap<ContextSegmentKind, (PreservationAction, u32)> =
             std::collections::BTreeMap::new();
 
-        // Pass 1: drop oldest evictable kinds first.
+        // Pass 1: drop oldest evictable kinds first. Count removals by length
+        // delta so `segments_dropped` in the event is real (it was always 0).
+        let segs_before_drop = state.segments.len();
         if matches!(self.strategy, CompactionStrategy::Drop | CompactionStrategy::Hybrid) {
             let kinds = [
                 ContextSegmentKind::Conversation,
@@ -167,6 +168,9 @@ impl CompactionEngine {
                 });
             }
         }
+
+        let dropped: u32 = segs_before_drop
+            .saturating_sub(state.segments.len()) as u32;
 
         // Pass 2: summarise long evictable segments. Synchronous summariser
         // call (the noop/extractive impls are CPU-only; the LLM summariser
@@ -200,6 +204,7 @@ impl CompactionEngine {
                 summarised += 1;
                 PreservationAction::Summarised
             } else {
+                preserved += 1;
                 PreservationAction::Preserved
             };
             preservation_map
@@ -211,6 +216,8 @@ impl CompactionEngine {
             .into_iter()
             .map(|(kind, (action, segments))| PreservationRecord { kind, action, segments })
             .collect();
+        // Every surviving segment is tallied exactly once.
+        debug_assert_eq!(preserved + summarised, state.segments.len() as u32);
 
         let after = state.total_tokens();
         let event = CompactionEvent {
@@ -239,7 +246,6 @@ pub fn estimate_tokens(body: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::NullSink;
     use crate::summarizer::NoopSummarizer;
 
     fn build_state() -> ContextState {

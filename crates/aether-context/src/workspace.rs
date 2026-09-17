@@ -36,7 +36,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::manager::{ContextManager, ContextManagerConfig};
-use crate::state::{ContextSegment, ContextSegmentKind};
+use crate::state::ContextSegmentKind;
 
 /// A segment promoted from an agent into the shared global layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]

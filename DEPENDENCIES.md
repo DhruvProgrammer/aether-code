@@ -11,6 +11,7 @@ Every crate is justified. No "might be useful later". (spec §30)
 | `async-trait` | aether-models, aether-tools | Object-safe `ModelProvider` / `Tool` traits |
 | `futures-util` | aether-models | `BoxStream` for token streaming |
 | `tokio` (process, rt) | aether-tools, aether-cli | Async runtime + safe command execution |
+| `tokio` (time, macros, rt) | aether-models | Async sleep for retry backoff; no new external crate (workspace already uses tokio) |
 | `thiserror` | aether-config, aether-models, aether-tools | Library error types |
 | `anyhow` | aether-core, aether-cli, aether-sessions | Application-level errors |
 | `clap` (derive) | aether-cli | CLI parsing |

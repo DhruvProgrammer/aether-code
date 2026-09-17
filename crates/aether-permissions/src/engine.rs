@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn global_rule_wins_over_default() {
-        let mut e = PermissionEngine::new().with_default(Permission::Ask);
+        let e = PermissionEngine::new().with_default(Permission::Ask);
         e.add_global(Rule::new(Operation::Network, ResourceScope::Host { value: "api.openai.com".into() }, Permission::Allow));
         e.set_approval(Arc::new(DenyAllChannel));
         let rec = e.decide(Operation::Network, &ResourceScope::Host { value: "api.openai.com".into() },
