@@ -11,6 +11,7 @@ members = [
     "crates/aether-cli",
     "crates/aether-sessions",
     "crates/aether-mind",
+    "crates/aether-memory",
     "crates/aether-desktop",
     "crates/aether-plugin",
     "crates/aether-evidence",

@@ -55,3 +55,17 @@ Render task-state (progress/verification/compaction/health) in UI; seam-mapped t
 ## Wave 8 — Acceptance + regression + CI
 
 §28 long-session integration test (mock providers; 18 steps incl. forced compaction→continuation→survival proof); §29 matrix (unit/integration/tsc/vite/build/validation/session-switch/tools/changes/compaction//compact); new CI workflow running cargo test + tsc (repo currently runs none).
+
+## Wave 9 — Context Memory Engine (DOING)
+
+New `aether-memory` crate; arch in `MEMORY_ARCHITECTURE.md` / `MEMORY_SCHEMA.md` /
+`RETRIEVAL_ARCHITECTURE.md` / `MEMORY_EVALUATION.md`.
+
+| Component | Current | Target | Files | Deps | Risks | Tests | Status |
+|---|---|---|---|---|---|---|---|
+| Data model | free-form `Mind` nodes | typed `MemoryRecord` + relations | memory/types.rs | — | over-categorization | schema/type tests | DOING |
+| Store | redb blobs, no FTS | `MemoryStore` trait + SQLite/FTS5 | memory/store.rs | rusqlite (already in tree) | FTS5 availability | crud/search tests | DOING |
+| Extraction | LLM-only, opt-in | rule-based chunker + critical fast-path | memory/extract.rs | — | trivia pollution | boundary/type tests | DOING |
+| Retrieval | once-per-task concat | hybrid + rerank + pack per planning call | memory/retrieve.rs, engine.rs | — | weight tuning | buried-info test | DOING |
+| Integration | static memory string | engine in `Agent::run` + compiler slot | core/agent_loop.rs | memory crate | prompt drift | existing 88 core tests green | TODO |
+| Eval | none | scenario matrix + 100-turn benchmark | memory tests | — | synthetic bias | §48 benchmark | TODO |

@@ -21,6 +21,7 @@ Every crate is justified. No "might be useful later". (spec §30)
 | `chrono` | aether-sessions | RFC3339 timestamps for log rows |
 | `redb` | aether-mind | Embedded graph + kv + vector store (Phase 3, spec §9) |
 | `aether-mind` | aether-core, aether-cli | Memory engine + skills + context discovery |
+| `aether-memory` | aether-core, aether-cli | Wave 9 typed context memory (records/store/retrieval/engine). Deps only: serde/serde_json/rusqlite(already above)/uuid/chrono/thiserror — no new external crates |
 | `aether-runtime` | aether-tools, aether-core, aether-cli | Plugin runtime: services, mode-tagged bus, tool seam, TOML composition (DeepSeek-Harness port). Deps only: serde/serde_json/toml/thiserror/anyhow/async-trait/tokio (all already above) — no new external crates |
 
 **Rejected for v1:** `ratatui` (replaced by a dependency-free ANSI styling layer in

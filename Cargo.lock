@@ -48,6 +48,7 @@ dependencies = [
  "aether-core",
  "aether-evidence",
  "aether-gateway",
+ "aether-memory",
  "aether-mind",
  "aether-models",
  "aether-permissions",
@@ -105,6 +106,7 @@ dependencies = [
  "aether-config",
  "aether-context",
  "aether-evidence",
+ "aether-memory",
  "aether-mind",
  "aether-models",
  "aether-permissions",
@@ -187,6 +189,18 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aether-memory"
+version = "0.29.1"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

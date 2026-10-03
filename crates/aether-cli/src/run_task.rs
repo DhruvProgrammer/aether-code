@@ -501,6 +501,30 @@ pub async fn run(
             .and_then(|dir| aether_skills::SkillIndex::load(&dir).ok())
             .map(Arc::new);
 
+    // Wave 9: hierarchical context memory (typed store + hybrid retrieval).
+    // Best-effort: when the store cannot open, the agent keeps the legacy
+    // single-prefetch path. The project scope is the run directory.
+    let memory_engine: Option<Arc<aether_memory::MemoryEngine>> =
+        match aether_memory::SqliteMemoryStore::open(
+            &aether_config::Config::default_dir().join("memory.db"),
+        ) {
+            Ok(store) => {
+                let store: Arc<dyn aether_memory::MemoryStore> = Arc::new(store);
+                Some(Arc::new(aether_memory::MemoryEngine::new(
+                    store,
+                    run_cwd.to_string_lossy().to_string(),
+                )))
+            }
+            Err(e) => {
+                emit(
+                    &sink,
+                    "stderr",
+                    &format!("memory store unavailable, hierarchical memory disabled: {e}"),
+                );
+                None
+            }
+        };
+
     let agent = Agent::new(
         controller,
         cfg.agent.controller_model.clone(),
@@ -548,6 +572,12 @@ pub async fn run(
     // Skill wiring: builders consume self, so re-wrap when an index exists.
     let agent = match skill_index {
         Some(idx) => agent.with_skill_index(idx),
+        None => agent,
+    };
+
+    // Memory wiring: same re-wrap pattern; None keeps the legacy path.
+    let agent = match memory_engine {
+        Some(engine) => agent.with_memory_engine(engine),
         None => agent,
     };
 

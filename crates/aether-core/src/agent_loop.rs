@@ -89,6 +89,11 @@ pub struct Agent {
     /// the coder system prompt is compiled via PromptCompiler within the
     /// executor's context budget; otherwise the legacy static prompt is used.
     skill_index: Option<Arc<aether_skills::SkillIndex>>,
+    /// Hierarchical context memory engine (Wave 9). When present, the task
+    /// is observed into the typed store and each planning call retrieves
+    /// fresh packed memories instead of reusing one static prefetch.
+    /// `None` keeps the legacy single-prefetch path.
+    memory_engine: Option<Arc<aether_memory::MemoryEngine>>,
     // ---- plugin runtime (DeepSeek-Harness port, P0) ----
     /// Plugin host for tool-seam interception. `None` = legacy direct
     /// path everywhere. Threaded into every `Executor` this loop builds.
@@ -153,6 +158,7 @@ impl Agent {
             task_event_sink: None,
             memory_manager: Arc::new(aether_mind::memory::MemoryManager::new()),
             skill_index: None,
+            memory_engine: None,
             plugin_host: None,
             tool_scope: aether_runtime::ScopeKey::GLOBAL,
         }
@@ -215,6 +221,57 @@ impl Agent {
     pub fn with_skill_index(mut self, idx: Arc<aether_skills::SkillIndex>) -> Self {
         self.skill_index = Some(idx);
         self
+    }
+
+    /// Inject the hierarchical context memory engine (Wave 9).
+    pub fn with_memory_engine(mut self, engine: Arc<aether_memory::MemoryEngine>) -> Self {
+        self.memory_engine = Some(engine);
+        self
+    }
+
+    /// Access the memory engine, if wired.
+    pub fn memory_engine(&self) -> Option<&Arc<aether_memory::MemoryEngine>> {
+        self.memory_engine.as_ref()
+    }
+
+    /// Retrieval budget for packed memories: they share the window with
+    /// system/skills/tools, so they get roughly an eighth of it.
+    fn memory_options(&self) -> aether_memory::RetrievalOptions {
+        aether_memory::RetrievalOptions {
+            memory_budget_tokens: (self.context_max_tokens / 8).clamp(500, 4000),
+            max_candidates: self.memory_top_k.max(5),
+            ..Default::default()
+        }
+    }
+
+    /// Best-effort observation into the memory engine. Memory must never
+    /// break the agent loop, so failures are logged and ignored.
+    fn observe_memory(&self, sid: &str, task_id: &str, role: &str, content: &str, source_id: String) {
+        if let Some(engine) = &self.memory_engine {
+            let msg = aether_memory::MessageView {
+                role: role.to_string(),
+                content: content.to_string(),
+                tool_name: None,
+                source_id,
+            };
+            if let Err(e) =
+                engine.observe(std::slice::from_ref(&msg), Some(sid), Some(task_id), None)
+            {
+                eprintln!("aether: memory observe failed: {e}");
+            }
+        }
+    }
+
+    /// Fresh packed memories for the current cycle request. Empty when no
+    /// engine is wired or retrieval fails — the static context still applies.
+    fn refresh_memories(&self, sid: &str, request: &str) -> String {
+        if let Some(engine) = &self.memory_engine {
+            match engine.retrieve(request, Some(sid), &self.memory_options()) {
+                Ok(r) => return aether_memory::MemoryEngine::render(&r),
+                Err(e) => eprintln!("aether: memory retrieve failed: {e}"),
+            }
+        }
+        String::new()
     }
 
     /// Attach the plugin host: every `Executor` this loop builds runs
@@ -390,6 +447,8 @@ impl Agent {
         if let Some(store) = &self.session {
             let _ = store.set_kv(sid, "task_state", &tsm.serialize());
         }
+        // Wave 9: index the task itself so later cycles can retrieve it.
+        self.observe_memory(sid, &task_id, "user", task, format!("task:{task_id}"));
 
         // --- Dynamic skill loading: compile the coder system prompt once per
         // task within the executor's budget. Falls back to the legacy static
@@ -581,6 +640,15 @@ impl Agent {
                     eng.state_summary()
                 ),
             };
+            // Wave 9: refresh retrieval every cycle — the task evolves, so a
+            // single pre-loop prefetch goes stale. Falls back to the static
+            // context when the engine is absent or retrieval fails.
+            let cycle_memory = self.refresh_memories(sid, &cycle_task);
+            let cycle_context = if cycle_memory.is_empty() {
+                context.clone()
+            } else {
+                format!("{context}\n{cycle_memory}")
+            };
 
             // Plan (or replan) with the model-informed task.
             // Task state: UNDERSTANDING → PLANNING (LLM 2 plans).
@@ -606,7 +674,7 @@ impl Agent {
                 self.controller.as_ref(),
                 &self.controller_model,
                 &cycle_task,
-                &context,
+                &cycle_context,
                 Mode::Build,
             )
             .await?;
@@ -670,6 +738,15 @@ impl Agent {
             eng.record_action(&format!("execute plan (iter {})", iter + 1));
             eng.observe("executor", &summarize(&result), None, None);
             persist_trace(&self.session, sid, "execute", "implementer", &summarize(&result));
+            // Wave 9: index plan + outcome so the next cycle retrieves them.
+            self.observe_memory(sid, &task_id, "assistant", &plan, format!("plan:{task_id}:{iter}"));
+            self.observe_memory(
+                sid,
+                &task_id,
+                "assistant",
+                &summarize(&result),
+                format!("result:{task_id}:{iter}"),
+            );
 
             // Task state: EXECUTING/REPAIRING → REVIEWING (LLM 3 reviews; LLM 1 cannot self-complete).
             let exec_from = tsm.state();
