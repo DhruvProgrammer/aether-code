@@ -48,6 +48,7 @@ dependencies = [
  "aether-core",
  "aether-evidence",
  "aether-gateway",
+ "aether-harness",
  "aether-memory",
  "aether-mind",
  "aether-models",
@@ -106,6 +107,7 @@ dependencies = [
  "aether-config",
  "aether-context",
  "aether-evidence",
+ "aether-harness",
  "aether-memory",
  "aether-mind",
  "aether-models",
@@ -189,6 +191,26 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aether-harness"
+version = "0.29.1"
+dependencies = [
+ "aether-config",
+ "aether-context",
+ "aether-evidence",
+ "aether-sessions",
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

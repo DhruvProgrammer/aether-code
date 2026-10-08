@@ -27,6 +27,7 @@ aether-analysis = { path = "../aether-analysis" }
 aether-gateway = { path = "../aether-gateway" }
 aether-skills = { path = "../aether-skills" }
 aether-memory = { path = "../aether-memory" }
+aether-harness = { path = "../aether-harness" }
 aether-runtime = { path = "../aether-runtime" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

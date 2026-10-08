@@ -94,6 +94,11 @@ pub struct Agent {
     /// fresh packed memories instead of reusing one static prefetch.
     /// `None` keeps the legacy single-prefetch path.
     memory_engine: Option<Arc<aether_memory::MemoryEngine>>,
+    /// Harness runtime (Wave 10): persistent goal, RLM working context,
+    /// recursive subagent registry, scheduler and refinement state. When
+    /// present, each cycle refreshes the structured working context instead
+    /// of appending to a growing transcript string.
+    harness: Option<Arc<aether_harness::Harness>>,
     // ---- plugin runtime (DeepSeek-Harness port, P0) ----
     /// Plugin host for tool-seam interception. `None` = legacy direct
     /// path everywhere. Threaded into every `Executor` this loop builds.
@@ -159,6 +164,7 @@ impl Agent {
             memory_manager: Arc::new(aether_mind::memory::MemoryManager::new()),
             skill_index: None,
             memory_engine: None,
+            harness: None,
             plugin_host: None,
             tool_scope: aether_runtime::ScopeKey::GLOBAL,
         }
@@ -227,6 +233,19 @@ impl Agent {
     pub fn with_memory_engine(mut self, engine: Arc<aether_memory::MemoryEngine>) -> Self {
         self.memory_engine = Some(engine);
         self
+    }
+
+    /// Inject the harness runtime (Wave 10). The harness owns the persistent
+    /// goal, the structured working context, the recursive subagent registry,
+    /// the scheduler and refinement state. It never changes model assignments.
+    pub fn with_harness(mut self, harness: Arc<aether_harness::Harness>) -> Self {
+        self.harness = Some(harness);
+        self
+    }
+
+    /// Access the harness, if wired.
+    pub fn harness(&self) -> Option<&Arc<aether_harness::Harness>> {
+        self.harness.as_ref()
     }
 
     /// Access the memory engine, if wired.
@@ -649,6 +668,31 @@ impl Agent {
             } else {
                 format!("{context}\n{cycle_memory}")
             };
+            // Wave 10: refresh the RLM working context for this cycle and
+            // compile it under budget, instead of letting the prompt string
+            // grow across the whole task.
+            let cycle_context = if let Some(h) = &self.harness {
+                {
+                    let mut ctx = h.context.lock();
+                    ctx.set_task(&cycle_task);
+                    if cycle_memory.is_empty() {
+                        // keep whatever the harness already retrieved
+                    } else {
+                        ctx.relevant_memories = h
+                            .retrieve_memories(&cycle_task)
+                            .unwrap_or_default();
+                    }
+                }
+                let compiled = h.working_context(self.context_max_tokens / 4);
+                let rendered = compiled.render();
+                if rendered.is_empty() {
+                    cycle_context
+                } else {
+                    format!("{cycle_context}\n{rendered}")
+                }
+            } else {
+                cycle_context
+            };
 
             // Plan (or replan) with the model-informed task.
             // Task state: UNDERSTANDING → PLANNING (LLM 2 plans).
@@ -747,6 +791,29 @@ impl Agent {
                 &summarize(&result),
                 format!("result:{task_id}:{iter}"),
             );
+            // Wave 10: record the outcome in the harness working context and
+            // persist, so an interrupted run can be recovered without
+            // replaying the transcript.
+            if let Some(h) = &self.harness {
+                {
+                    let mut ctx = h.context.lock();
+                    ctx.push_event(aether_harness::ContextEvent {
+                        kind: aether_harness::ContextEventKind::Plan,
+                        text: plan.chars().take(2_000).collect(),
+                        source_id: Some(format!("plan:{task_id}:{iter}")),
+                        at: chrono::Utc::now().timestamp(),
+                    });
+                    ctx.push_event(aether_harness::ContextEvent {
+                        kind: aether_harness::ContextEventKind::AssistantMessage,
+                        text: summarize(&result),
+                        source_id: Some(format!("result:{task_id}:{iter}")),
+                        at: chrono::Utc::now().timestamp(),
+                    });
+                }
+                if let Err(e) = h.persist() {
+                    eprintln!("aether: harness persist failed: {e}");
+                }
+            }
 
             // Task state: EXECUTING/REPAIRING → REVIEWING (LLM 3 reviews; LLM 1 cannot self-complete).
             let exec_from = tsm.state();

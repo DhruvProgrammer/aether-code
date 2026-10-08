@@ -52,6 +52,22 @@ Glob search, non-git Added tracking, chunked large-file reads — ONLY as Wave 8
 
 Render task-state (progress/verification/compaction/health) in UI; seam-mapped typed tool errors; redaction audit; diagnostics events. ACL unchanged. Tests: event→UI mapping; secret-leak negative tests.
 
+## Wave 10 — Prime-Agent-inspired harness (DOING)
+
+New `aether-harness` crate; arch in `HARNESS_ARCHITECTURE.md`. Recon first: six
+of the requested subsystems already existed and are routed into, not rebuilt.
+
+| Component | Current | Target | Files | Deps | Risks | Tests | Status |
+|---|---|---|---|---|---|---|---|
+| Goals | `EngineeringModel.goal` is a string | persistent Goal + lifecycle + progress/blocked/next | harness/goal.rs | — | second source of truth | lifecycle + recovery | DOING |
+| Scheduler | absent (zero cron/heartbeat hits) | cron/interval/once, claim-once, backoff, event-driven wake | harness/schedule.rs | tokio sync/time | double-claim | parse/next/claim/wake | DOING |
+| Subagents | sequential await, no join/cancel, 2 dead budget fields | concurrent spawn + join + per-child cancel + enforced timeout/tokens | harness/subagent.rs | futures-util join_all | current_thread runtime | isolation/limits/timeout | DOING |
+| Refinement | skills read-only, no lessons store | versioned overlay + rollback, immutable core prompt | harness/refine.rs | — | model rewriting core | evidence/base-prompt/rollback | DOING |
+| Gates | state machine enforces evidence | real commands, first-failure-wins, no idle reruns | harness/gates.rs | — | fabricated PASS | fake-runner suites | DOING |
+| Context runtime | segments exist, transcript-ish prompts | RLM structured env + budget compile | harness/context.rs | aether-context priorities | dropping needed state | compile/budget/roundtrip | DOING |
+| Persistence | no schema_version anywhere | versioned store + ordered migrations + recovery | harness/state.rs | rusqlite (in tree) | migration drift | migration/recovery/corrupt-row | DOING |
+| Agent integration | static memory string | harness observed + context compiled per cycle | core/agent_loop.rs | harness crate | prompt drift | existing 85 core tests green | TODO |
+
 ## Wave 8 — Acceptance + regression + CI
 
 §28 long-session integration test (mock providers; 18 steps incl. forced compaction→continuation→survival proof); §29 matrix (unit/integration/tsc/vite/build/validation/session-switch/tools/changes/compaction//compact); new CI workflow running cargo test + tsc (repo currently runs none).

@@ -525,6 +525,35 @@ pub async fn run(
             }
         };
 
+    // Wave 10: harness runtime (persistent goal, RLM working context,
+    // recursive subagents, scheduler, refinements). Best-effort: without a
+    // store the harness still works in-memory, so the agent is never blocked.
+    let harness_store = aether_harness::HarnessStore::open(
+        &aether_config::Config::default_dir().join("harness.db"),
+    )
+    .ok()
+    .map(Arc::new);
+    let harness = {
+        let h = aether_harness::Harness::new(&session_id, harness_store.clone());
+        // Bridge Wave 9 memory into the harness working context when both
+        // are available; otherwise the harness simply has no memories yet.
+        let h = match &memory_engine {
+            Some(engine) => h.with_memory(Arc::new(MemoryBridge {
+                engine: engine.clone(),
+            })),
+            None => h,
+        };
+        Arc::new(h)
+    };
+
+    // Restore a prior harness session (goal + working context + jobs) so a
+    // restarted run continues instead of re-deriving everything.
+    if let Some(store) = &harness_store {
+        if let Ok((restored, _)) = aether_harness::Harness::restore(store.clone(), &session_id) {
+            harness.restore_from(&restored);
+        }
+    }
+
     let agent = Agent::new(
         controller,
         cfg.agent.controller_model.clone(),
@@ -580,6 +609,7 @@ pub async fn run(
         Some(engine) => agent.with_memory_engine(engine),
         None => agent,
     };
+    let agent = agent.with_harness(harness);
 
     let format = |task: &str| -> String {
         if opts.plan {
@@ -684,6 +714,45 @@ pub async fn run(
 
 fn emit(sink: &OutputSink, stream: &'static str, line: &str) {
     (sink)(TaskEvent::Line { stream, line: line.to_string() });
+}
+
+/// Adapts the Wave 9 retrieval engine to the harness `MemoryRetriever` seam,
+/// so the RLM working context is filled from durable memory each cycle.
+struct MemoryBridge {
+    engine: Arc<aether_memory::MemoryEngine>,
+}
+
+impl aether_harness::MemoryRetriever for MemoryBridge {
+    fn retrieve_refs(&self, request: &str, limit: usize) -> Vec<aether_harness::MemoryRef> {
+        let opts = aether_harness::MemoryRetrievalOptions {
+            max_candidates: limit.max(1),
+            ..Default::default()
+        };
+        let memory_opts = aether_memory::RetrievalOptions {
+            max_candidates: opts.max_candidates,
+            memory_budget_tokens: opts.memory_budget_tokens,
+            ..Default::default()
+        };
+        match self.engine.retrieve(request, None, &memory_opts) {
+            Ok(r) => r
+                .memories
+                .into_iter()
+                .map(|m| aether_harness::MemoryRef {
+                    id: m.record.id,
+                    title: m.record.title,
+                    content: m
+                        .record
+                        .summary
+                        .clone()
+                        .unwrap_or(m.record.content)
+                        .chars()
+                        .take(600)
+                        .collect(),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 async fn run_rollback(
